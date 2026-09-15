@@ -1,6 +1,8 @@
 com/nvidia/spark/rapids/*/RapidsShuffleManager.class
 com/nvidia/spark/rapids/AvroProvider.class
 com/nvidia/spark/rapids/HiveProvider.class
+com/nvidia/spark/rapids/PaimonProvider.class
+com/nvidia/spark/rapids/PaimonProvider$.class
 com/nvidia/spark/rapids/iceberg/IcebergProvider.class
 com/nvidia/spark/rapids/iceberg/IcebergProvider$.class
 com/nvidia/spark/rapids/iceberg/IcebergProviderAccess.class

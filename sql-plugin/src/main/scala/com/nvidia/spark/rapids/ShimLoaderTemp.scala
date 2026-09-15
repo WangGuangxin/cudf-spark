@@ -49,6 +49,9 @@ object ShimLoaderTemp {
   def newIcebergProbe(): IcebergProbe = ShimReflectionUtils.newInstanceOf[IcebergProbe](
     "com.nvidia.spark.rapids.iceberg.IcebergProbeImpl")
 
+  def newPaimonProvider(): PaimonProvider = ShimReflectionUtils.newInstanceOf[PaimonProvider](
+    "org.apache.spark.sql.rapids.PaimonProviderImpl")
+
   def newPlanShims(): PlanShims = ShimReflectionUtils.newInstanceOf[PlanShims](
     "com.nvidia.spark.rapids.shims.PlanShimsImpl"
   )

@@ -66,6 +66,14 @@ trait ExternalSourceBase extends Logging {
 
   protected lazy val icebergProvider = IcebergProvider()
 
+  lazy val hasPaimonJar = {
+    PaimonProvider.isSupportedSparkVersion &&
+      Utils.classIsLoadable(PaimonProvider.cpuScanClassName) &&
+        Try(ShimReflectionUtils.loadClass(PaimonProvider.cpuScanClassName)).isSuccess
+  }
+
+  protected lazy val paimonProvider = ShimLoaderTemp.newPaimonProvider()
+
   private lazy val deltaProvider = DeltaProvider()
 
   private lazy val creatableRelations = deltaProvider.getCreatableRelationRules
@@ -131,6 +139,9 @@ trait ExternalSourceBase extends Logging {
     }
     if (hasIcebergJar) {
       scans = scans ++ icebergProvider.getScans
+    }
+    if (hasPaimonJar) {
+      scans = scans ++ paimonProvider.getScans
     }
     scans
   }
