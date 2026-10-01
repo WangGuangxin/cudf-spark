@@ -233,4 +233,6 @@ case class GpuBroadcastHashJoinExec(
       doColumnarBroadcastJoin()
     }
   }
+
+  override private[execution] def supportsJoinChain: Boolean = !isExecutorBroadcast
 }

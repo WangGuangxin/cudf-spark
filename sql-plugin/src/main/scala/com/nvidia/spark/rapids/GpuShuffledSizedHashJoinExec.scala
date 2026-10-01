@@ -429,6 +429,72 @@ abstract class GpuShuffledSizedHashJoinExec[HOST_BATCH_TYPE <: AutoCloseable] ex
   }
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
+    GpuJoinChain.execute(this).getOrElse(doColumnarJoinEager())
+  }
+
+  /** Bound on the driver; only the selected build input is buffered for late materialization. */
+  def joinChainBuildLoader(side: GpuBuildSide): (Iterator[ColumnarBatch],
+      Iterator[ColumnarBatch]) =>
+      (Either[ColumnarBatch, Iterator[ColumnarBatch]], Iterator[ColumnarBatch]) = {
+    val buildPlan = if (side == GpuBuildRight) right else left
+    val streamPlan = if (side == GpuBuildRight) left else right
+    val buildHost = isHostBatchProducer(buildPlan)
+    val streamHost = isHostBatchProducer(streamPlan)
+    val target = gpuBatchSizeBytes
+    val output = buildPlan.output
+    val streamTypes = streamPlan.output.map(_.dataType).toArray
+    val metrics = allMetrics.withDefaultValue(NoopMetric)
+    val concatMetrics = getConcatMetrics(metrics)
+    val read = readOption
+    (build, stream) => {
+      val gpuStream = if (streamHost) {
+        GpuShuffleCoalesceUtils.getGpuShuffleCoalesceIterator(
+          stream, target, streamTypes, read, concatMetrics)
+      } else stream
+      val gpuBuild = if (buildHost) {
+        GpuShuffleCoalesceUtils.getGpuShuffleCoalesceIterator(
+          build, target, output.map(_.dataType).toArray, read, concatMetrics)
+      } else build
+      GpuShuffledHashJoinExec.prepareJoinChainBuild(
+        gpuBuild, gpuStream, target, output, metrics, read)
+    }
+  }
+
+  /** A large/non-unique build resumes normal GPU sizing and sub-partition joins. */
+  def joinChainEager(side: GpuBuildSide): (Either[ColumnarBatch, Iterator[ColumnarBatch]],
+      Iterator[ColumnarBatch]) => Iterator[ColumnarBatch] = {
+    val localType = joinType
+    val lKeys = leftKeys
+    val rKeys = rightKeys
+    val lOutput = left.output
+    val rOutput = right.output
+    val cond = condition
+    val target = gpuBatchSizeBytes
+    val options = RapidsConf.getJoinOptions(conf, target)
+    val amplification = partitionNumAmplification
+    val metrics = allMetrics.withDefaultValue(NoopMetric)
+    (build, stream) => {
+      val buildIter = build.fold(batch =>
+        GpuSubPartitionHashJoin.safeIteratorFromSeq(Seq(batch)), identity)
+      val (lIter, rIter) = if (side == GpuBuildRight) (stream, buildIter) else (buildIter, stream)
+      val info = getGpuGpuJoinInfo(localType, lKeys, lOutput, lIter, rKeys, rOutput, rIter,
+        cond, target, metrics)
+      val joined = if (info.buildSize <= target) {
+        metrics(SMALL_JOIN_COUNT) += 1
+        doSmallBuildJoin(info, options, metrics)
+      } else {
+        metrics(BIG_JOIN_COUNT) += 1
+        doBigBuildJoin(info, options, amplification, metrics)
+      }
+      joined.map { batch =>
+        metrics(NUM_OUTPUT_ROWS) += batch.numRows()
+        metrics(NUM_OUTPUT_BATCHES) += 1
+        batch
+      }
+    }
+  }
+
+  private def doColumnarJoinEager(): RDD[ColumnarBatch] = {
     val localJoinType = joinType
     val localLeftKeys = leftKeys
     val leftOutput = left.output
