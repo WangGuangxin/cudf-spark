@@ -1146,6 +1146,7 @@ abstract class BaseHashJoinIterator(
     joinOptions: JoinOptions,
     joinType: JoinType,
     buildSide: GpuBuildSide,
+    compareNullsEqual: Boolean,
     conditionForLogging: Option[Expression],
     opTime: GpuMetric,
     joinTime: GpuMetric)
@@ -1159,6 +1160,9 @@ abstract class BaseHashJoinIterator(
       opTime = opTime,
       joinTime = joinTime) {
   private var cachedBuiltKeys: Option[LazySpillableColumnarBatch] = None
+  protected lazy val regularHash = new GpuJoinHashCache(false, compareNullsEqual)
+  protected lazy val distinctHash = new GpuJoinHashCache(true, compareNullsEqual)
+  private[execution] def hashBuildCount: Long = regularHash.buildCount + distinctHash.buildCount
 
   private def projectedBuiltKeys: LazySpillableColumnarBatch = {
     cachedBuiltKeys.getOrElse {
@@ -1167,10 +1171,20 @@ abstract class BaseHashJoinIterator(
       val keys = withRetryNoSplit[LazySpillableColumnarBatch] {
         withRestoreOnRetry(built) {
           withResource(GpuProjectExec.project(built.getBatch, boundBuiltKeys)) { projected =>
-            closeOnExcept(LazySpillableColumnarBatch(projected, "build_keys")) { spillable =>
-              built.allowSpilling()
-              spillable.allowSpilling()
-              spillable
+            // Hash state retains keys between probes. Copy them out of contiguous payload buffers.
+            withResource(GpuColumnVector.extractBases(projected).toSeq.safeMap { column =>
+              column.subVector(0, projected.numRows())
+            }) { columns =>
+              withResource(new Table(columns: _*)) { table =>
+                withResource(GpuColumnVector.from(table, GpuColumnVector.extractTypes(projected))) {
+                  copied =>
+                    closeOnExcept(LazySpillableColumnarBatch(copied, "build_keys")) { spillable =>
+                      built.allowSpilling()
+                      spillable.allowSpilling()
+                      spillable
+                    }
+                }
+              }
             }
           }
         }
@@ -1182,9 +1196,11 @@ abstract class BaseHashJoinIterator(
 
   override def close(): Unit = {
     if (!closed) {
-      withResource(cachedBuiltKeys) { _ =>
-        cachedBuiltKeys = None
-        super.close()
+      withResource(Seq(regularHash, distinctHash)) { _ =>
+        withResource(cachedBuiltKeys) { _ =>
+          cachedBuiltKeys = None
+          super.close()
+        }
       }
     }
   }
@@ -1383,6 +1399,21 @@ abstract class BaseHashJoinIterator(
     }
   }
 
+  // AUTO can amortize the buffered build across probes. SMALLEST retains its explicit policy.
+  protected def reusableInnerJoin(left: Table, right: Table): GatherMapsResult = {
+    val selected = if (joinOptions.buildSideSelection == JoinBuildSideSelection.AUTO) buildSide
+      else JoinBuildSideSelection.selectPhysicalBuildSide(joinOptions.buildSideSelection,
+        buildSide, left.getRowCount, right.getRowCount)
+    if (selected != buildSide) {
+      JoinImpl.innerHashJoin(left, right, compareNullsEqual,
+        joinOptions.buildSideSelection, buildSide)
+    } else {
+      val maps = if (buildSide == GpuBuildRight) regularHash.innerJoin(right, left)
+        else regularHash.innerJoin(left, right).reverse
+      GatherMapsResult(maps(0), maps(1))
+    }
+  }
+
   override def computeNumJoinRows(cb: LazySpillableColumnarBatch): Long = {
     // TODO: Replace this estimate with exact join row counts using the corresponding cudf APIs
     //       being added in https://github.com/rapidsai/cudf/issues/9053.
@@ -1404,20 +1435,22 @@ abstract class BaseHashJoinIterator(
       val batches = Seq(built, keys, spillOnlyCb)
       batches.foreach(_.checkpoint())
       withRetryNoSplit {
-        withRestoreOnRetry(batches) {
-          // We need a new LSCB that will be taken over by the gatherer, or closed
-          closeOnExcept(LazySpillableColumnarBatch(spillOnlyCb.getBatch, "stream_data")) {
-            streamBatch =>
-              // the original stream data batch is not spillable until
-              // we ask it to be right here, because we called `getBatch` on it
-              // to make up the new lazy spillable (`streamBatch`)
-              spillOnlyCb.allowSpilling()
+        withRestoreOnRetry(Seq(regularHash, distinctHash)) {
+          withRestoreOnRetry(batches) {
+            // We need a new LSCB that will be taken over by the gatherer, or closed
+            closeOnExcept(LazySpillableColumnarBatch(spillOnlyCb.getBatch, "stream_data")) {
+              streamBatch =>
+                // the original stream data batch is not spillable until
+                // we ask it to be right here, because we called `getBatch` on it
+                // to make up the new lazy spillable (`streamBatch`)
+                spillOnlyCb.allowSpilling()
 
-              withResource(GpuColumnVector.incRefCounts(keys.getBatch)) { builtKeys =>
-                // The local reference keeps keys alive while the cached batch can be spilled.
-                keys.allowSpilling()
-                joinGatherer(builtKeys, built, streamBatch)
-              }
+                withResource(GpuColumnVector.incRefCounts(keys.getBatch)) { builtKeys =>
+                  // The local reference keeps keys alive while the cached batch can be spilled.
+                  keys.allowSpilling()
+                  joinGatherer(builtKeys, built, streamBatch)
+                }
+            }
           }
         }
       }
@@ -1530,6 +1563,7 @@ class HashJoinIterator(
       joinOptions,
       joinType,
       buildSide,
+      compareNullsEqual,
       conditionForLogging,
       opTime = opTime,
       joinTime = joinTime) {
@@ -1553,16 +1587,16 @@ class HashJoinIterator(
           logJoinCardinality(leftKeys, rightKeys, "distinct")
           val result = joinType match {
             case LeftOuter =>
-              val rightRet = leftKeys.leftDistinctJoinGatherMap(rightKeys, compareNullsEqual)
+              val rightRet = distinctHash.leftDistinctJoin(rightKeys, leftKeys)
               GatherMapsResult.makeFromRight(rightRet)
             case RightOuter =>
-              val leftRet = rightKeys.leftDistinctJoinGatherMap(leftKeys, compareNullsEqual)
+              val leftRet = distinctHash.leftDistinctJoin(leftKeys, rightKeys)
               GatherMapsResult.makeFromLeft(leftRet)
             case _: InnerLike =>
               val arrayRet = if (buildSide == GpuBuildRight) {
-                leftKeys.innerDistinctJoinGatherMaps(rightKeys, compareNullsEqual)
+                distinctHash.innerJoin(rightKeys, leftKeys)
               } else {
-                rightKeys.innerDistinctJoinGatherMaps(leftKeys, compareNullsEqual).reverse
+                distinctHash.innerJoin(leftKeys, rightKeys).reverse
               }
               GatherMapsResult(arrayRet(0), arrayRet(1))
             case _ =>
@@ -1631,8 +1665,7 @@ class HashJoinIterator(
     }
     logJoinCardinality(leftKeys, rightKeys, implName)
 
-    val innerMaps = JoinImpl.innerHashJoin(leftKeys, rightKeys, compareNullsEqual,
-      joinOptions.buildSideSelection, buildSide)
+    val innerMaps = reusableInnerJoin(leftKeys, rightKeys)
 
     val leftRowCount = leftKeys.getRowCount
     val rightRowCount = rightKeys.getRowCount
@@ -1665,12 +1698,15 @@ class HashJoinIterator(
     
     val result = joinType match {
       case LeftOuter =>
-        JoinImpl.leftOuterHashJoinBuildRight(leftKeys, rightKeys, compareNullsEqual)
+        regularHash.leftJoin(rightKeys, leftKeys) match {
+          case maps => GatherMapsResult(maps(0), maps(1))
+        }
       case RightOuter =>
-        JoinImpl.rightOuterHashJoinBuildLeft(leftKeys, rightKeys, compareNullsEqual)
+        regularHash.leftJoin(leftKeys, rightKeys) match {
+          case maps => GatherMapsResult(maps(1), maps(0))
+        }
       case _: InnerLike =>
-        JoinImpl.innerHashJoin(leftKeys, rightKeys, compareNullsEqual,
-          joinOptions.buildSideSelection, buildSide)
+        reusableInnerJoin(leftKeys, rightKeys)
       case LeftSemi =>
         JoinImpl.leftSemiHashJoinBuildRight(leftKeys, rightKeys, compareNullsEqual)
       case LeftAnti =>
@@ -1713,6 +1749,7 @@ class ConditionalHashJoinIterator(
       joinOptions,
       joinType,
       buildSide,
+      compareNullsEqual,
       conditionForLogging,
       opTime = opTime,
       joinTime = joinTime) {
@@ -1787,8 +1824,7 @@ class ConditionalHashJoinIterator(
     val leftRowCount = leftKeys.getRowCount
     val rightRowCount = rightKeys.getRowCount
 
-    val innerMaps = JoinImpl.innerHashJoin(leftKeys, rightKeys,
-      nullEquality == NullEquality.EQUAL, joinOptions.buildSideSelection, buildSide)
+    val innerMaps = reusableInnerJoin(leftKeys, rightKeys)
 
     val compiledCondition = lazyCompiledCondition.getForBuildSide(buildSide)
 
@@ -1929,6 +1965,7 @@ class HashJoinStreamSideIterator(
       joinOptions,
       joinType,
       buildSide,
+      compareNullsEqual,
       conditionForLogging,
       opTime = opTime,
       joinTime = joinTime) {
@@ -2014,8 +2051,7 @@ class HashJoinStreamSideIterator(
     }
     logJoinCardinality(leftKeys, rightKeys, implName, originalJoinType)
 
-    val innerMaps = JoinImpl.innerHashJoin(leftKeys, rightKeys, compareNullsEqual,
-      joinOptions.buildSideSelection, cudfBuildSide)
+    val innerMaps = reusableInnerJoin(leftKeys, rightKeys)
 
     val leftRowCount = leftKeys.getRowCount
     val rightRowCount = rightKeys.getRowCount
@@ -2053,12 +2089,15 @@ class HashJoinStreamSideIterator(
     
     val result = subJoinType match {
       case LeftOuter =>
-        JoinImpl.leftOuterHashJoinBuildRight(leftKeys, rightKeys, compareNullsEqual)
+        regularHash.leftJoin(rightKeys, leftKeys) match {
+          case maps => GatherMapsResult(maps(0), maps(1))
+        }
       case RightOuter =>
-        JoinImpl.rightOuterHashJoinBuildLeft(leftKeys, rightKeys, compareNullsEqual)
+        regularHash.leftJoin(leftKeys, rightKeys) match {
+          case maps => GatherMapsResult(maps(1), maps(0))
+        }
       case Inner =>
-        JoinImpl.innerHashJoin(leftKeys, rightKeys, compareNullsEqual,
-          joinOptions.buildSideSelection, cudfBuildSide)
+        reusableInnerJoin(leftKeys, rightKeys)
       case t =>
         throw new IllegalStateException(s"unsupported join type: $t")
     }
@@ -2130,8 +2169,7 @@ class HashJoinStreamSideIterator(
     }
     logJoinCardinality(leftKeys, rightKeys, implName, originalJoinType)
 
-    val innerMaps = JoinImpl.innerHashJoin(leftKeys, rightKeys, compareNullsEqual,
-      joinOptions.buildSideSelection, cudfBuildSide)
+    val innerMaps = reusableInnerJoin(leftKeys, rightKeys)
 
     val compiledCondition = lazyCondition.getForBuildSide(cudfBuildSide)
 

@@ -77,7 +77,7 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
   private def run(fact: Seq[Row], ss: Seq[JoinChainStage],
       action: Int => Unit = _ => (), targetSize: Long = options.targetSize,
       inputBatchRows: Int = 120, dimensionRows: Seq[Seq[Row]] = dims,
-      retryKeys: Boolean = false): Seq[Row] = {
+      retryKeys: Boolean = false, expectedHashBuilds: Option[Long] = None): Seq[Row] = {
     val builds = dimensionRows.zip(dims).safeMap { case (rows, shape) =>
       withResource(batch(rows, shape.head.size))(LazySpillableColumnarBatch(_, "test_dim"))
     }
@@ -93,7 +93,7 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
             options.copy(targetSize = targetSize)) {
           override protected def beforeProbe(stage: Int): Unit = action(stage)
         }) { iterator =>
-          iterator.flatMap { output =>
+          val outputRows = iterator.flatMap { output =>
             withResource(output) { gpu =>
               withResource(GpuColumnVector.extractBases(gpu).toSeq.safeMap(_.copyToHost())) {
                 columns =>
@@ -103,6 +103,8 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
               }
             }
           }.toVector
+          expectedHashBuilds.foreach(count => assert(iterator.hashBuildCount == count))
+          outputRows
         }
         assert(SpillFramework.stores.deviceStore.numHandles == 0)
         assert(SpillFramework.stores.hostStore.numHandles == 0)
@@ -114,6 +116,12 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
   private def sorted(rows: Seq[Row]): Seq[String] = rows.map(_.mkString(",")).sorted
   private val fact = Seq(Seq[Integer](1, 11), Seq[Integer](2, 22),
     Seq[Integer](3, 33), Seq[Integer](null, 44), Seq[Integer](1, 55))
+
+  test("each join stage builds one hash state across stream batches") {
+    val rows = (0 until 20).flatMap(_ => fact)
+    assert(sorted(run(rows, stages, inputBatchRows = 5,
+      expectedHashBuilds = Some(stages.size.toLong))) == sorted(expected(rows, stages)))
+  }
 
   test("composed maps preserve projections, build-left order and multiple input batches") {
     val rows = (0 until 50).flatMap(_ => fact)
