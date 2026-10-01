@@ -32,7 +32,7 @@ import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, FullOuter, Inner, Inn
 import org.apache.spark.sql.catalyst.plans.physical.{Distribution, Partitioning, PartitioningCollection, UnknownPartitioning}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
-import org.apache.spark.sql.rapids.GpuOr
+import org.apache.spark.sql.rapids.GpuAnd
 import org.apache.spark.sql.rapids.execution.{GpuHashJoin, GpuSubPartitionHashJoin, JoinTypeChecks}
 import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -223,7 +223,7 @@ case class GpuShuffledHashJoinExec(
   // `RequireSingleBatchWithFilter`
   private lazy val buildGoal: CoalesceSizeGoal = joinType match {
     case _: InnerLike | LeftSemi | LeftAnti =>
-      val nullFilteringMask = boundBuildKeys.map(GpuIsNotNull).reduce(GpuOr)
+      val nullFilteringMask = boundBuildKeys.map(GpuIsNotNull).reduce(GpuAnd)
       RequireSingleBatchWithFilter(nullFilteringMask)
     case _ => RequireSingleBatch
   }
