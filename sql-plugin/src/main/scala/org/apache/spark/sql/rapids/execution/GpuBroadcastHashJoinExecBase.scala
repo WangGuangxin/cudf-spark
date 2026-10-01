@@ -29,6 +29,7 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.BroadcastQueryStageExec
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, HashedRelationBroadcastMode}
+import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 abstract class GpuBroadcastHashJoinMetaBase(
@@ -203,6 +204,16 @@ abstract class GpuBroadcastHashJoinExecBase(
       "GpuBroadcastHashJoin does not support row-based processing")
 
   protected def doColumnarBroadcastJoin(): RDD[ColumnarBatch] = {
+    GpuJoinChain.execute(this).getOrElse(doColumnarBroadcastJoinEager())
+  }
+
+  // Executor broadcasts have a different build-side lifecycle and cannot participate yet.
+  private[execution] def supportsJoinChain: Boolean = true
+  private[execution] def chainBuildProjection: Option[ColumnarBatch => ColumnarBatch] =
+    buildSidePostProjection
+  private[execution] def chainBuildSchema: StructType = getBroadcastPlan(buildPlan).schema
+
+  private def doColumnarBroadcastJoinEager(): RDD[ColumnarBatch] = {
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
     val opTime = gpuLongMetric(OP_TIME_LEGACY)

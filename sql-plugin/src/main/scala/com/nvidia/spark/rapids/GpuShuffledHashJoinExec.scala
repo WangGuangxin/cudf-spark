@@ -33,7 +33,7 @@ import org.apache.spark.sql.catalyst.plans.physical.{Distribution, Partitioning,
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.joins.ShuffledHashJoinExec
 import org.apache.spark.sql.rapids.GpuAnd
-import org.apache.spark.sql.rapids.execution.{GpuHashJoin, GpuSubPartitionHashJoin, JoinTypeChecks}
+import org.apache.spark.sql.rapids.execution.{GpuHashJoin, GpuJoinChain, GpuSubPartitionHashJoin, JoinTypeChecks}
 import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -242,7 +242,67 @@ case class GpuShuffledHashJoinExec(
     }
   }
 
-  override def internalDoExecuteColumnar() : RDD[ColumnarBatch] = {
+  override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
+    GpuJoinChain.execute(this).getOrElse(doColumnarJoinEager())
+  }
+
+  def joinChainTarget: Long = realTargetBatchSize()
+
+  // A chain may keep the preceding inner join on the streaming side. Bind an internal copy to
+  // that direction while retaining the physical plan and its metrics for scheduling/reporting.
+  private def joinChainPlan(side: GpuBuildSide): GpuShuffledHashJoinExec = {
+    require(side == buildSide || (joinType == Inner && condition.isEmpty))
+    val selected = if (side == buildSide) {
+      this
+    } else {
+      copy(buildSide = side)(cpuLeftKeys, cpuRightKeys)
+    }
+    // Binding uses driver-created metrics; a fallback must not initialize them on an executor.
+    selected.boundBuildKeys
+    selected
+  }
+
+  /** Driver-bound adapters for a local join chain; retain the ordinary partition build policy. */
+  def joinChainBuildLoader(side: GpuBuildSide):
+      (Iterator[ColumnarBatch], Iterator[ColumnarBatch]) =>
+      (Either[ColumnarBatch, Iterator[ColumnarBatch]], Iterator[ColumnarBatch]) = {
+    val target = realTargetBatchSize()
+    val selected = joinChainPlan(side)
+    val output = selected.buildPlan.output
+    val goal = selected.buildGoal
+    val subParts = RapidsConf.HASH_SUB_PARTITION_TEST_ENABLED.get(conf)
+      .map(_ && RapidsConf.TEST_CONF.get(conf))
+    val metrics = allMetrics ++ Map(NUM_INPUT_ROWS -> NoopMetric, NUM_INPUT_BATCHES -> NoopMetric,
+      NUM_OUTPUT_ROWS -> NoopMetric, NUM_OUTPUT_BATCHES -> NoopMetric)
+    val read = readOption
+    (build, stream) => GpuShuffledHashJoinExec.prepareBuildBatchesForJoin(
+      build, stream, target, output, goal, subParts, metrics, read)
+  }
+
+  def joinChainEager(side: GpuBuildSide): (Either[ColumnarBatch, Iterator[ColumnarBatch]],
+      Iterator[ColumnarBatch]) => Iterator[ColumnarBatch] = {
+    val selected = joinChainPlan(side)
+    val options = RapidsConf.getJoinOptions(conf, realTargetBatchSize())
+    val partitions = RapidsConf.NUM_SUB_PARTITIONS.get(conf)
+    val rows = gpuLongMetric(NUM_OUTPUT_ROWS)
+    val batches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val op = gpuLongMetric(OP_TIME_LEGACY)
+    val time = gpuLongMetric(JOIN_TIME)
+    val size = gpuLongMetric(BUILD_DATA_SIZE)
+    (build, stream) => build match {
+      case Left(batch) =>
+        closeOnExcept(batch)(_ => size += GpuColumnVector.getTotalDeviceMemoryUsed(batch))
+        selected.doJoin(batch, stream, options, rows, batches, op, time)
+      case Right(iterator) =>
+        val sized = iterator.map { batch =>
+          closeOnExcept(batch)(_ => size += GpuColumnVector.getTotalDeviceMemoryUsed(batch))
+          batch
+        }
+        selected.doJoinBySubPartition(sized, stream, options, partitions, rows, batches, op, time)
+    }
+  }
+
+  private def doColumnarJoinEager(): RDD[ColumnarBatch] = {
     val buildDataSize = gpuLongMetric(BUILD_DATA_SIZE)
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
@@ -335,6 +395,14 @@ object GpuShuffledHashJoinExec extends Logging {
    * @return a pair of an Either for build and streamed iterator that can be used
    *         for the join.
    */
+  def prepareJoinChainBuild(
+      build: Iterator[ColumnarBatch], stream: Iterator[ColumnarBatch], target: Long,
+      output: Seq[Attribute], metrics: Map[String, GpuMetric], read: CoalesceReadOption):
+      (Either[ColumnarBatch, Iterator[ColumnarBatch]], Iterator[ColumnarBatch]) = {
+    prepareBuildBatchesForJoin(build, stream, target, output, RequireSingleBatch,
+      None, metrics, read)
+  }
+
   private[rapids] def prepareBuildBatchesForJoin(
       buildIter: Iterator[ColumnarBatch],
       streamIter: Iterator[ColumnarBatch],
