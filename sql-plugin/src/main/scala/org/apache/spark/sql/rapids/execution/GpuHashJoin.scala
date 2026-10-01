@@ -15,7 +15,7 @@
  */
 package org.apache.spark.sql.rapids.execution
 
-import ai.rapids.cudf.{ColumnView, DType, GatherMap, NullEquality, OutOfBoundsPolicy, Scalar, Table}
+import ai.rapids.cudf.{DType, GatherMap, NullEquality, OutOfBoundsPolicy, Table}
 import ai.rapids.cudf.ast.CompiledExpression
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
@@ -1908,7 +1908,7 @@ class HashJoinStreamSideIterator(
     built: LazySpillableColumnarBatch,
     boundBuiltKeys: Seq[GpuExpression],
     buildStatsOpt: Option[JoinBuildSideStats],
-    buildSideTrackerInit: Option[SpillableColumnarBatch],
+    buildSideTrackerInit: Option[OuterJoinTracker],
     stream: Iterator[LazySpillableColumnarBatch],
     boundStreamKeys: Seq[GpuExpression],
     streamAttributes: Seq[Attribute],
@@ -1961,7 +1961,7 @@ class HashJoinStreamSideIterator(
     case t => throw new IllegalStateException(s"unexpected subJoinType: $t")
   }
 
-  private[this] var builtSideTracker: Option[SpillableColumnarBatch] = buildSideTrackerInit
+  private[this] var builtSideTracker: Option[OuterJoinTracker] = buildSideTrackerInit
 
   private def unconditionalJoinGatherMaps(
       leftKeys: Table, rightKeys: Table): GatherMapsResult = {
@@ -2263,7 +2263,7 @@ class HashJoinStreamSideIterator(
    *  join. This is normally called after iteration has completed. The caller takes ownership
    *  of the resulting data and is responsible for closing it.
    */
-  def releaseBuiltSideTracker(): Option[SpillableColumnarBatch] = {
+  def releaseBuiltSideTracker(): Option[OuterJoinTracker] = {
     val result = builtSideTracker
     builtSideTracker = None
     result
@@ -2278,64 +2278,16 @@ class HashJoinStreamSideIterator(
     }
   }
 
-  private def trueColumnTable(numRows: Int): Table = {
-    withResource(Scalar.fromBool(true)) { trueScalar =>
-      withResource(ai.rapids.cudf.ColumnVector.fromScalar(trueScalar, numRows)) {
-        new Table(_)
-      }
-    }
-  }
-
-  // Create a boolean column to indicate which gather map rows are valid.
-  private def validIndexMask(gatherView: ColumnView): ColumnView = {
-    withResource(Scalar.fromInt(Int.MinValue)) { invalidIndex =>
-      gatherView.notEqualTo(invalidIndex)
-    }
-  }
-
-  /**
-   * Update the tracking mask for the build side.
-   */
+  /** Update the matched-row bitmap directly from the build-side gather map. */
   private def updateTrackingMask(buildSideGatherMap: LazySpillableGatherMap): Unit = {
-    // Filter the build side gather map to remove invalid indices
-    val numGatherMapRows = buildSideGatherMap.getRowCount.toInt
-    val filteredGatherMap = {
-      withResource(buildSideGatherMap.toColumnView(0, numGatherMapRows)) { gatherView =>
-        withResource(gatherView.copyToColumnVector()) { gatherVec =>
-          withResource(new Table(gatherVec)) { gatherTab =>
-            withResource(validIndexMask(gatherView)) { mask =>
-              gatherTab.filter(mask)
-            }
-          }
-        }
-      }
+    val tracker = builtSideTracker.getOrElse {
+      val created = OuterJoinTracker(built.numRows)
+      builtSideTracker = Some(created)
+      created
     }
-    // Update all hits in the gather map with false (no longer needed) in the tracking table
-    val updatedTrackingTable = withResource(filteredGatherMap) { filteredMap =>
-      // Get the current tracking table, or all true table to start with
-      val builtTrackingTable = builtSideTracker.map { spillableBatch =>
-        withResource(spillableBatch) { scb =>
-          withResource(scb.getColumnarBatch()) { trackingBatch =>
-            GpuColumnVector.from(trackingBatch)
-          }
-        }
-      }.getOrElse {
-        trueColumnTable(built.numRows)
-      }
-      withResource(builtTrackingTable) { trackingTable =>
-        withResource(Scalar.fromBool(false)) { falseScalar =>
-          Table.scatter(Array(falseScalar), filteredMap.getColumn(0), trackingTable)
-        }
-      }
+    withResource(buildSideGatherMap.toColumnView(0, buildSideGatherMap.getRowCount.toInt)) {
+      tracker.update
     }
-    val previousTracker = builtSideTracker
-    builtSideTracker = withResource(updatedTrackingTable) { _ =>
-      Some(SpillableColumnarBatch(
-        GpuColumnVector.from(updatedTrackingTable, Array[DataType](DataTypes.BooleanType)),
-        SpillPriorities.ACTIVE_ON_DECK_PRIORITY))
-    }
-    // If we throw above, we should not close the existing tracker
-    previousTracker.foreach(_.close())
   }
 }
 
@@ -2367,7 +2319,7 @@ class HashOuterJoinIterator(
     built: LazySpillableColumnarBatch,
     boundBuiltKeys: Seq[GpuExpression],
     buildStats: Option[JoinBuildSideStats],
-    buildSideTrackerInit: Option[SpillableColumnarBatch],
+    buildSideTrackerInit: Option[OuterJoinTracker],
     stream: Iterator[LazySpillableColumnarBatch],
     boundStreamKeys: Seq[GpuExpression],
     streamAttributes: Seq[Attribute],
@@ -2426,13 +2378,11 @@ class HashOuterJoinIterator(
         case None => None
         case Some(tracker) =>
           val filteredBatch = withResource(tracker) { scb =>
-            withResource(scb.getColumnarBatch()) { trackerBatch =>
-              withResource(GpuColumnVector.from(trackerBatch)) { trackerTab =>
-                val batch = built.getBatch
-                withResource(GpuColumnVector.from(batch)) { builtTable =>
-                  withResource(builtTable.filter(trackerTab.getColumn(0))) { filterTab =>
-                    GpuColumnVector.from(filterTab, GpuColumnVector.extractTypes(batch))
-                  }
+            withResource(scb.unmatchedMask()) { mask =>
+              val batch = built.getBatch
+              withResource(GpuColumnVector.from(batch)) { builtTable =>
+                withResource(builtTable.filter(mask)) { filterTab =>
+                  GpuColumnVector.from(filterTab, GpuColumnVector.extractTypes(batch))
                 }
               }
             }

@@ -1675,9 +1675,9 @@ class BigSizedJoinIterator(
   private var subIter: Option[Iterator[ColumnarBatch]] = None
 
   // Buffer per join group to track build-side rows that have been referenced for outer joins
-  private val buildSideRowTrackers: Array[Option[SpillableColumnarBatch]] = {
+  private val buildSideRowTrackers: Array[Option[OuterJoinTracker]] = {
     if (needTracker) {
-      val arr = new Array[Option[SpillableColumnarBatch]](joinGroups.length)
+      val arr = new Array[Option[OuterJoinTracker]](joinGroups.length)
       arr.indices.foreach { i => arr(i) = None }
       arr
     } else {
