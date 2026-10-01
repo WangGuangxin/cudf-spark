@@ -342,9 +342,11 @@ private[execution] class JoinChainIterator(
       }, attrs, builds.head, options.targetSize, options.sizeEstimateThreshold,
       opTime, stages.last.joinTime) {
   private case class Origin(source: Int, column: Int)
+  private val hashes = stages.map(stage => new GpuJoinHashCache(true, stage.nullsEqual))
+  private[execution] def hashBuildCount: Long = hashes.map(_.buildCount).sum
   override def close(): Unit = {
     if (!closed) {
-      withResource(builds.drop(1) ++ keys) { _ =>
+      withResource(hashes ++ builds.drop(1) ++ keys) { _ =>
         val closeableInput = input match {
           case closeable: AutoCloseable => Some(closeable)
           case _ => None
@@ -391,7 +393,9 @@ private[execution] class JoinChainIterator(
       inputs.foreach(_.checkpoint())
       try {
         val (gatherer, counts) = withRetryNoSplit {
-          withRestoreOnRetry(inputs) { buildGatherer(fact) }
+          withRestoreOnRetry(hashes) {
+            withRestoreOnRetry(inputs) { buildGatherer(fact) }
+          }
         }
         // Commit metrics only after the complete attempt succeeds, avoiding retry double counts.
         stages.dropRight(1).zip(counts).foreach { case (stage, rows) =>
@@ -443,8 +447,7 @@ private[execution] class JoinChainIterator(
             }) { streamColumns =>
               withResource(new Table(streamColumns: _*)) { streamKeys =>
                 withResource(GpuColumnVector.from(keys(i).getBatch)) { buildKeys =>
-                  withResource(streamKeys.innerDistinctJoinGatherMaps(
-                      buildKeys, stage.nullsEqual)) { joined =>
+                  withResource(hashes(i).innerJoin(buildKeys, streamKeys)) { joined =>
                     keys(i).allowSpilling()
                     val joinedRows = joined(0).getRowCount.toInt
                     if (joinedRows == 0) {

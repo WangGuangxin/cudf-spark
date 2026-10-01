@@ -1344,6 +1344,9 @@ abstract class BaseHashJoinIterator(
       opTime = opTime,
       joinTime = joinTime) {
   private var cachedBuiltKeys: Option[LazySpillableColumnarBatch] = None
+  protected lazy val regularHash = new GpuJoinHashCache(false, compareNullsEqual)
+  protected lazy val distinctHash = new GpuJoinHashCache(true, compareNullsEqual)
+  private[execution] def hashBuildCount: Long = regularHash.buildCount + distinctHash.buildCount
 
   private def projectedBuiltKeys: LazySpillableColumnarBatch = {
     cachedBuiltKeys.getOrElse {
@@ -1352,10 +1355,20 @@ abstract class BaseHashJoinIterator(
       val keys = withRetryNoSplit[LazySpillableColumnarBatch] {
         withRestoreOnRetry(built) {
           withResource(GpuProjectExec.project(built.getBatch, boundBuiltKeys)) { projected =>
-            closeOnExcept(LazySpillableColumnarBatch(projected, "build_keys")) { spillable =>
-              built.allowSpilling()
-              spillable.allowSpilling()
-              spillable
+            // Hash state retains keys between probes. Copy them out of contiguous payload buffers.
+            withResource(GpuColumnVector.extractBases(projected).toSeq.safeMap { column =>
+              column.subVector(0, projected.numRows())
+            }) { columns =>
+              withResource(new Table(columns: _*)) { table =>
+                withResource(GpuColumnVector.from(table, GpuColumnVector.extractTypes(projected))) {
+                  copied =>
+                    closeOnExcept(LazySpillableColumnarBatch(copied, "build_keys")) { spillable =>
+                      built.allowSpilling()
+                      spillable.allowSpilling()
+                      spillable
+                    }
+                }
+              }
             }
           }
         }
@@ -1367,9 +1380,11 @@ abstract class BaseHashJoinIterator(
 
   override def close(): Unit = {
     if (!closed) {
-      withResource(cachedBuiltKeys) { _ =>
-        cachedBuiltKeys = None
-        super.close()
+      withResource(Seq(regularHash, distinctHash)) { _ =>
+        withResource(cachedBuiltKeys) { _ =>
+          cachedBuiltKeys = None
+          super.close()
+        }
       }
     }
   }
@@ -1672,6 +1687,21 @@ abstract class BaseHashJoinIterator(
         innerMaps.close()
         throw new NotImplementedError(
           s"Join $targetJoinType with $errorContext is not currently supported")
+    }
+  }
+
+  // AUTO can amortize the buffered build across probes. SMALLEST retains its explicit policy.
+  protected def reusableInnerJoin(left: Table, right: Table): GatherMapsResult = {
+    val selected = if (joinOptions.buildSideSelection == JoinBuildSideSelection.AUTO) buildSide
+      else JoinBuildSideSelection.selectPhysicalBuildSide(joinOptions.buildSideSelection,
+        buildSide, left.getRowCount, right.getRowCount)
+    if (selected != buildSide) {
+      JoinImpl.innerHashJoin(left, right, compareNullsEqual,
+        joinOptions.buildSideSelection, buildSide)
+    } else {
+      val maps = if (buildSide == GpuBuildRight) regularHash.innerJoin(right, left)
+        else regularHash.innerJoin(left, right).reverse
+      GatherMapsResult(maps(0), maps(1))
     }
   }
 
