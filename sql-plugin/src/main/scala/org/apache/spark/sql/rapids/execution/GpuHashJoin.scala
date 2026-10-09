@@ -1399,11 +1399,10 @@ abstract class BaseHashJoinIterator(
     }
   }
 
-  // AUTO can amortize the buffered build across probes. SMALLEST retains its explicit policy.
+  // Reuse the buffered hash only when it is also the selected physical build side.
   protected def reusableInnerJoin(left: Table, right: Table): GatherMapsResult = {
-    val selected = if (joinOptions.buildSideSelection == JoinBuildSideSelection.AUTO) buildSide
-      else JoinBuildSideSelection.selectPhysicalBuildSide(joinOptions.buildSideSelection,
-        buildSide, left.getRowCount, right.getRowCount)
+    val selected = JoinBuildSideSelection.selectPhysicalBuildSide(
+      joinOptions.buildSideSelection, buildSide, left.getRowCount, right.getRowCount)
     if (selected != buildSide) {
       JoinImpl.innerHashJoin(left, right, compareNullsEqual,
         joinOptions.buildSideSelection, buildSide)

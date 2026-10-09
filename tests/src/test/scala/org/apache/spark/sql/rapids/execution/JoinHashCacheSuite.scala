@@ -115,8 +115,8 @@ class JoinHashCacheSuite extends RmmSparkRetrySuiteBase {
             }.toVector
             val expected = bp.map(value => (value, if (value < 200) 10 else 20))
             assert(result.sorted == (0 until 4).flatMap(_ => expected).sorted)
-            // Ties under SMALLEST may select the streamed table; do not cache that input.
-            val cached = distinct || selection != JoinBuildSideSelection.SMALLEST ||
+            // AUTO and SMALLEST select the streamed table on ties; do not cache that input.
+            val cached = distinct || selection == JoinBuildSideSelection.FIXED ||
               side == GpuBuildRight
             assert(iterator.hashBuildCount == (if (cached) 1 else 0))
           }
