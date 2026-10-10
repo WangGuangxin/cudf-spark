@@ -23,23 +23,119 @@ import com.nvidia.spark.rapids.RapidsConf
 import org.apache.spark.SparkEnv
 
 private[spill] trait ShuffleSpillDiskIOThrottler {
-  def throttleRead(numBytes: Long): Unit
-  def throttleWrite(numBytes: Long): Unit
+  def throttleRead(numBytes: Long, ioTimeNanos: Long): ThrottleResult
+  def throttleWrite(numBytes: Long, ioTimeNanos: Long): ThrottleResult
 }
+
+private[spill] case class ThrottleResult(waitNanos: Long, queueDepth: Long)
 
 private[spill] object ExecutorShuffleSpillDiskIOThrottler
     extends ShuffleSpillDiskIOThrottler {
-  private lazy val limiters = {
+  private lazy val limiter = {
     val conf = Option(SparkEnv.get)
       .map(env => new RapidsConf(env.conf))
       .getOrElse(new RapidsConf(Map.empty[String, String]))
-    (new ThroughputLimiter(conf.shuffleSpillReadBandwidth),
-      new ThroughputLimiter(conf.shuffleSpillWriteBandwidth))
+    new ShuffleSpillBandwidthLimiter(
+      conf.shuffleSpillReadBandwidth,
+      conf.shuffleSpillWriteBandwidth,
+      conf.shuffleSpillTotalBandwidth)
   }
 
-  override def throttleRead(numBytes: Long): Unit = limiters._1.acquire(numBytes)
+  override def throttleRead(numBytes: Long, ioTimeNanos: Long): ThrottleResult =
+    limiter.throttleRead(numBytes, ioTimeNanos)
 
-  override def throttleWrite(numBytes: Long): Unit = limiters._2.acquire(numBytes)
+  override def throttleWrite(numBytes: Long, ioTimeNanos: Long): ThrottleResult =
+    limiter.throttleWrite(numBytes, ioTimeNanos)
+}
+
+/**
+ * Coordinates directional limits with an optional shared read/write limit. All reservations are
+ * made under one monitor so concurrent reads and writes compete for the same total bandwidth.
+ */
+private[spill] class ShuffleSpillBandwidthLimiter(
+    readBytesPerSecond: Long,
+    writeBytesPerSecond: Long,
+    totalBytesPerSecond: Long,
+    nanoTime: () => Long = () => System.nanoTime(),
+    sleepNanos: Long => Unit = nanos => TimeUnit.NANOSECONDS.sleep(nanos))
+    extends ShuffleSpillDiskIOThrottler {
+  require(readBytesPerSecond >= 0, "readBytesPerSecond must be non-negative")
+  require(writeBytesPerSecond >= 0, "writeBytesPerSecond must be non-negative")
+  require(totalBytesPerSecond >= 0, "totalBytesPerSecond must be non-negative")
+
+  private var nextReadNanos = nanoTime()
+  private var nextWriteNanos = nextReadNanos
+  private var nextTotalNanos = nextReadNanos
+  private var outstandingReservations = 0L
+
+  override def throttleRead(numBytes: Long, ioTimeNanos: Long): ThrottleResult = {
+    throttle(numBytes, ioTimeNanos, read = true)
+  }
+
+  override def throttleWrite(numBytes: Long, ioTimeNanos: Long): ThrottleResult = {
+    throttle(numBytes, ioTimeNanos, read = false)
+  }
+
+  private def throttle(numBytes: Long, ioTimeNanos: Long, read: Boolean): ThrottleResult = {
+    if (numBytes <= 0) {
+      return ThrottleResult(0L, 0L)
+    }
+
+    val (waitNanos, queueDepth) = synchronized {
+      val now = nanoTime()
+      val directionalRate = if (read) readBytesPerSecond else writeBytesPerSecond
+      val directionalNext = if (read) nextReadNanos else nextWriteNanos
+      val (directionalFinish, directionalWait) = reserve(
+        now, directionalNext, directionalRate, numBytes, ioTimeNanos)
+      val (totalFinish, totalWait) = reserve(
+        now, nextTotalNanos, totalBytesPerSecond, numBytes, ioTimeNanos)
+
+      if (read) {
+        nextReadNanos = directionalFinish
+      } else {
+        nextWriteNanos = directionalFinish
+      }
+      nextTotalNanos = totalFinish
+      val wait = math.max(directionalWait, totalWait)
+      if (wait > 0) {
+        outstandingReservations += 1
+      }
+      (wait, outstandingReservations)
+    }
+
+    if (waitNanos > 0) {
+      try {
+        sleepNanos(waitNanos)
+      } finally {
+        synchronized {
+          outstandingReservations -= 1
+        }
+      }
+    }
+    ThrottleResult(waitNanos, if (waitNanos > 0) queueDepth else 0L)
+  }
+
+  private def reserve(
+      now: Long,
+      nextAvailable: Long,
+      bytesPerSecond: Long,
+      numBytes: Long,
+      ioTimeNanos: Long): (Long, Long) = {
+    if (bytesPerSecond == 0) {
+      (nextAvailable, 0L)
+    } else {
+      val duration = math.max(1L,
+        math.ceil(numBytes.toDouble * TimeUnit.SECONDS.toNanos(1) / bytesPerSecond).toLong)
+      val remainingDuration = math.max(0L, duration - math.max(0L, ioTimeNanos))
+      val start = math.max(now, nextAvailable)
+      val finish = saturatedAdd(start, remainingDuration)
+      (finish, math.max(0L, finish - now))
+    }
+  }
+
+  private def saturatedAdd(left: Long, right: Long): Long = {
+    if (left > 0 && right > Long.MaxValue - left) Long.MaxValue else left + right
+  }
 }
 
 /**
@@ -55,19 +151,23 @@ private[spill] class ThroughputLimiter(
 
   private var nextAvailableNanos: Long = nanoTime()
 
-  def acquire(numBytes: Long): Unit = {
+  def acquire(numBytes: Long, ioTimeNanos: Long = 0L): Long = {
     if (bytesPerSecond > 0 && numBytes > 0) {
       val waitNanos = synchronized {
         val now = nanoTime()
         val start = math.max(now, nextAvailableNanos)
         val duration = math.max(1L,
           math.ceil(numBytes.toDouble * TimeUnit.SECONDS.toNanos(1) / bytesPerSecond).toLong)
-        nextAvailableNanos = saturatedAdd(start, duration)
-        math.max(0L, start - now)
+        val remainingDuration = math.max(0L, duration - math.max(0L, ioTimeNanos))
+        nextAvailableNanos = saturatedAdd(start, remainingDuration)
+        math.max(0L, nextAvailableNanos - now)
       }
       if (waitNanos > 0) {
         sleepNanos(waitNanos)
       }
+      waitNanos
+    } else {
+      0L
     }
   }
 

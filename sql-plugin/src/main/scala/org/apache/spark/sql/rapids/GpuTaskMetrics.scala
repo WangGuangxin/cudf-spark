@@ -281,6 +281,16 @@ class GpuTaskMetrics extends Serializable with Logging {
   // Disk write savings from SpillablePartialFileHandle
   private val diskWriteSavedBytes = new LongAccumulator
 
+  // Physical I/O and synthetic throttle behavior for partial shuffle spill files
+  private val shuffleSpillPhysicalReadBytes = new LongAccumulator
+  private val shuffleSpillPhysicalWriteBytes = new LongAccumulator
+  private val shuffleSpillReadIOCalls = new LongAccumulator
+  private val shuffleSpillWriteIOCalls = new LongAccumulator
+  private val shuffleSpillReadThrottleTimeNs = new NanoSecondAccumulator
+  private val shuffleSpillWriteThrottleTimeNs = new NanoSecondAccumulator
+  private val shuffleSpillTotalThrottleTimeNs = new NanoSecondAccumulator
+  private val shuffleSpillThrottleMaxQueueDepth = new MaxLongAccumulator
+
   // PerfIO S3 backend executor counts — each executor contributes 1 to its active backend
   // per stage, making it easy to see from the event log whether PerfIO is enabled on all nodes.
   private val perfioS3NettyExecutors = new LongAccumulator
@@ -351,6 +361,14 @@ class GpuTaskMetrics extends Serializable with Logging {
     "multithreadReaderMaxParallelism" -> multithreadReaderMaxParallelism,
     "gpuMaxConcurrentGpuTasks" -> maxConcurrentGpuTasks,
     "gpuDiskWriteSavedBytes" -> diskWriteSavedBytes,
+    "gpuShuffleSpillPhysicalReadBytes" -> shuffleSpillPhysicalReadBytes,
+    "gpuShuffleSpillPhysicalWriteBytes" -> shuffleSpillPhysicalWriteBytes,
+    "gpuShuffleSpillReadIOCalls" -> shuffleSpillReadIOCalls,
+    "gpuShuffleSpillWriteIOCalls" -> shuffleSpillWriteIOCalls,
+    "gpuShuffleSpillReadThrottleTime" -> shuffleSpillReadThrottleTimeNs,
+    "gpuShuffleSpillWriteThrottleTime" -> shuffleSpillWriteThrottleTimeNs,
+    "gpuShuffleSpillTotalThrottleTime" -> shuffleSpillTotalThrottleTimeNs,
+    "gpuShuffleSpillThrottleMaxQueueDepth" -> shuffleSpillThrottleMaxQueueDepth,
     "perfio.s3.netty.executors" -> perfioS3NettyExecutors,
     "perfio.s3.crt.executors" -> perfioS3CrtExecutors,
     "perfio.s3.s3a.executors" -> perfioS3S3aExecutors,
@@ -508,6 +526,43 @@ class GpuTaskMetrics extends Serializable with Logging {
   def addDiskWriteSaved(bytes: Long): Unit = {
     diskWriteSavedBytes.add(bytes)
   }
+
+  def recordShuffleSpillDiskIO(
+      read: Boolean,
+      numBytes: Long,
+      throttleWaitNanos: Long,
+      queueDepth: Long): Unit = {
+    if (read) {
+      shuffleSpillPhysicalReadBytes.add(numBytes)
+      shuffleSpillReadIOCalls.add(1L)
+      shuffleSpillReadThrottleTimeNs.add(throttleWaitNanos)
+    } else {
+      shuffleSpillPhysicalWriteBytes.add(numBytes)
+      shuffleSpillWriteIOCalls.add(1L)
+      shuffleSpillWriteThrottleTimeNs.add(throttleWaitNanos)
+    }
+    shuffleSpillTotalThrottleTimeNs.add(throttleWaitNanos)
+    shuffleSpillThrottleMaxQueueDepth.add(queueDepth)
+  }
+
+  private[rapids] def getShuffleSpillPhysicalReadBytes: Long =
+    shuffleSpillPhysicalReadBytes.value
+
+  private[rapids] def getShuffleSpillPhysicalWriteBytes: Long =
+    shuffleSpillPhysicalWriteBytes.value
+
+  private[rapids] def getShuffleSpillReadIOCalls: Long = shuffleSpillReadIOCalls.value
+
+  private[rapids] def getShuffleSpillWriteIOCalls: Long = shuffleSpillWriteIOCalls.value
+
+  private[rapids] def getShuffleSpillReadThrottleTime: Long =
+    shuffleSpillReadThrottleTimeNs.value.value
+
+  private[rapids] def getShuffleSpillWriteThrottleTime: Long =
+    shuffleSpillWriteThrottleTimeNs.value.value
+
+  private[rapids] def getShuffleSpillTotalThrottleTime: Long =
+    shuffleSpillTotalThrottleTimeNs.value.value
 
   /**
    * Records this executor's PerfIO S3 backend exactly once per stage (per GpuTaskMetrics

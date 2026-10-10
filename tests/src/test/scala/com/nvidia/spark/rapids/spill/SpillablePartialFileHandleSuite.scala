@@ -33,9 +33,15 @@ class SpillablePartialFileHandleSuite
     var readBytes: Long = 0L
     var writeBytes: Long = 0L
 
-    override def throttleRead(numBytes: Long): Unit = readBytes += numBytes
+    override def throttleRead(numBytes: Long, ioTimeNanos: Long): ThrottleResult = {
+      readBytes += numBytes
+      ThrottleResult(0L, 0L)
+    }
 
-    override def throttleWrite(numBytes: Long): Unit = writeBytes += numBytes
+    override def throttleWrite(numBytes: Long, ioTimeNanos: Long): ThrottleResult = {
+      writeBytes += numBytes
+      ThrottleResult(0L, 0L)
+    }
   }
 
   // Use 1GB max buffer size for tests to avoid memory issues on test machines
@@ -136,6 +142,24 @@ class SpillablePartialFileHandleSuite
       val readBuffer = new Array[Byte](data.length)
       assert(handle.readAt(0, readBuffer, 0, readBuffer.length) === data.length)
       assert(throttler.readBytes === data.length)
+    }
+  }
+
+  test("FILE_ONLY mode: throttle only physical writes below the buffer") {
+    val tempFile = File.createTempFile("test-file-only-physical-throttle-", ".tmp")
+    val throttler = new RecordingIOThrottler
+    val data = new Array[Byte](1024)
+
+    withResource(SpillablePartialFileHandle.createFileOnly(
+      file = tempFile,
+      syncWrites = false,
+      bufferedOutputStreamFactory = new BufferedOutputStream(_, 4096),
+      ioThrottler = throttler)) { handle =>
+      handle.write(data, 0, data.length)
+      assert(throttler.writeBytes === 0L)
+
+      handle.finishWrite()
+      assert(throttler.writeBytes === data.length)
     }
   }
 

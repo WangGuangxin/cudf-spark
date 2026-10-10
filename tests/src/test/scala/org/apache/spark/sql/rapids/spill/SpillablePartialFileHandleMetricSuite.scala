@@ -27,6 +27,7 @@ import org.scalatest.funsuite.AnyFunSuite
 
 import org.apache.spark.TaskContext
 import org.apache.spark.executor.TaskMetrics
+import org.apache.spark.sql.rapids.GpuTaskMetrics
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 
 /**
@@ -129,6 +130,33 @@ class SpillablePartialFileHandleMetricSuite extends AnyFunSuite with BeforeAndAf
               s"but got ${taskMetrics.diskBytesSpilled}")
         }
       }
+    } finally {
+      tempFile.delete()
+    }
+  }
+
+  test("file-only handle records physical disk IO metrics") {
+    val tempFile = File.createTempFile("test-partial-file-physical-io-metric-", ".tmp")
+    val gpuTaskMetrics = new GpuTaskMetrics
+    val testData = "physical disk IO metrics".getBytes("UTF-8")
+
+    try {
+      withResource(SpillablePartialFileHandle.createFileOnly(
+        file = tempFile,
+        taskMetrics = gpuTaskMetrics)) { handle =>
+        handle.write(testData, 0, testData.length)
+        handle.finishWrite()
+
+        val result = new Array[Byte](testData.length)
+        assert(handle.readAt(0L, result, 0, result.length) == result.length)
+        assert(result.sameElements(testData))
+      }
+
+      assert(gpuTaskMetrics.getShuffleSpillPhysicalWriteBytes == testData.length)
+      assert(gpuTaskMetrics.getShuffleSpillPhysicalReadBytes == testData.length)
+      assert(gpuTaskMetrics.getShuffleSpillWriteIOCalls > 0L)
+      assert(gpuTaskMetrics.getShuffleSpillReadIOCalls == 1L)
+      assert(gpuTaskMetrics.getShuffleSpillTotalThrottleTime == 0L)
     } finally {
       tempFile.delete()
     }

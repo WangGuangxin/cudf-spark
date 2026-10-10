@@ -29,6 +29,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.shuffle.IndexShuffleBlockResolver
 import org.apache.spark.shuffle.api.{ShuffleMapOutputWriter, ShufflePartitionWriter, WritableByteChannelWrapper}
 import org.apache.spark.shuffle.api.metadata.MapOutputCommitMessage
+import org.apache.spark.sql.rapids.GpuTaskMetrics
 import org.apache.spark.util.Utils
 
 /**
@@ -57,6 +58,7 @@ class RapidsLocalDiskShuffleMapOutputWriter(
   private val initialBufferSize = rapidsConf.partialFileBufferInitialSize
   private val maxBufferSize = rapidsConf.partialFileBufferMaxSize
   private val memoryThreshold = rapidsConf.partialFileBufferMemoryThreshold
+  private val taskMetrics = GpuTaskMetrics.get
 
   // Read Spark's shuffle sync configuration to maintain compatibility
   private val syncWrites = sparkConf.get("spark.shuffle.sync", "false").toBoolean
@@ -139,7 +141,7 @@ class RapidsLocalDiskShuffleMapOutputWriter(
         // Force file-only mode (e.g., for final merge operations)
         logDebug(s"Using forced file-only mode for shuffle $shuffleId map $mapId")
         val handle = SpillablePartialFileHandle.createFileOnly(
-          outputTempFile, syncWrites)
+          outputTempFile, syncWrites, taskMetrics = taskMetrics)
         partialFileHandle = Some(handle)
       } else if (HostAlloc.isUsageBelowThreshold(memoryThreshold)) {
         // Memory sufficient: use MEMORY_WITH_SPILL mode with predictive sizing
@@ -151,7 +153,8 @@ class RapidsLocalDiskShuffleMapOutputWriter(
             spillFile = outputTempFile,
             priority = Long.MinValue,
             syncWrites = syncWrites,
-            capacityHintProvider = Some(capacityHintProvider))
+            capacityHintProvider = Some(capacityHintProvider),
+            taskMetrics = taskMetrics)
           partialFileHandle = Some(handle)
           logDebug(s"Using memory-with-spill mode for shuffle $shuffleId map $mapId " +
             s"with predictive sizing (initial=${initialBufferSize / 1024 / 1024}MB, " +
@@ -161,7 +164,7 @@ class RapidsLocalDiskShuffleMapOutputWriter(
             logWarning(s"Failed to create memory buffer, " +
               s"falling back to file-only", e)
             val handle = SpillablePartialFileHandle.createFileOnly(
-              outputTempFile, syncWrites)
+              outputTempFile, syncWrites, taskMetrics = taskMetrics)
             partialFileHandle = Some(handle)
         }
       } else {
@@ -169,7 +172,7 @@ class RapidsLocalDiskShuffleMapOutputWriter(
         logDebug(s"Host memory usage high, using file-only mode for shuffle " +
           s"$shuffleId map $mapId")
         val handle = SpillablePartialFileHandle.createFileOnly(
-          outputTempFile, syncWrites)
+          outputTempFile, syncWrites, taskMetrics = taskMetrics)
         partialFileHandle = Some(handle)
       }
     }

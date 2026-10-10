@@ -52,24 +52,55 @@ class ShuffleSpillDiskIOThrottlerSuite extends AnyFunSuite {
 
     assert(sleeps === Seq(
       TimeUnit.MILLISECONDS.toNanos(250),
-      TimeUnit.MILLISECONDS.toNanos(250)))
+      TimeUnit.MILLISECONDS.toNanos(250),
+      TimeUnit.MILLISECONDS.toNanos(500)))
   }
 
   test("limiter does not add delay when underlying IO is slower") {
-    var now = 0L
     val sleeps = new ArrayBuffer[Long]()
     val limiter = new ThroughputLimiter(
       bytesPerSecond = 100L,
-      nanoTime = () => now,
+      nanoTime = () => 0L,
       sleepNanos = nanos => {
         sleeps += nanos
         ()
       })
 
-    limiter.acquire(25L)
-    now = TimeUnit.SECONDS.toNanos(1)
-    limiter.acquire(25L)
+    limiter.acquire(25L, TimeUnit.SECONDS.toNanos(1))
 
     assert(sleeps.isEmpty)
+  }
+
+  test("shared limit combines concurrent read and write reservations") {
+    val sleeps = new ArrayBuffer[Long]()
+    val limiter = new ShuffleSpillBandwidthLimiter(
+      readBytesPerSecond = 0L,
+      writeBytesPerSecond = 0L,
+      totalBytesPerSecond = 100L,
+      nanoTime = () => 0L,
+      sleepNanos = sleeps += _)
+
+    val readResult = limiter.throttleRead(50L, 0L)
+    val writeResult = limiter.throttleWrite(50L, 0L)
+
+    assert(readResult.waitNanos === TimeUnit.MILLISECONDS.toNanos(500))
+    assert(writeResult.waitNanos === TimeUnit.SECONDS.toNanos(1))
+    assert(sleeps === Seq(readResult.waitNanos, writeResult.waitNanos))
+  }
+
+  test("directional limits remain independent when shared limit is disabled") {
+    val sleeps = new ArrayBuffer[Long]()
+    val limiter = new ShuffleSpillBandwidthLimiter(
+      readBytesPerSecond = 100L,
+      writeBytesPerSecond = 100L,
+      totalBytesPerSecond = 0L,
+      nanoTime = () => 0L,
+      sleepNanos = sleeps += _)
+
+    val readResult = limiter.throttleRead(50L, 0L)
+    val writeResult = limiter.throttleWrite(50L, 0L)
+
+    assert(readResult.waitNanos === TimeUnit.MILLISECONDS.toNanos(500))
+    assert(writeResult.waitNanos === TimeUnit.MILLISECONDS.toNanos(500))
   }
 }
