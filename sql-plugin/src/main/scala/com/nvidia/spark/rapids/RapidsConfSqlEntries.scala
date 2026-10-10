@@ -258,6 +258,12 @@ private[rapids] trait RapidsConfSqlEntries extends RapidsConfResourceEntries {
       .booleanConf
       .createWithDefault(false)
 
+  val ENABLE_FILTER_PROJECT_FUSION = conf("spark.rapids.sql.filterProjectFusion.enabled")
+      .doc("Fuse eligible adjacent GPU filters and projections to avoid materializing " +
+        "unused filtered columns.")
+      .booleanConf
+      .createWithDefault(false)
+
   val ENABLE_TIERED_PROJECT = conf("spark.rapids.sql.tiered.project.enabled")
       .doc("Enable tiered projections.")
       .internal()
