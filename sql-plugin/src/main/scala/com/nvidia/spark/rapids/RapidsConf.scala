@@ -2241,6 +2241,26 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(false)
 
+  val SHUFFLE_SPILL_READ_BANDWIDTH =
+    conf("spark.rapids.shuffle.spill.readBandwidth")
+      .doc("Maximum aggregate disk read bandwidth per executor for partial shuffle files, " +
+        "in bytes per second. This is intended for testing slow spill storage. A value of 0 " +
+        "disables throttling.")
+      .startupOnly()
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ >= 0, "Shuffle spill read bandwidth must be non-negative")
+      .createWithDefault(0L)
+
+  val SHUFFLE_SPILL_WRITE_BANDWIDTH =
+    conf("spark.rapids.shuffle.spill.writeBandwidth")
+      .doc("Maximum aggregate disk write bandwidth per executor for partial shuffle files, " +
+        "in bytes per second. This is intended for testing slow spill storage. A value of 0 " +
+        "disables throttling.")
+      .startupOnly()
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ >= 0, "Shuffle spill write bandwidth must be non-negative")
+      .createWithDefault(0L)
+
   val SHUFFLE_TRANSPORT_EARLY_START = conf("spark.rapids.shuffle.transport.earlyStart")
     .doc("Enable early connection establishment for RAPIDS Shuffle")
     .startupOnly()
@@ -3522,6 +3542,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val partialFileBufferMaxSize: Long = get(PARTIAL_FILE_BUFFER_MAX_SIZE)
 
   lazy val partialFileBufferMemoryThreshold: Double = get(PARTIAL_FILE_BUFFER_MEMORY_THRESHOLD)
+
+  lazy val shuffleSpillReadBandwidth: Long = get(SHUFFLE_SPILL_READ_BANDWIDTH)
+
+  lazy val shuffleSpillWriteBandwidth: Long = get(SHUFFLE_SPILL_WRITE_BANDWIDTH)
 
   lazy val isUnspillEnabled: Boolean = get(UNSPILL)
 

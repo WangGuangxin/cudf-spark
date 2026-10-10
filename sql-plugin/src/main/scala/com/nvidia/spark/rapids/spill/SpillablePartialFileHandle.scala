@@ -81,7 +81,8 @@ class SpillablePartialFileHandle private (
     priority: Long,
     syncWrites: Boolean,
     bufferedOutputStreamFactory: FileOutputStream => BufferedOutputStream,
-    capacityHintProvider: Option[(Long, Long) => Long])
+    capacityHintProvider: Option[(Long, Long) => Long],
+    ioThrottler: ShuffleSpillDiskIOThrottler)
   extends HostSpillableHandle[ai.rapids.cudf.HostMemoryBuffer] with Logging {
 
   // State management
@@ -274,9 +275,7 @@ class SpillablePartialFileHandle private (
       val channel = fos.getChannel
       val bb = buffer.asByteBuffer()
       bb.limit(writePosition.toInt)
-      while (bb.hasRemaining) {
-        channel.write(bb)
-      }
+      writeToFileChannel(channel, bb)
       if (syncWrites) {
         channel.force(true)
       }
@@ -305,6 +304,7 @@ class SpillablePartialFileHandle private (
     if (shouldUseFile) {
       // FILE_ONLY mode or spilled: write to file
       ensureFileOutputStreamOpen()
+      ioThrottler.throttleWrite(1)
       bufferedOutputStream.get.write(b)
       writePosition += 1
     } else {
@@ -343,7 +343,15 @@ class SpillablePartialFileHandle private (
     if (shouldUseFile) {
       // FILE_ONLY mode or spilled: write to file
       ensureFileOutputStreamOpen()
-      bufferedOutputStream.get.write(bytes, offset, length)
+      var currentOffset = offset
+      var remaining = length
+      while (remaining > 0) {
+        val chunkSize = math.min(remaining, SpillablePartialFileHandle.THROTTLED_IO_CHUNK_SIZE)
+        ioThrottler.throttleWrite(chunkSize)
+        bufferedOutputStream.get.write(bytes, currentOffset, chunkSize)
+        currentOffset += chunkSize
+        remaining -= chunkSize
+      }
       writePosition += length
     } else {
       // MEMORY_WITH_SPILL mode: write to buffer (protected from spill)
@@ -428,6 +436,7 @@ class SpillablePartialFileHandle private (
 
     def readFromFile(): Int = {
       ensureFileInputStreamOpen()
+      ioThrottler.throttleRead(actualLength)
       val bytesRead = bufferedInputStream.get.read(bytes, offset, actualLength)
       if (bytesRead > 0) {
         readPosition += bytesRead
@@ -500,6 +509,7 @@ class SpillablePartialFileHandle private (
 
     def readFromFileChannel(): Int = {
       ensureFileChannelOpen()
+      ioThrottler.throttleRead(actualLength)
       val buf = ByteBuffer.wrap(bytes, offset, actualLength)
       fileChannel.get.read(buf, position)
     }
@@ -688,9 +698,7 @@ class SpillablePartialFileHandle private (
         val channel = fos.getChannel
         val bb = bufferToSpill.asByteBuffer()
         bb.limit(totalBytesWritten.toInt)
-        while (bb.hasRemaining) {
-          channel.write(bb)
-        }
+        writeToFileChannel(channel, bb)
         if (syncWrites) {
           channel.force(true)
         }
@@ -705,6 +713,20 @@ class SpillablePartialFileHandle private (
           notifyAll() // Wake up any waiting doClose()
         }
         throw e
+    }
+  }
+
+  private def writeToFileChannel(channel: FileChannel, buffer: ByteBuffer): Unit = {
+    while (buffer.hasRemaining) {
+      val originalLimit = buffer.limit()
+      val chunkSize = math.min(buffer.remaining(),
+        SpillablePartialFileHandle.THROTTLED_IO_CHUNK_SIZE)
+      buffer.limit(buffer.position() + chunkSize)
+      ioThrottler.throttleWrite(chunkSize)
+      while (buffer.hasRemaining) {
+        channel.write(buffer)
+      }
+      buffer.limit(originalLimit)
     }
   }
 
@@ -923,6 +945,7 @@ class SpillablePartialFileHandle private (
 object SpillablePartialFileHandle extends Logging {
 
   private val DEFAULT_FILE_BUFFER_SIZE = 64 * 1024
+  private[spill] val THROTTLED_IO_CHUNK_SIZE = 64 * 1024
 
   private[spill] def boundedReadLengthAsInt(requestedLength: Int, remainingBytes: Long): Int = {
     require(requestedLength >= 0, s"requestedLength must be non-negative: $requestedLength")
@@ -948,13 +971,24 @@ object SpillablePartialFileHandle extends Logging {
       priority = Long.MinValue,
       syncWrites = syncWrites,
       bufferedOutputStreamFactory = new BufferedOutputStream(_, DEFAULT_FILE_BUFFER_SIZE),
-      capacityHintProvider = None)
+      capacityHintProvider = None,
+      ioThrottler = ExecutorShuffleSpillDiskIOThrottler)
   }
 
   private[spill] def createFileOnly(
       file: File,
       syncWrites: Boolean,
       bufferedOutputStreamFactory: FileOutputStream => BufferedOutputStream):
+  SpillablePartialFileHandle = {
+    createFileOnly(file, syncWrites, bufferedOutputStreamFactory,
+      ExecutorShuffleSpillDiskIOThrottler)
+  }
+
+  private[spill] def createFileOnly(
+      file: File,
+      syncWrites: Boolean,
+      bufferedOutputStreamFactory: FileOutputStream => BufferedOutputStream,
+      ioThrottler: ShuffleSpillDiskIOThrottler):
   SpillablePartialFileHandle = {
     new SpillablePartialFileHandle(
       storageMode = PartialFileStorageMode.FILE_ONLY,
@@ -965,7 +999,8 @@ object SpillablePartialFileHandle extends Logging {
       priority = Long.MinValue,
       syncWrites = syncWrites,
       bufferedOutputStreamFactory = bufferedOutputStreamFactory,
-      capacityHintProvider = None)
+      capacityHintProvider = None,
+      ioThrottler = ioThrottler)
   }
 
   /**
@@ -1006,6 +1041,7 @@ object SpillablePartialFileHandle extends Logging {
       priority = priority,
       syncWrites = syncWrites,
       bufferedOutputStreamFactory = new BufferedOutputStream(_, DEFAULT_FILE_BUFFER_SIZE),
-      capacityHintProvider = capacityHintProvider)
+      capacityHintProvider = capacityHintProvider,
+      ioThrottler = ExecutorShuffleSpillDiskIOThrottler)
   }
 }

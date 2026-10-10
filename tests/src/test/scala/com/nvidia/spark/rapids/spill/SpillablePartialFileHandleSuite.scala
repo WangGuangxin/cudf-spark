@@ -29,6 +29,15 @@ import org.scalatestplus.mockito.MockitoSugar
 class SpillablePartialFileHandleSuite
     extends AnyFunSuite with BeforeAndAfterEach with MockitoSugar {
 
+  private class RecordingIOThrottler extends ShuffleSpillDiskIOThrottler {
+    var readBytes: Long = 0L
+    var writeBytes: Long = 0L
+
+    override def throttleRead(numBytes: Long): Unit = readBytes += numBytes
+
+    override def throttleWrite(numBytes: Long): Unit = writeBytes += numBytes
+  }
+
   // Use 1GB max buffer size for tests to avoid memory issues on test machines
   private val testMaxBufferSize = 1L * 1024 * 1024 * 1024
   private val spillInProgressField = {
@@ -107,6 +116,26 @@ class SpillablePartialFileHandleSuite
       
       // EOF check
       assert(handle.read(readBuffer, 0, 10) == -1)
+    }
+  }
+
+  test("FILE_ONLY mode: throttle disk reads and writes") {
+    val tempFile = File.createTempFile("test-file-only-throttle-", ".tmp")
+    val throttler = new RecordingIOThrottler
+    val data = new Array[Byte](SpillablePartialFileHandle.THROTTLED_IO_CHUNK_SIZE + 1)
+
+    withResource(SpillablePartialFileHandle.createFileOnly(
+      file = tempFile,
+      syncWrites = false,
+      bufferedOutputStreamFactory = new BufferedOutputStream(_),
+      ioThrottler = throttler)) { handle =>
+      handle.write(data, 0, data.length)
+      handle.finishWrite()
+      assert(throttler.writeBytes === data.length)
+
+      val readBuffer = new Array[Byte](data.length)
+      assert(handle.readAt(0, readBuffer, 0, readBuffer.length) === data.length)
+      assert(throttler.readBytes === data.length)
     }
   }
 
