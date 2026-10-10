@@ -1247,6 +1247,12 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(false)
 
+  val ENABLE_FILTER_PROJECT_FUSION = conf("spark.rapids.sql.filterProjectFusion.enabled")
+      .doc("Fuse eligible adjacent GPU filters and projections to avoid materializing " +
+        "unused filtered columns.")
+      .booleanConf
+      .createWithDefault(false)
+
   val ENABLE_TIERED_PROJECT = conf("spark.rapids.sql.tiered.project.enabled")
       .doc("Enable tiered projections.")
       .internal()
@@ -3673,6 +3679,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val isCastFloatToIntegralTypesEnabled: Boolean = get(ENABLE_CAST_FLOAT_TO_INTEGRAL_TYPES)
 
   lazy val isProjectAstEnabled: Boolean = get(ENABLE_PROJECT_AST)
+
+  lazy val isFilterProjectFusionEnabled: Boolean = get(ENABLE_FILTER_PROJECT_FUSION)
 
   lazy val isTieredProjectEnabled: Boolean = get(ENABLE_TIERED_PROJECT)
 

@@ -955,6 +955,9 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
         if (rapidsConf.isFileScanPrunePartitionEnabled) {
           updatedPlan = prunePartitionForFileSourceScan(updatedPlan)
         }
+        if (rapidsConf.isFilterProjectFusionEnabled) {
+          updatedPlan = GpuFilterProjectExec.fuse(updatedPlan, rapidsConf.shouldExplain)
+        }
         updatedPlan = insertColumnarFromGpu(updatedPlan)
         updatedPlan = insertCoalesce(updatedPlan)
         // only insert shuffle coalesces when using normal shuffle

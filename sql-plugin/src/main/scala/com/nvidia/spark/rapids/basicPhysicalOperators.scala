@@ -1352,7 +1352,7 @@ object GpuFilter {
     }
   }
 
-  private def computeCheckedFilterMask(boundCondition: GpuTieredProject,
+  private[rapids] def computeCheckedFilterMask(boundCondition: GpuTieredProject,
       cb: ColumnarBatch): Option[cudf.ColumnVector] = {
     withResource(boundCondition.project(cb)) { filterBatch =>
       val filterMask = filterBatch.column(0).asInstanceOf[GpuColumnVector]
