@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,16 +22,19 @@ import ai.rapids.cudf.{ColumnVector, HostMemoryBuffer, JCudfSerialization, Table
 import com.nvidia.spark.rapids.Arm._
 import org.mockito.ArgumentMatchers._
 import org.mockito.Mockito._
+import org.scalatest.PrivateMethodTester
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti, LeftSemi}
+import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 /** Tests for the "prepareBuildBatchesForJoin" function. */
-class GpuShuffledHashJoinExecSuite extends AnyFunSuite with MockitoSugar {
+class GpuShuffledHashJoinExecSuite extends AnyFunSuite with MockitoSugar with PrivateMethodTester {
   private val metricMap = mock[Map[String, GpuMetric]]
   when(metricMap(any())).thenReturn(NoopMetric)
 
@@ -136,6 +139,56 @@ class GpuShuffledHashJoinExecSuite extends AnyFunSuite with MockitoSugar {
             assertBatchColsAndRowsAndClose(builtBatch, 1, 5)
           }
           assert(batchCount == 1)
+        }
+      }
+    }
+  }
+
+  test("composite join keys filter build rows when any key is null") {
+    TestUtils.withGpuSparkSession(new SparkConf()) { _ =>
+      val buildAttrs = Seq(
+        AttributeReference("key1", IntegerType, nullable = true)(),
+        AttributeReference("key2", IntegerType, nullable = true)())
+      val child = mock[SparkPlan]
+      when(child.output).thenReturn(buildAttrs)
+      val readOption = CoalesceReadOption(new RapidsConf(new SparkConf()))
+      val buildGoalMethod = PrivateMethod[CoalesceSizeGoal](Symbol("buildGoal"))
+      val joinCases = Seq((Inner, GpuBuildLeft), (Inner, GpuBuildRight),
+        (LeftSemi, GpuBuildRight), (LeftAnti, GpuBuildRight))
+
+      joinCases.foreach { case (joinType, buildSide) =>
+        val join = GpuShuffledHashJoinExec(buildAttrs, buildAttrs, joinType, buildSide,
+          None, child, child, readOption, isSkewJoin = false)(buildAttrs, buildAttrs)
+        // Use the operator's goal so changing its mask back to OR fails this test.
+        val goal = join invokePrivate buildGoalMethod()
+        Seq(false, true).foreach { serialized =>
+          val buildIter = withResource(ColumnVector.fromBoxedInts(null, 1, null, 1)) { key1 =>
+            withResource(ColumnVector.fromBoxedInts(1, null, null, 1)) { key2 =>
+              withResource(new Table(key1, key2)) { table =>
+                val batch = if (serialized) {
+                  getSerializedBatch(table)
+                } else {
+                  GpuColumnVector.from(table, buildAttrs.map(_.dataType).toArray)
+                }
+                Iterator(batch)
+              }
+            }
+          }
+          withClue(s"joinType=$joinType, buildSide=$buildSide, serialized=$serialized: ") {
+            testJoinPreparation(buildIter, goal, buildAttrs, optimalCase = serialized) { data =>
+              assert(data.isLeft)
+              withResource(data.left.get) { batch =>
+                assertResult(2)(batch.numCols())
+                assertResult(1)(batch.numRows())
+                GpuColumnVector.extractBases(batch).foreach { column =>
+                  withResource(column.copyToHost()) { hostColumn =>
+                    assert(!hostColumn.isNull(0))
+                    assertResult(1)(hostColumn.getInt(0))
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }
