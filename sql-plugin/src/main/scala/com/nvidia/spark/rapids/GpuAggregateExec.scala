@@ -157,7 +157,8 @@ object AggregateUtils extends Logging {
       metrics: GpuHashAggregateMetrics,
       targetMergeBatchSize: Long,
       configuredTargetBatchSize: Long,
-      helper: AggHelper
+      helper: AggHelper,
+      keysAreUnique: () => Boolean = () => false
   ): Iterator[SpillableColumnarBatch] = {
     new Iterator[SpillableColumnarBatch] {
 
@@ -194,7 +195,15 @@ object AggregateUtils extends Logging {
           if (stagingBatches.size == 1) {
             return stagingBatches.head
           }
-          concatenateAndMergeWithRetry(stagingBatches, metrics, helper)
+          // A specialized first pass can prove that all keys are already unique after
+          // draining its input. Concatenation then preserves complete aggregation.
+          if (keysAreUnique()) {
+            withResource(stagingBatches) { _ =>
+              concatenateBatchesWithRetry(metrics, stagingBatches.toSeq)
+            }
+          } else {
+            concatenateAndMergeWithRetry(stagingBatches, metrics, helper)
+          }
         }
         }
       }
@@ -450,7 +459,7 @@ class AggHelper(
       conf, metrics)
 
   // a bound expression that is applied after the cuDF aggregate
-  private val postStepBound =
+  private[rapids] val postStepBound =
     GpuBindReferences.bindGpuReferencesTiered(postStep.toList, postStepAttr.toList, conf, metrics)
 
   /**
@@ -540,16 +549,18 @@ class AggHelper(
   def performReduction(preProcessed: ColumnarBatch): ColumnarBatch = {
     NvtxRegistry.AGG_REDUCE {
       val cvs = mutable.ArrayBuffer[GpuColumnVector]()
-      cudfAggregates.zipWithIndex.foreach { case (cudfAgg, ix) =>
-        val aggFn = cudfAgg.reductionAggregate
-        val cols = GpuColumnVector.extractColumns(preProcessed)
-        val reductionCol = cols(aggOrdinals(ix))
-        withResource(aggFn(reductionCol.getBase)) { res =>
-          cvs += GpuColumnVector.from(
-            cudf.ColumnVector.fromScalar(res, 1), cudfAgg.dataType)
+      closeOnExcept(cvs) { _ =>
+        cudfAggregates.zipWithIndex.foreach { case (cudfAgg, ix) =>
+          val aggFn = cudfAgg.reductionAggregate
+          val cols = GpuColumnVector.extractColumns(preProcessed)
+          val reductionCol = cols(aggOrdinals(ix))
+          withResource(aggFn(reductionCol.getBase)) { res =>
+            cvs += GpuColumnVector.from(
+              cudf.ColumnVector.fromScalar(res, 1), cudfAgg.dataType)
+          }
         }
+        new ColumnarBatch(cvs.toArray, 1)
       }
-      new ColumnarBatch(cvs.toArray, 1)
     }
   }
 
@@ -907,7 +918,8 @@ class GpuMergeAggregateIterator(
     allowNonFullyAggregatedOutput: Boolean,
     skipAggPassReductionRatio: Double,
     localInputRowsCount: LocalGpuMetric,
-    allMetrics: Map[String, GpuMetric]
+    allMetrics: Map[String, GpuMetric],
+    firstPassKeysAreUnique: () => Boolean = () => false
 )
   extends Iterator[ColumnarBatch] with AutoCloseable with Logging {
   private[this] val isReductionOnly = groupingExpressions.isEmpty
@@ -1004,7 +1016,7 @@ class GpuMergeAggregateIterator(
           metrics,
           targetMergeBatchSize,
           configuredTargetBatchSize,
-          concatAndMergeHelper)
+          concatAndMergeHelper, firstPassKeysAreUnique)
         , metrics, targetMergeBatchSize, concatAndMergeHelper,
         hashKeys, defaultHashBucketNum, baseHashSeed, 0, maxLevelsOfRepartition, batchesByBucket)
       if (repartitionHappened) {
