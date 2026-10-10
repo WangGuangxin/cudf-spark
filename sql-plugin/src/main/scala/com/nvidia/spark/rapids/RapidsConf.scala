@@ -974,6 +974,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val isProjectAstEnabled: Boolean = get(ENABLE_PROJECT_AST)
 
+  lazy val isExpandAggregateFusionEnabled: Boolean = get(ENABLE_EXPAND_AGGREGATE_FUSION)
+
   lazy val isTieredProjectEnabled: Boolean = get(ENABLE_TIERED_PROJECT)
 
   lazy val isCombinedExpressionsEnabled: Boolean = get(ENABLE_COMBINED_EXPRESSIONS)
