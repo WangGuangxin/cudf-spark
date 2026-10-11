@@ -20,7 +20,6 @@ import scala.collection.AbstractIterator
 import scala.concurrent.Future
 
 import com.nvidia.spark.rapids._
-import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric.{DEBUG_LEVEL, ESSENTIAL_LEVEL, MODERATE_LEVEL}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.{splitSpillableInHalfByRows, withRetry}
@@ -242,25 +241,7 @@ abstract class GpuShuffleExchangeExecBase(
   private lazy val serializer: Serializer = new GpuColumnarBatchSerializer(
     allMetrics, sparkTypes, kudoMode, useKudo, kudoBufferCopyMeasurementEnabled)
 
-  private lazy val partialAggregateFusion: Option[(GpuHashAggregateExec, Array[Int])] = {
-    val rapidsConf = new RapidsConf(conf)
-    if (rapidsConf.shufflePartialAggPackEnabled && useGPUShuffle &&
-        rapidsConf.loreDumpIds.isEmpty && rapidsConf.loreDumpPath.isEmpty) {
-      (child, gpuOutputPartitioning) match {
-        case (agg: GpuHashAggregateExec, hp: GpuHashPartitioning)
-            if !hp.usesKudoGPUSlicing =>
-          GpuPartialAggregateShuffle.operations(agg, hp).map(ops => (agg, ops))
-        case _ => None
-      }
-    } else None
-  }
-
-  def isPartialAggregatePackFused: Boolean = partialAggregateFusion.isDefined
-
-  @transient lazy val inputBatchRDD: RDD[ColumnarBatch] = partialAggregateFusion match {
-    case Some((agg, _)) => agg.executePartialAggregateForShuffle()
-    case None => child.executeColumnar()
-  }
+  @transient lazy val inputBatchRDD: RDD[ColumnarBatch] = child.executeColumnar()
 
   /**
    * Returns the GPU partitioning used to build the shuffle dependency. Distributions whose
@@ -294,8 +275,7 @@ abstract class GpuShuffleExchangeExecBase(
       additionalMetrics,
       opTimeNewShuffleWrite,
       descendantOpTimeMetrics,
-      enableOpTimeTrackingRdd,
-      partialAggregateFusion.map { case (agg, ops) => (ops, agg.allMetrics) })
+      enableOpTimeTrackingRdd)
   }
 
   /**
@@ -425,8 +405,7 @@ object GpuShuffleExchangeExecBase {
       additionalMetrics: Map[String, GpuMetric],
       opTimeNewShuffleWrite: Option[GpuMetric] = None,
       descendantOpTimeMetrics: Seq[GpuMetric] = Seq.empty,
-      enableOpTimeTrackingRdd: Boolean = true,
-      partialAggregateMerge: Option[(Array[Int], Map[String, GpuMetric])] = None)
+      enableOpTimeTrackingRdd: Boolean = true)
   : ShuffleDependency[Int, ColumnarBatch, ColumnarBatch] = {
     val isRoundRobin = newPartitioning match {
       case _: GpuRoundRobinPartitioning => true
@@ -465,17 +444,7 @@ object GpuShuffleExchangeExecBase {
     val partitionTime: GpuMetric = metrics(METRIC_SHUFFLE_PARTITION_TIME)
     def getPartitioned: ColumnarBatch => Any = {
       batch => partitionTime.ns {
-        partialAggregateMerge match {
-          case Some((ops, aggMetrics)) =>
-            val packed = aggMetrics(GpuMetric.AGG_TIME).ns {
-              partitioner.asInstanceOf[GpuHashPartitioning].partialAggregateAndPack(batch, ops)
-            }
-            aggMetrics(GpuMetric.NUM_OUTPUT_ROWS) += packed.map(_._1.numRows().toLong).sum
-            aggMetrics(GpuMetric.NUM_OUTPUT_BATCHES) += 1
-            aggMetrics("NUM_AGGS") += 1
-            packed
-          case None => partitioner.columnarEvalAny(batch)
-        }
+        partitioner.columnarEvalAny(batch)
       }
     }
     val rddWithPartitionIds: RDD[Product2[Int, ColumnarBatch]] = {
@@ -497,7 +466,7 @@ object GpuShuffleExchangeExecBase {
             if (!partitionedIter.hasNext && iter.hasNext) {
               var batch = iter.next()
               while (batch.numRows == 0 && iter.hasNext) {
-                withResource(batch) { _ => () }
+                batch.close()
                 batch = iter.next()
               }
               // Get a non-empty batch or the last batch. So still need to
@@ -511,7 +480,7 @@ object GpuShuffleExchangeExecBase {
                   getParts(cb).asInstanceOf[Array[(ColumnarBatch, Int)]]
                 }
               } else {
-                withResource(batch) { _ => () }
+                batch.close()
               }
             }
             // Process the next partitioned array from the iterator

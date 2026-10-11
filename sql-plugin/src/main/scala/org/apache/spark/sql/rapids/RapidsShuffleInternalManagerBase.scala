@@ -1657,8 +1657,7 @@ class RapidsCachingWriter[K, V](
               uncompressedMetric += c.getTableMeta.bufferMeta().uncompressedSize()
               catalog.addCompressedBatch(
                 blockId,
-                // The catalog consumes a reference; the input iterator still owns its batch.
-                GpuCompressedColumnVector.incRefCounts(batch),
+                batch,
                 SpillPriorities.OUTPUT_FOR_SHUFFLE_INITIAL_TASK_PRIORITY)
             case c =>
               throw new IllegalStateException(s"Unexpected column type: ${c.getClass}")

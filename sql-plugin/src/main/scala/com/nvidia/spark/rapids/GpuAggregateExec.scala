@@ -158,8 +158,7 @@ object AggregateUtils extends Logging {
       targetMergeBatchSize: Long,
       configuredTargetBatchSize: Long,
       helper: AggHelper,
-      keysAreUnique: () => Boolean = () => false,
-      deferLastMerge: Boolean = false
+      keysAreUnique: () => Boolean = () => false
   ): Iterator[SpillableColumnarBatch] = {
     new Iterator[SpillableColumnarBatch] {
 
@@ -198,8 +197,7 @@ object AggregateUtils extends Logging {
           }
           // A specialized first pass can prove that all keys are already unique after
           // draining its input. Concatenation then preserves complete aggregation.
-          // A fused shuffle consumer may instead finish this bounded merge when packing.
-          if (keysAreUnique() || deferLastMerge) {
+          if (keysAreUnique()) {
             withResource(stagingBatches) { _ =>
               concatenateBatchesWithRetry(metrics, stagingBatches.toSeq)
             }
@@ -921,8 +919,7 @@ class GpuMergeAggregateIterator(
     skipAggPassReductionRatio: Double,
     localInputRowsCount: LocalGpuMetric,
     allMetrics: Map[String, GpuMetric],
-    firstPassKeysAreUnique: () => Boolean = () => false,
-    deferFinalMerge: Boolean = false
+    firstPassKeysAreUnique: () => Boolean = () => false
 )
   extends Iterator[ColumnarBatch] with AutoCloseable with Logging {
   private[this] val isReductionOnly = groupingExpressions.isEmpty
@@ -1019,21 +1016,15 @@ class GpuMergeAggregateIterator(
           metrics,
           targetMergeBatchSize,
           configuredTargetBatchSize,
-          concatAndMergeHelper, firstPassKeysAreUnique, deferLastMerge = deferFinalMerge)
+          concatAndMergeHelper, firstPassKeysAreUnique)
         , metrics, targetMergeBatchSize, concatAndMergeHelper,
         hashKeys, defaultHashBucketNum, baseHashSeed, 0, maxLevelsOfRepartition, batchesByBucket)
       if (repartitionHappened) {
         metrics.numTasksRepartitioned += 1
       }
 
-      realIter = Some(if (deferFinalMerge) {
-        // The shuffle consumer merges each bucket directly into packed partition buffers.
-        // Avoid concatenating completed buckets into another materialized output batch.
-        buildBucketIterator().map(sb => withRetryNoSplit(sb)(_.getColumnarBatch()))
-      } else {
-        ConcatIterator(new CloseableBufferedIterator(buildBucketIterator()),
-          configuredTargetBatchSize)
-      })
+      realIter = Some(ConcatIterator(
+        new CloseableBufferedIterator(buildBucketIterator()), configuredTargetBatchSize))
       realIter.get.next()
     }
   }
@@ -1108,12 +1099,8 @@ class GpuMergeAggregateIterator(
                 }
               }
 
-              if (deferFinalMerge) {
-                concatenateBatchesWithRetry(metrics, toAggregateBuckets.flatMap(_.data).toSeq)
-              } else {
-                AggregateUtils.concatenateAndMergeWithRetry(
-                  toAggregateBuckets.flatMap(_.data), metrics, concatAndMergeHelper)
-              }
+              AggregateUtils.concatenateAndMergeWithRetry(
+                toAggregateBuckets.flatMap(_.data), metrics, concatAndMergeHelper)
           }
         }
       }
@@ -2027,21 +2014,6 @@ case class GpuHashAggregateExec(
   }
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    aggregateRdd(deferFinalMerge = false)
-  }
-
-  /** Only the paired shuffle consumer may read these canonical, possibly unmerged buffers. */
-  def executePartialAggregateForShuffle(): RDD[ColumnarBatch] = executeQuery {
-    val rdd = wrapWithTimeTrackingRDD(aggregateRdd(deferFinalMerge = true))
-    getTaskMetrics.map { taskMetrics =>
-      rdd.mapPartitions { iter =>
-        taskMetrics.makeSureRegistered()
-        iter
-      }
-    }.getOrElse(rdd)
-  }
-
-  private def aggregateRdd(deferFinalMerge: Boolean): RDD[ColumnarBatch] = {
     val aggMetrics = GpuHashAggregateMetrics(
       numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS),
       numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES),
@@ -2087,7 +2059,7 @@ case class GpuHashAggregateExec(
         localEstimatedPreProcessGrowth, alreadySorted, expectedOrdering,
         postBoundReferences, targetBatchSize, aggMetrics, conf,
         localForcePre, localAllowPre, allowNonFullyAggregatedOutput, skipAggPassReductionRatio,
-        allMetrics, deferFinalMerge
+        allMetrics
       )
     }
   }
@@ -2208,8 +2180,7 @@ class DynamicGpuPartialAggregateIterator(
     allowSinglePassAgg: Boolean,
     allowNonFullyAggregatedOutput: Boolean,
     skipAggPassReductionRatio: Double,
-    allMetrics: Map[String, GpuMetric],
-    deferFinalMerge: Boolean = false
+    allMetrics: Map[String, GpuMetric]
 ) extends Iterator[ColumnarBatch] {
   private var aggIter: Option[Iterator[ColumnarBatch]] = None
   private[this] val isReductionOnly = boundGroupExprs.outputExprs.isEmpty
@@ -2315,12 +2286,10 @@ class DynamicGpuPartialAggregateIterator(
       allowNonFullyAggregatedOutput,
       skipAggPassReductionRatio,
       localInputRowsMetrics,
-      allMetrics,
-      deferFinalMerge = deferFinalMerge
+      allMetrics
     )
 
-    if (deferFinalMerge) mergeIter
-    else GpuAggFinalPassIterator.makeIter(mergeIter, postBoundReferences, metrics)
+    GpuAggFinalPassIterator.makeIter(mergeIter, postBoundReferences, metrics)
   }
 
   override def next(): ColumnarBatch = {
