@@ -22,18 +22,27 @@ import com.nvidia.spark.rapids.jni.DistinctHashJoin
 import com.nvidia.spark.rapids.spill.{SpillableJoinHashHandle, SpillFramework}
 
 /** Own one reusable hash state; pressure or a failed attempt may discard it without losing keys. */
-private[execution] class GpuJoinHashCache(distinct: Boolean, compareNullsEqual: Boolean)
+private[execution] class GpuJoinHashCache(distinct: Boolean, compareNullsEqual: Boolean,
+    reuseEnabled: Boolean = true)
     extends AutoCloseable with Retryable {
   private var cached: Option[SpillableJoinHashHandle] = None
   private[execution] var buildCount: Long = 0
 
+  private def build(keys: Table): AutoCloseable = {
+    val state = if (distinct) new DistinctHashJoin(keys, compareNullsEqual)
+      else new HashJoin(keys, compareNullsEqual)
+    buildCount += 1
+    state
+  }
+
   private def withState[T](keys: Table)(fn: AutoCloseable => T): T = {
-    cached.flatMap(_.withState(fn)) match {
+    if (!reuseEnabled) {
+      withResource(build(keys))(fn)
+    } else cached.flatMap(_.withState(fn)) match {
       case Some(result) => result
       case None =>
         close()
-        val state = if (distinct) new DistinctHashJoin(keys, compareNullsEqual)
-          else new HashJoin(keys, compareNullsEqual)
+        val state = build(keys)
         // Hash slots plus row metadata. This is a spill-planning estimate, not an exact size.
         val bytes = math.max(1L, keys.getRowCount * 32L)
         val handle = closeOnExcept(state)(new SpillableJoinHashHandle(_, bytes))
@@ -42,7 +51,6 @@ private[execution] class GpuJoinHashCache(distinct: Boolean, compareNullsEqual: 
           handle.withState { resource =>
             SpillFramework.stores.deviceStore.track(handle)
             cached = Some(handle)
-            buildCount += 1
             fn(resource)
           }.get
         }

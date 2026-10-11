@@ -1078,7 +1078,10 @@ case class JoinOptions(
     buildSideSelection: JoinBuildSideSelection.JoinBuildSideSelection,
     targetSize: Long,
     logCardinalityEnabled: Boolean,
-    sizeEstimateThreshold: Double)
+    sizeEstimateThreshold: Double,
+    buildKeyCacheEnabled: Boolean = true,
+    hashReuseEnabled: Boolean = true,
+    outerBitmapEnabled: Boolean = true)
 
 /**
  * Statistics for join cardinality logging to help diagnose performance issues.
@@ -1160,37 +1163,51 @@ abstract class BaseHashJoinIterator(
       opTime = opTime,
       joinTime = joinTime) {
   private var cachedBuiltKeys: Option[LazySpillableColumnarBatch] = None
-  protected lazy val regularHash = new GpuJoinHashCache(false, compareNullsEqual)
-  protected lazy val distinctHash = new GpuJoinHashCache(true, compareNullsEqual)
+  protected lazy val regularHash =
+    new GpuJoinHashCache(false, compareNullsEqual, joinOptions.hashReuseEnabled)
+  protected lazy val distinctHash =
+    new GpuJoinHashCache(true, compareNullsEqual, joinOptions.hashReuseEnabled)
   private[execution] def hashBuildCount: Long = regularHash.buildCount + distinctHash.buildCount
 
-  private def projectedBuiltKeys: LazySpillableColumnarBatch = {
-    cachedBuiltKeys.getOrElse {
-      // Build keys are deterministic and the build batch does not change across stream batches.
-      built.checkpoint()
-      val keys = withRetryNoSplit[LazySpillableColumnarBatch] {
-        withRestoreOnRetry(built) {
-          withResource(GpuProjectExec.project(built.getBatch, boundBuiltKeys)) { projected =>
-            // Hash state retains keys between probes. Copy them out of contiguous payload buffers.
+  private def projectBuiltKeys(): LazySpillableColumnarBatch = {
+    built.checkpoint()
+    withRetryNoSplit[LazySpillableColumnarBatch] {
+      withRestoreOnRetry(built) {
+        withResource(GpuProjectExec.project(built.getBatch, boundBuiltKeys)) { projected =>
+          // Only retained hash state needs keys detached from contiguous payload buffers.
+          val ownedKeys = if (joinOptions.hashReuseEnabled) {
             withResource(GpuColumnVector.extractBases(projected).toSeq.safeMap { column =>
               column.subVector(0, projected.numRows())
             }) { columns =>
               withResource(new Table(columns: _*)) { table =>
-                withResource(GpuColumnVector.from(table, GpuColumnVector.extractTypes(projected))) {
-                  copied =>
-                    closeOnExcept(LazySpillableColumnarBatch(copied, "build_keys")) { spillable =>
-                      built.allowSpilling()
-                      spillable.allowSpilling()
-                      spillable
-                    }
-                }
+                GpuColumnVector.from(table, GpuColumnVector.extractTypes(projected))
               }
+            }
+          } else {
+            GpuColumnVector.incRefCounts(projected)
+          }
+          withResource(ownedKeys) { keys =>
+            closeOnExcept(LazySpillableColumnarBatch(keys, "build_keys")) { spillable =>
+              built.allowSpilling()
+              spillable.allowSpilling()
+              spillable
             }
           }
         }
       }
-      cachedBuiltKeys = Some(keys)
-      keys
+    }
+  }
+
+  private def withProjectedBuiltKeys[T](fn: LazySpillableColumnarBatch => T): T = {
+    if (joinOptions.buildKeyCacheEnabled) {
+      val keys = cachedBuiltKeys.getOrElse {
+        val projected = projectBuiltKeys()
+        cachedBuiltKeys = Some(projected)
+        projected
+      }
+      fn(keys)
+    } else {
+      withResource(projectBuiltKeys())(fn)
     }
   }
 
@@ -1209,12 +1226,13 @@ abstract class BaseHashJoinIterator(
   protected lazy val buildStats: JoinBuildSideStats = buildStatsOpt.getOrElse {
     joinType match {
       case _: InnerLike | LeftOuter | RightOuter | FullOuter =>
-        val keys = projectedBuiltKeys
-        keys.checkpoint()
-        withRetryNoSplit {
-          withRestoreOnRetry(keys) {
-            withResource(LazySpillableColumnarBatch.spillOnly(keys)) { spillOnlyKeys =>
-              JoinBuildSideStats.fromKeys(spillOnlyKeys.getBatch)
+        withProjectedBuiltKeys { keys =>
+          keys.checkpoint()
+          withRetryNoSplit {
+            withRestoreOnRetry(keys) {
+              withResource(LazySpillableColumnarBatch.spillOnly(keys)) { spillOnlyKeys =>
+                JoinBuildSideStats.fromKeys(spillOnlyKeys.getBatch)
+              }
             }
           }
         }
@@ -1430,25 +1448,26 @@ abstract class BaseHashJoinIterator(
     // cb will be closed by the caller, so use a spill-only version here
     val spillOnlyCb = LazySpillableColumnarBatch.spillOnly(cb)
     try {
-      val keys = projectedBuiltKeys
-      val batches = Seq(built, keys, spillOnlyCb)
-      batches.foreach(_.checkpoint())
-      withRetryNoSplit {
-        withRestoreOnRetry(Seq(regularHash, distinctHash)) {
-          withRestoreOnRetry(batches) {
-            // We need a new LSCB that will be taken over by the gatherer, or closed
-            closeOnExcept(LazySpillableColumnarBatch(spillOnlyCb.getBatch, "stream_data")) {
-              streamBatch =>
-                // the original stream data batch is not spillable until
-                // we ask it to be right here, because we called `getBatch` on it
-                // to make up the new lazy spillable (`streamBatch`)
-                spillOnlyCb.allowSpilling()
+      withProjectedBuiltKeys { keys =>
+        val batches = Seq(built, keys, spillOnlyCb)
+        batches.foreach(_.checkpoint())
+        withRetryNoSplit {
+          withRestoreOnRetry(Seq(regularHash, distinctHash)) {
+            withRestoreOnRetry(batches) {
+              // We need a new LSCB that will be taken over by the gatherer, or closed
+              closeOnExcept(LazySpillableColumnarBatch(spillOnlyCb.getBatch, "stream_data")) {
+                streamBatch =>
+                  // the original stream data batch is not spillable until
+                  // we ask it to be right here, because we called `getBatch` on it
+                  // to make up the new lazy spillable (`streamBatch`)
+                  spillOnlyCb.allowSpilling()
 
-                withResource(GpuColumnVector.incRefCounts(keys.getBatch)) { builtKeys =>
-                  // The local reference keeps keys alive while the cached batch can be spilled.
-                  keys.allowSpilling()
-                  joinGatherer(builtKeys, built, streamBatch)
-                }
+                  withResource(GpuColumnVector.incRefCounts(keys.getBatch)) { builtKeys =>
+                    // The local reference keeps keys alive while the cached batch can be spilled.
+                    keys.allowSpilling()
+                    joinGatherer(builtKeys, built, streamBatch)
+                  }
+              }
             }
           }
         }
@@ -2318,7 +2337,7 @@ class HashJoinStreamSideIterator(
   /** Update the matched-row bitmap directly from the build-side gather map. */
   private def updateTrackingMask(buildSideGatherMap: LazySpillableGatherMap): Unit = {
     val tracker = builtSideTracker.getOrElse {
-      val created = OuterJoinTracker(built.numRows)
+      val created = OuterJoinTracker(built.numRows, joinOptions.outerBitmapEnabled)
       builtSideTracker = Some(created)
       created
     }

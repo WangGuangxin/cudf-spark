@@ -801,6 +801,30 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(false)
 
+  val JOIN_BUILD_KEY_CACHE_ENABLED = conf("spark.rapids.sql.join.buildKeyCache.enabled")
+    .doc("Reuse projected build keys across hash join stream batches. When disabled, " +
+      "project build keys separately for statistics and each probe. This controls ordinary " +
+      "hash joins; fused join chains retain their own keys. Disable join.chain.enabled " +
+      "to measure the ordinary hash join baseline.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val JOIN_HASH_REUSE_ENABLED = conf("spark.rapids.sql.join.hashReuse.enabled")
+    .doc("Reuse evictable build hash state across GPU join probes, including fused join " +
+      "chains. When disabled, build and release hash state for each probe. Independent " +
+      "of buildKeyCache.enabled.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val JOIN_OUTER_BITMAP_ENABLED = conf("spark.rapids.sql.join.outerBitmap.enabled")
+    .doc("Track matched build rows using a spillable device bitmap for hash outer joins. " +
+      "When disabled, use the spillable boolean column and filter/scatter tracking path.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
   val ENABLE_JOIN_CHAIN = conf("spark.rapids.sql.join.chain.enabled")
     .doc("When enabled, consecutive GPU hash joins within a stage are fused into a single " +
       "chain that defers payload materialization: only join keys are gathered between probes " +
@@ -3379,7 +3403,9 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
     val buildSideSelection = JoinBuildSideSelection.withName(buildSideStr)
     val logCardinality = LOG_JOIN_CARDINALITY.get(conf)
     val sizeEstimateThreshold = JOIN_GATHERER_SIZE_ESTIMATE_THRESHOLD.get(conf)
-    JoinOptions(strategy, buildSideSelection, targetSize, logCardinality, sizeEstimateThreshold)
+    JoinOptions(strategy, buildSideSelection, targetSize, logCardinality, sizeEstimateThreshold,
+      JOIN_BUILD_KEY_CACHE_ENABLED.get(conf), JOIN_HASH_REUSE_ENABLED.get(conf),
+      JOIN_OUTER_BITMAP_ENABLED.get(conf))
   }
 }
 
@@ -3484,7 +3510,9 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
     val buildSideSelection = JoinBuildSideSelection.withName(buildSideStr)
     val logCardinality = get(LOG_JOIN_CARDINALITY)
     val sizeEstimateThreshold = get(JOIN_GATHERER_SIZE_ESTIMATE_THRESHOLD)
-    JoinOptions(strategy, buildSideSelection, targetSize, logCardinality, sizeEstimateThreshold)
+    JoinOptions(strategy, buildSideSelection, targetSize, logCardinality, sizeEstimateThreshold,
+      get(JOIN_BUILD_KEY_CACHE_ENABLED), get(JOIN_HASH_REUSE_ENABLED),
+      get(JOIN_OUTER_BITMAP_ENABLED))
   }
 
   lazy val sizedJoinPartitionAmplification: Double = get(SIZED_JOIN_PARTITION_AMPLIFICATION)

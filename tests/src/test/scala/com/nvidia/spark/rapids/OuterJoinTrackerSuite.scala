@@ -33,6 +33,37 @@ class OuterJoinTrackerSuite extends RmmSparkRetrySuiteBase {
     }
   }
 
+  test("boolean baseline accumulates matches across updates and spilled snapshots") {
+    withResource(OuterJoinTracker(65, useBitmap = false)) { tracker =>
+      assert(tracker.sizeInBytes >= tracker.numRows)
+      withResource(ColumnVector.fromInts(1, 31, 31, Int.MinValue)) { indices =>
+        tracker.update(indices)
+        tracker.update(indices)
+      }
+      assert(SpillFramework.stores.deviceStore.spill(Long.MaxValue) > 0)
+      assert(SpillFramework.stores.hostStore.spill(Long.MaxValue) > 0)
+      withResource(ColumnVector.fromInts(2, 64)) { indices =>
+        RmmSpark.forceRetryOOM(RmmSpark.getCurrentThreadId, 1)
+        withRetryNoSplit { tracker.update(indices) }
+      }
+      assertUnmatched(tracker, Set(1, 2, 31, 64))
+      assert(SpillFramework.stores.deviceStore.spill(Long.MaxValue) > 0)
+      assertUnmatched(tracker, Set(1, 2, 31, 64))
+    }
+    assert(SpillFramework.stores.deviceStore.numHandles == 0)
+    assert(SpillFramework.stores.hostStore.numHandles == 0)
+    assert(SpillFramework.stores.diskStore.numHandles == 0)
+  }
+
+  test("boolean baseline handles zero rows and empty maps") {
+    Seq(0, 33).foreach { rows =>
+      withResource(OuterJoinTracker(rows, useBitmap = false)) { tracker =>
+        withResource(ColumnVector.fromInts()) { indices => tracker.update(indices) }
+        assertUnmatched(tracker, Set.empty)
+      }
+    }
+  }
+
   test("bitmap stays compact and accumulates matches across updates") {
     withResource(OuterJoinTracker(65)) { tracker =>
       assert(tracker.sizeInBytes == 12)

@@ -474,7 +474,8 @@ private[execution] class JoinChainIterator(
       }, attrs, builds.head, options.targetSize, options.sizeEstimateThreshold,
       opTime, stages.last.joinTime) {
   private case class Origin(source: Int, column: Int)
-  private val hashes = stages.map(stage => new GpuJoinHashCache(true, stage.nullsEqual))
+  private val hashes = stages.map(stage =>
+    new GpuJoinHashCache(true, stage.nullsEqual, options.hashReuseEnabled))
   private[execution] def hashBuildCount: Long = hashes.map(_.buildCount).sum
   override def close(): Unit = {
     if (!closed) {

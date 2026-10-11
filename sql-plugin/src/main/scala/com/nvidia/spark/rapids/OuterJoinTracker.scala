@@ -16,14 +16,23 @@
 
 package com.nvidia.spark.rapids
 
-import ai.rapids.cudf.{ColumnVector, ColumnView}
+import ai.rapids.cudf.{ColumnVector, ColumnView, Scalar, Table}
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.jni.JoinPrimitives
 
-/** A spillable matched-row bitmap, owned by one outer join build group at a time. */
-class OuterJoinTracker private(
+import org.apache.spark.sql.types.{BooleanType, DataType}
+
+/** Matched-row tracking, owned by one outer join build group at a time. */
+trait OuterJoinTracker extends AutoCloseable {
+  def numRows: Int
+  def sizeInBytes: Long
+  def update(gatherIndices: ColumnView): Unit
+  def unmatchedMask(): ColumnVector
+}
+
+private class BitmapOuterJoinTracker(
     val numRows: Int,
-    private var bitmap: Option[SpillableBuffer]) extends AutoCloseable {
+    private var bitmap: Option[SpillableBuffer]) extends OuterJoinTracker {
   def sizeInBytes: Long = bitmap.get.sizeInBytes
 
   def update(gatherIndices: ColumnView): Unit = {
@@ -65,13 +74,71 @@ class OuterJoinTracker private(
   }
 }
 
-object OuterJoinTracker {
-  def apply(numRows: Int): OuterJoinTracker = {
-    val bitmap = closeOnExcept(JoinPrimitives.createOuterJoinTracker(numRows)) { buffer =>
-      SpillableBuffer(buffer, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+/** Baseline filter/scatter tracking with one boolean per build row. */
+private class BooleanOuterJoinTracker(
+    val numRows: Int,
+    private var tracking: Option[SpillableColumnarBatch]) extends OuterJoinTracker {
+  override def sizeInBytes: Long = tracking.get.sizeInBytes
+
+  override def update(gatherIndices: ColumnView): Unit = {
+    if (gatherIndices.getRowCount > 0) {
+      withResource(gatherIndices.copyToColumnVector()) { indices =>
+        withResource(new Table(indices)) { indexTable =>
+          withResource(Scalar.fromInt(Int.MinValue)) { invalid =>
+            withResource(gatherIndices.notEqualTo(invalid)) { valid =>
+              withResource(indexTable.filter(valid)) { filtered =>
+                val updated = withResource(tracking.get.getColumnarBatch()) { batch =>
+                  withResource(GpuColumnVector.from(batch)) { table =>
+                    withResource(Scalar.fromBool(false)) { matched =>
+                      Table.scatter(Array(matched), filtered.getColumn(0), table)
+                    }
+                  }
+                }
+                val next = withResource(updated) { table =>
+                  SpillableColumnarBatch(GpuColumnVector.from(table, Array[DataType](BooleanType)),
+                    SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+                }
+                closeOnExcept(next) { _ =>
+                  withResource(tracking) { _ => tracking = Some(next) }
+                }
+              }
+            }
+          }
+        }
+      }
     }
-    closeOnExcept(bitmap) { spillable =>
-      new OuterJoinTracker(numRows, Some(spillable))
+  }
+
+  override def unmatchedMask(): ColumnVector = {
+    withResource(tracking.get.getColumnarBatch()) { batch =>
+      batch.column(0).asInstanceOf[GpuColumnVector].getBase.incRefCount()
+    }
+  }
+
+  override def close(): Unit = withResource(tracking)(_ => tracking = None)
+}
+
+object OuterJoinTracker {
+  def apply(numRows: Int, useBitmap: Boolean = true): OuterJoinTracker = {
+    if (useBitmap) {
+      val bitmap = closeOnExcept(JoinPrimitives.createOuterJoinTracker(numRows)) { buffer =>
+        SpillableBuffer(buffer, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+      }
+      closeOnExcept(bitmap) { spillable =>
+        new BitmapOuterJoinTracker(numRows, Some(spillable))
+      }
+    } else {
+      val tracking = withResource(Scalar.fromBool(true)) { unmatched =>
+        withResource(ColumnVector.fromScalar(unmatched, numRows)) { mask =>
+          withResource(new Table(mask)) { table =>
+            SpillableColumnarBatch(GpuColumnVector.from(table, Array[DataType](BooleanType)),
+              SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+          }
+        }
+      }
+      closeOnExcept(tracking) { spillable =>
+        new BooleanOuterJoinTracker(numRows, Some(spillable))
+      }
     }
   }
 }

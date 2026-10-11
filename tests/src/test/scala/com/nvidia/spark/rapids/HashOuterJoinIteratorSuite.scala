@@ -110,12 +110,14 @@ class HashOuterJoinIteratorSuite extends RmmSparkRetrySuiteBase {
     (LeftOuter, GpuBuildLeft), (RightOuter, GpuBuildRight))
 
   cases.foreach { case (joinType, side) =>
-    Seq(false, true).foreach { conditional =>
-      test(s"$joinType $side conditional=$conditional preserves unmatched build rows") {
+    for (conditional <- Seq(false, true); bitmap <- Seq(false, true)) {
+      test(s"$joinType $side conditional=$conditional bitmap=$bitmap " +
+        "preserves unmatched build rows") {
         withResource(newBatch(buildRows)) { built =>
           withResource(streamRows.grouped(3).toSeq.safeMap(newBatch)) { stream =>
             withResource(new HashOuterJoinIterator(joinType, built, Seq(ref), None, None,
-                stream.iterator, Seq(ref), attrs, condition(conditional), options, side,
+                stream.iterator, Seq(ref), attrs, condition(conditional),
+                options.copy(outerBitmapEnabled = bitmap), side,
                 compareNullsEqual = false, None, NoopMetric, NoopMetric)) { iter =>
               assert(collect(iter).sorted == expected(joinType, side, conditional, streamRows))
             }
@@ -138,42 +140,46 @@ class HashOuterJoinIteratorSuite extends RmmSparkRetrySuiteBase {
     }
   }
 
-  test("join group tracker survives retry, transfer between iterators and spill") {
-    withResource(newBatch(buildRows)) { built =>
-      val firstRows = streamRows.take(3)
-      val lastRows = streamRows.drop(3)
-      withResource(newBatch(firstRows)) { first =>
-        var attempts = 0
-        val (initial, tracker) = withResource(new HashJoinStreamSideIterator(FullOuter,
-            LazySpillableColumnarBatch.spillOnly(built), Seq(ref), None, None,
-            Iterator(first), Seq(ref), attrs, None, options, GpuBuildLeft,
-            compareNullsEqual = false, None, NoopMetric, NoopMetric) {
-          override protected def joinGathererLeftRight(
-              leftKeys: Table, leftData: LazySpillableColumnarBatch,
-              rightKeys: Table, rightData: LazySpillableColumnarBatch): Option[JoinGatherer] = {
-            attempts += 1
-            val gatherer = super.joinGathererLeftRight(leftKeys, leftData, rightKeys, rightData)
-            if (attempts == 1) {
-              withResource(gatherer) { _ =>
-                throw new GpuRetryOOM("retry after marking outer join matches")
+  for (bitmap <- Seq(false, true)) {
+    test(s"join group tracker survives retry, transfer and spill bitmap=$bitmap") {
+      withResource(newBatch(buildRows)) { built =>
+        val firstRows = streamRows.take(3)
+        val lastRows = streamRows.drop(3)
+        withResource(newBatch(firstRows)) { first =>
+          var attempts = 0
+          val (initial, tracker) = withResource(new HashJoinStreamSideIterator(FullOuter,
+              LazySpillableColumnarBatch.spillOnly(built), Seq(ref), None, None,
+              Iterator(first), Seq(ref), attrs, None, options.copy(outerBitmapEnabled = bitmap),
+              GpuBuildLeft,
+              compareNullsEqual = false, None, NoopMetric, NoopMetric) {
+            override protected def joinGathererLeftRight(
+                leftKeys: Table, leftData: LazySpillableColumnarBatch,
+                rightKeys: Table, rightData: LazySpillableColumnarBatch): Option[JoinGatherer] = {
+              attempts += 1
+              val gatherer = super.joinGathererLeftRight(leftKeys, leftData, rightKeys, rightData)
+              if (attempts == 1) {
+                withResource(gatherer) { _ =>
+                  throw new GpuRetryOOM("retry after marking outer join matches")
+                }
+              } else {
+                gatherer
               }
-            } else {
-              gatherer
             }
+          }) { iter =>
+            (collect(iter), iter.releaseBuiltSideTracker())
           }
-        }) { iter =>
-          (collect(iter), iter.releaseBuiltSideTracker())
-        }
-        assert(attempts == 2)
-        withResource(tracker) { state =>
-          assert(SpillFramework.stores.deviceStore.spill(Long.MaxValue) > 0)
-          withResource(newBatch(lastRows)) { last =>
-            withResource(new HashOuterJoinIterator(FullOuter,
-                LazySpillableColumnarBatch.spillOnly(built), Seq(ref), None, state,
-                Iterator(last), Seq(ref), attrs, None, options, GpuBuildLeft,
-                compareNullsEqual = false, None, NoopMetric, NoopMetric)) { iter =>
-              assert((initial ++ collect(iter)).sorted ==
-                expected(FullOuter, GpuBuildLeft, false, streamRows))
+          assert(attempts == 2)
+          withResource(tracker) { state =>
+            assert(SpillFramework.stores.deviceStore.spill(Long.MaxValue) > 0)
+            withResource(newBatch(lastRows)) { last =>
+              withResource(new HashOuterJoinIterator(FullOuter,
+                  LazySpillableColumnarBatch.spillOnly(built), Seq(ref), None, state,
+                  Iterator(last), Seq(ref), attrs, None, options.copy(outerBitmapEnabled = bitmap),
+                  GpuBuildLeft,
+                  compareNullsEqual = false, None, NoopMetric, NoopMetric)) { iter =>
+                assert((initial ++ collect(iter)).sorted ==
+                  expected(FullOuter, GpuBuildLeft, false, streamRows))
+              }
             }
           }
         }

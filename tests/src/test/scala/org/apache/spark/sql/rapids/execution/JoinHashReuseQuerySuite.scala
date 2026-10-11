@@ -26,13 +26,17 @@ class JoinHashReuseQuerySuite extends SparkQueryCompareTestSuite {
   private val joinTypes = Seq("inner", "left_outer", "right_outer", "full_outer",
     "left_semi", "left_anti")
 
-  private def config(strategy: String): SparkConf = new SparkConf()
+  private def config(strategy: String, enabled: Boolean = true): SparkConf = new SparkConf()
     .set("spark.sql.autoBroadcastJoinThreshold", "-1")
     .set("spark.sql.adaptive.enabled", "false")
     .set("spark.sql.shuffle.partitions", "1")
     .set(RapidsConf.USE_SHUFFLED_SYMMETRIC_HASH_JOIN.key, "false")
     .set(RapidsConf.GPU_BATCH_SIZE_BYTES.key, "1024")
     .set(RapidsConf.JOIN_STRATEGY.key, strategy)
+    .set(RapidsConf.ENABLE_JOIN_CHAIN.key, "false")
+    .set(RapidsConf.JOIN_BUILD_KEY_CACHE_ENABLED.key, enabled.toString)
+    .set(RapidsConf.JOIN_HASH_REUSE_ENABLED.key, enabled.toString)
+    .set(RapidsConf.JOIN_OUTER_BITMAP_ENABLED.key, enabled.toString)
 
   private def query(spark: SparkSession, joinType: String, conditional: Boolean): DataFrame = {
     val left = spark.range(0, 1000).selectExpr(
@@ -47,10 +51,35 @@ class JoinHashReuseQuerySuite extends SparkQueryCompareTestSuite {
   }
 
   for (strategy <- Seq("HASH_ONLY", "INNER_HASH_WITH_POST");
-      joinType <- joinTypes; conditional <- Seq(false, true)) {
+      joinType <- joinTypes; conditional <- Seq(false, true); enabled <- Seq(false, true)) {
     testSparkResultsAreEqual(
-      s"reusable hash join $joinType strategy=$strategy conditional=$conditional",
-      spark => query(spark, joinType, conditional), config(strategy), sort = true)(identity)
+      s"reusable hash join $joinType strategy=$strategy " +
+        s"conditional=$conditional enabled=$enabled",
+      spark => query(spark, joinType, conditional), config(strategy, enabled),
+      sort = true)(identity)
+  }
+
+  test("join optimization defaults and SQLConf/map overrides are independent") {
+    val switches = Seq(RapidsConf.JOIN_BUILD_KEY_CACHE_ENABLED,
+      RapidsConf.JOIN_HASH_REUSE_ENABLED, RapidsConf.JOIN_OUTER_BITMAP_ENABLED)
+    for (disabled <- -1 until switches.size) {
+      val values = switches.zipWithIndex.map { case (entry, i) =>
+        entry.key -> (i != disabled).toString
+      }.toMap
+      val sqlConf = new org.apache.spark.sql.internal.SQLConf()
+      values.foreach { case (key, value) => sqlConf.setConfString(key, value) }
+      val expected = switches.indices.map(_ != disabled)
+      def check(options: JoinOptions): Unit = {
+        assert(Seq(options.buildKeyCacheEnabled, options.hashReuseEnabled,
+          options.outerBitmapEnabled) == expected)
+      }
+      check(RapidsConf.getJoinOptions(sqlConf, 1024))
+      check(new RapidsConf(values).getJoinOptions(1024))
+    }
+    val defaults = new RapidsConf(Map.empty[String, String]).getJoinOptions(1024)
+    assert(defaults.buildKeyCacheEnabled && defaults.hashReuseEnabled &&
+      defaults.outerBitmapEnabled)
+    assert(RapidsConf.ENABLE_JOIN_CHAIN.get(new org.apache.spark.sql.internal.SQLConf()))
   }
 
   test("reusable hash query exercises GPU joins") {
