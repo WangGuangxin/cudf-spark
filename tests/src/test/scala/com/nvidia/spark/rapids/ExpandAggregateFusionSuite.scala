@@ -227,6 +227,32 @@ class ExpandAggregateFusionSuite extends SparkQueryCompareTestSuite {
     assert(!GpuExpandAggregateExec.eligible(noId, expand))
   }
 
+  test("fused input is coalesced to the target batch size") {
+    // The unfused plan coalesces Expand's output before the partial aggregate. Fusion must
+    // keep equivalent batching on its own input, otherwise the first pass reduces poorly and
+    // pushes the work into the merge pass. See GpuExpandAggregateExec.childrenCoalesceGoal.
+    val (agg, _) = ExpandAggregateFusionSuite.fixture()
+    val fused = GpuExpandAggregateExec.fuse(agg).asInstanceOf[GpuExpandAggregateExec]
+    assert(fused.childrenCoalesceGoal == Seq(TargetSize(agg.configuredTargetBatchSize)))
+    withGpuSparkSession({ spark =>
+      data(spark).createOrReplaceTempView("fusion_batching")
+      val df = spark.sql("SELECT a,b,count(v) FROM fusion_batching GROUP BY ROLLUP(a,b)")
+      df.collect()
+      val nodes = PlanUtils.findOperators(df.queryExecution.executedPlan,
+        _.isInstanceOf[GpuExpandAggregateExec])
+      assert(nodes.nonEmpty, df.queryExecution.executedPlan.toString)
+      val goal = TargetSize(new RapidsConf(spark.sessionState.conf).gpuTargetBatchSizeBytes)
+      nodes.foreach { node =>
+        // insertCoalesce honours the goal, then optimizeCoalesce drops the node again when
+        // the child already provides that batching. Either outcome satisfies the contract.
+        val input = node.children.head
+        assert(input.isInstanceOf[GpuCoalesceBatches] ||
+          CoalesceGoal.satisfies(GpuExec.outputBatching(input), goal),
+          df.queryExecution.executedPlan.toString)
+      }
+    }, configuration(true))
+  }
+
   test("fusion defaults off independently of filter/project fusion") {
     val conf = new RapidsConf(new SparkConf()
       .set(RapidsConf.ENABLE_FILTER_PROJECT_FUSION.key, "true"))
