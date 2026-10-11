@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -177,9 +177,11 @@ object GpuBindReferences extends Logging {
                 }.mkString("\n")
           }.mkString("\n")
       }
-      GpuTieredProject(tiered)
+      GpuPartialProjectAst.wrapTieredProject(GpuTieredProject(tiered), conf)
     } else {
-      GpuTieredProject(Seq(GpuBindReferences.bindGpuReferencesNoMetrics(expressions, input)))
+      GpuPartialProjectAst.wrapTieredProject(
+        GpuTieredProject(Seq(GpuBindReferences.bindGpuReferencesNoMetrics(expressions, input))),
+        conf)
     }
   }
 

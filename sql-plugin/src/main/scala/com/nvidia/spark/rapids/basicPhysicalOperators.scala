@@ -78,6 +78,13 @@ class GpuProjectExecMeta(
         }
       }
     }
+    if (conf.get(RapidsConf.ENABLE_PROJECT_PARTIAL_AST)) {
+      gpuExprs.zip(childExprs).foreach { case (expr, meta) =>
+        if (GpuBatchUtils.isFixedWidth(expr.dataType) && meta.canThisBeAst) {
+          GpuPartialProjectAst.markEligible(expr)
+        }
+      }
+    }
     GpuProjectExec(gpuExprs, gpuChild)
   }
 }

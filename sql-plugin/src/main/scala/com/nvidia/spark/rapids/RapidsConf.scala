@@ -1293,6 +1293,12 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(false)
 
+  val ENABLE_PROJECT_PARTIAL_AST = conf("spark.rapids.sql.projectPartialAstEnabled")
+      .doc("Use cudf AST for eligible fixed-width outputs in mixed GPU projections, " +
+        "after common subexpression elimination. Other outputs use ordinary GPU expressions.")
+      .booleanConf
+      .createWithDefault(false)
+
   val ENABLE_FILTER_PROJECT_FUSION = conf("spark.rapids.sql.filterProjectFusion.enabled")
       .doc("Fuse eligible adjacent GPU filters and projections to avoid materializing " +
         "unused filtered columns.")
