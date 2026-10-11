@@ -136,6 +136,29 @@ abstract class GpuHashPartitioningBase(expressions: Seq[Expression], numPartitio
   }
 
   def partitionIdExpression: GpuExpression = GpuPmod(hashFunc, GpuLiteral(numPartitions))
+
+  /** Takes ownership of canonical partial buffers; caller supplies the retry boundary. */
+  def partialAggregateAndPack(batch: ColumnarBatch,
+      operations: Array[Int]): Array[(ColumnarBatch, Int)] = {
+    require(usesGPUShuffle && !usesKudoGPUSlicing,
+      "Partial aggregate packing requires the GPU packed-table endpoint")
+    val packed = withResource(batch) { cb =>
+      if (cb.numRows() == 0) Array.empty[ColumnarBatch]
+      else {
+        if (cb.numRows() > (1 << 28)) {
+          // Native state uses INT32 slot indices and <= 50% hash-table occupancy.
+          throw new com.nvidia.spark.rapids.jni.GpuSplitAndRetryOOM(
+            "Partial aggregate merge input exceeds native hash state capacity")
+        }
+        val tables = withResource(GpuColumnVector.from(cb)) { table =>
+          PartitionPack.partialAggregateAndPack(table, operations, numPartitions)
+        }
+        packedTablesToBatchesAndClose(tables)
+      }
+    }
+    GpuSemaphore.releaseIfNecessary(TaskContext.get())
+    packed.zipWithIndex
+  }
 }
 
 object GpuHashPartitioningBase extends Logging {
