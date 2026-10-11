@@ -172,9 +172,11 @@ object GpuBindReferences extends Logging {
                 }.mkString("\n")
           }.mkString("\n")
       }
-      GpuTieredProject(tiered)
+      GpuPartialProjectAst.wrapTieredProject(GpuTieredProject(tiered), conf)
     } else {
-      GpuTieredProject(Seq(GpuBindReferences.bindGpuReferencesNoMetrics(expressions, input)))
+      GpuPartialProjectAst.wrapTieredProject(
+        GpuTieredProject(Seq(GpuBindReferences.bindGpuReferencesNoMetrics(expressions, input))),
+        conf)
     }
   }
 
