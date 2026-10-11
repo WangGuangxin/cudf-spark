@@ -63,13 +63,15 @@ class HashJoinIteratorSuite extends RmmSparkRetrySuiteBase {
       retryProjection: Boolean = false,
       retryJoin: Boolean = false,
       spillBetweenBatches: Boolean = false,
-      targetSize: Long = 1024): Unit = {
+      targetSize: Long = 1024,
+      cacheKeys: Boolean = true, reuseHash: Boolean = true): Unit = {
     val key = CountingKey(retryProjection)
     withResource(newBatch(1, 2, 3)) { built =>
       withResource(Seq(newBatch(2, 3, 4), newBatch(2, 3, 4))) { stream =>
         var joinAttempts = 0
         val iterator = new HashJoinIterator(built, Seq(key), stats, stream.iterator, Seq(ref),
-          Seq(attr), options.copy(targetSize = targetSize), Inner, GpuBuildLeft,
+          Seq(attr), options.copy(targetSize = targetSize, buildKeyCacheEnabled = cacheKeys,
+            hashReuseEnabled = reuseHash), Inner, GpuBuildLeft,
           compareNullsEqual = false, None, NoopMetric, NoopMetric) {
           override protected def joinGathererLeftRight(
               leftKeys: Table,
@@ -102,8 +104,9 @@ class HashJoinIteratorSuite extends RmmSparkRetrySuiteBase {
             }
           }
           assert(results.sorted.toSeq == Seq((1, 2), (1, 2), (2, 3), (2, 3), (3, 4), (3, 4)))
-          assert(key.evaluations == (if (retryProjection) 2 else 1))
           val expectedAttempts = if (targetSize == 16) 4 else 2
+          val projections = if (cacheKeys) 1 else expectedAttempts + (if (stats.isEmpty) 1 else 0)
+          assert(key.evaluations == projections + (if (retryProjection) 1 else 0))
           assert(joinAttempts == expectedAttempts + (if (retryJoin) 1 else 0))
           // Exhaustion closes the iterator-owned batches; a second close must also be safe.
           intercept[IllegalStateException] { built.getBatch }
@@ -113,6 +116,21 @@ class HashJoinIteratorSuite extends RmmSparkRetrySuiteBase {
         }
       }
     }
+  }
+
+  for (cacheKeys <- Seq(false, true); reuseHash <- Seq(false, true)) {
+    test(s"independent key cache=$cacheKeys and hash reuse=$reuseHash") {
+      checkJoin(cacheKeys = cacheKeys, reuseHash = reuseHash)
+    }
+  }
+
+  test("uncached build keys survive projection retry, probe retry and spill") {
+    checkJoin(cacheKeys = false, reuseHash = false, retryProjection = true,
+      retryJoin = true, spillBetweenBatches = true)
+  }
+
+  test("uncached build keys are reprojected for split stream batches") {
+    checkJoin(cacheKeys = false, reuseHash = false, targetSize = 16)
   }
 
   test("reuse projected build keys for statistics and multiple stream batches") {

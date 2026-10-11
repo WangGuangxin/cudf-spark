@@ -85,6 +85,13 @@ class MixedJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       spark => query(spark, recipe), config(sized, aqe), sort = true)(identity)
   }
 
+  for (sized <- Seq(false, true); aqe <- Seq(false, true)) {
+    testSparkResultsAreEqual(s"mixed join chain without hash reuse sized=$sized AQE=$aqe",
+      spark => query(spark, recipes(0)),
+      config(sized, aqe).set(RapidsConf.JOIN_HASH_REUSE_ENABLED.key, "false"),
+      sort = true)(identity)
+  }
+
   for (sized <- Seq(false, true)) {
     testSparkResultsAreEqual(s"mixed join build-left chain sized=$sized",
       spark => query(spark, recipes(3), buildLeft = true, repeatedFact = true),

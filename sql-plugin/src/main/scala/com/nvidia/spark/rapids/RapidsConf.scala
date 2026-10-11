@@ -636,7 +636,9 @@ object RapidsConf extends Logging with RapidsConfEntries {
     val buildSideSelection = JoinBuildSideSelection.withName(buildSideStr)
     val logCardinality = LOG_JOIN_CARDINALITY.get(conf)
     val sizeEstimateThreshold = JOIN_GATHERER_SIZE_ESTIMATE_THRESHOLD.get(conf)
-    JoinOptions(strategy, buildSideSelection, targetSize, logCardinality, sizeEstimateThreshold)
+    JoinOptions(strategy, buildSideSelection, targetSize, logCardinality, sizeEstimateThreshold,
+      JOIN_BUILD_KEY_CACHE_ENABLED.get(conf), JOIN_HASH_REUSE_ENABLED.get(conf),
+      JOIN_OUTER_BITMAP_ENABLED.get(conf))
   }
 }
 
@@ -743,7 +745,9 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
     val buildSideSelection = JoinBuildSideSelection.withName(buildSideStr)
     val logCardinality = get(LOG_JOIN_CARDINALITY)
     val sizeEstimateThreshold = get(JOIN_GATHERER_SIZE_ESTIMATE_THRESHOLD)
-    JoinOptions(strategy, buildSideSelection, targetSize, logCardinality, sizeEstimateThreshold)
+    JoinOptions(strategy, buildSideSelection, targetSize, logCardinality, sizeEstimateThreshold,
+      get(JOIN_BUILD_KEY_CACHE_ENABLED), get(JOIN_HASH_REUSE_ENABLED),
+      get(JOIN_OUTER_BITMAP_ENABLED))
   }
 
   lazy val sizedJoinPartitionAmplification: Double = get(SIZED_JOIN_PARTITION_AMPLIFICATION)

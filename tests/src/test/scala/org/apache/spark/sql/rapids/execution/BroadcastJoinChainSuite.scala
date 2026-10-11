@@ -77,7 +77,8 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
   private def run(fact: Seq[Row], ss: Seq[JoinChainStage],
       action: Int => Unit = _ => (), targetSize: Long = options.targetSize,
       inputBatchRows: Int = 120, dimensionRows: Seq[Seq[Row]] = dims,
-      retryKeys: Boolean = false, expectedHashBuilds: Option[Long] = None): Seq[Row] = {
+      retryKeys: Boolean = false, expectedHashBuilds: Option[Long] = None,
+      reuseHash: Boolean = true): Seq[Row] = {
     val builds = dimensionRows.zip(dims).safeMap { case (rows, shape) =>
       withResource(batch(rows, shape.head.size))(LazySpillableColumnarBatch(_, "test_dim"))
     }
@@ -90,7 +91,7 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
         val input = fact.grouped(inputBatchRows).map(batch(_, 2))
         val attrs = (0 until 2).map(i => AttributeReference(s"c$i", IntegerType)())
         val result = withResource(new JoinChainIterator(input, attrs, builds, keys, ss,
-            options.copy(targetSize = targetSize)) {
+            options.copy(targetSize = targetSize, hashReuseEnabled = reuseHash)) {
           override protected def beforeProbe(stage: Int): Unit = action(stage)
         }) { iterator =>
           val outputRows = iterator.flatMap { output =>
@@ -121,6 +122,12 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
     val rows = (0 until 20).flatMap(_ => fact)
     assert(sorted(run(rows, stages, inputBatchRows = 5,
       expectedHashBuilds = Some(stages.size.toLong))) == sorted(expected(rows, stages)))
+  }
+
+  test("join chains rebuild each stage hash for every batch when reuse is disabled") {
+    val rows = (0 until 20).flatMap(_ => fact)
+    assert(sorted(run(rows, stages, inputBatchRows = fact.size, reuseHash = false,
+      expectedHashBuilds = Some(20L * stages.size))) == sorted(expected(rows, stages)))
   }
 
   test("composed maps preserve projections, build-left order and multiple input batches") {

@@ -1025,4 +1025,28 @@ private[rapids] trait RapidsConfSqlEntries extends RapidsConfResourceEntries {
     .internal()
     .booleanConf
     .createWithDefault(true)
+
+  val JOIN_BUILD_KEY_CACHE_ENABLED = conf("spark.rapids.sql.join.buildKeyCache.enabled")
+    .doc("Reuse projected build keys across hash join stream batches. When disabled, " +
+      "project build keys separately for statistics and each probe. This controls ordinary " +
+      "hash joins; fused join chains retain their own keys. Disable join.chain.enabled " +
+      "to measure the ordinary hash join baseline.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val JOIN_HASH_REUSE_ENABLED = conf("spark.rapids.sql.join.hashReuse.enabled")
+    .doc("Reuse evictable build hash state across GPU join probes, including fused join " +
+      "chains. When disabled, build and release hash state for each probe. Independent " +
+      "of buildKeyCache.enabled.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val JOIN_OUTER_BITMAP_ENABLED = conf("spark.rapids.sql.join.outerBitmap.enabled")
+    .doc("Track matched build rows using a spillable device bitmap for hash outer joins. " +
+      "When disabled, use the spillable boolean column and filter/scatter tracking path.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
 }

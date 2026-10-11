@@ -75,9 +75,11 @@ class JoinHashCacheSuite extends RmmSparkRetrySuiteBase {
   }
 
   for (distinct <- Seq(false, true); side <- Seq(GpuBuildLeft, GpuBuildRight);
+      reuse <- Seq(false, true);
       selection <- Seq(JoinBuildSideSelection.AUTO, JoinBuildSideSelection.FIXED,
         JoinBuildSideSelection.SMALLEST)) {
-    test(s"iterator hash reuse distinct=$distinct side=$side selection=$selection") {
+    test(s"iterator hash reuse distinct=$distinct side=$side " +
+      s"selection=$selection enabled=$reuse") {
       def batch(keys: Seq[Int], payload: Seq[Int]): LazySpillableColumnarBatch = {
         withResource(ColumnVector.fromInts(keys: _*)) { kc =>
           withResource(ColumnVector.fromInts(payload: _*)) { pc =>
@@ -96,7 +98,8 @@ class JoinHashCacheSuite extends RmmSparkRetrySuiteBase {
           val attrs = Seq(AttributeReference("key", IntegerType)(),
             AttributeReference("payload", IntegerType)())
           val key = GpuBoundReference(0, IntegerType, false)(ExprId(0), "key")
-          val options = JoinOptions(JoinStrategy.HASH_ONLY, selection, 1024 * 1024, false, 0.75)
+          val options = JoinOptions(JoinStrategy.HASH_ONLY, selection, 1024 * 1024, false, 0.75,
+            hashReuseEnabled = reuse)
           withResource(new HashJoinIterator(build, Seq(key),
               Some(JoinBuildSideStats(1.0, distinct)), stream.iterator, Seq(key), attrs,
               options, Inner, side, false, None, NoopMetric, NoopMetric)) { iterator =>
@@ -118,11 +121,35 @@ class JoinHashCacheSuite extends RmmSparkRetrySuiteBase {
             // AUTO and SMALLEST select the streamed table on ties; do not cache that input.
             val cached = distinct || selection == JoinBuildSideSelection.FIXED ||
               side == GpuBuildRight
-            assert(iterator.hashBuildCount == (if (cached) 1 else 0))
+            assert(iterator.hashBuildCount == (if (cached) { if (reuse) 1 else 4 } else 0))
           }
         }
       }
       assert(SpillFramework.stores.deviceStore.numHandles == 0)
+    }
+  }
+
+  for (distinct <- Seq(false, true)) {
+    test(s"disabled hash reuse rebuilds without retaining device state distinct=$distinct") {
+      withResource(ColumnVector.fromInts(1, 2, 3)) { build =>
+        withResource(new Table(build)) { keys =>
+          withResource(ColumnVector.fromInts(3, 1, 9)) { stream =>
+            withResource(new Table(stream)) { probe =>
+              withResource(new GpuJoinHashCache(distinct, false, reuseEnabled = false)) { cache =>
+                val before = ai.rapids.cudf.Rmm.getTotalBytesAllocated
+                for (_ <- 0 until 3) {
+                  withResource(cache.innerJoin(keys, probe)) { maps =>
+                    assert(maps(0).getRowCount == 2)
+                  }
+                  assert(SpillFramework.stores.deviceStore.numHandles == 0)
+                  assert(ai.rapids.cudf.Rmm.getTotalBytesAllocated == before)
+                }
+                assert(cache.buildCount == 3)
+              }
+            }
+          }
+        }
+      }
     }
   }
 
