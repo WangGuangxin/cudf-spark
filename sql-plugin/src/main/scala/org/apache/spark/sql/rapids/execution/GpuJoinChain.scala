@@ -22,12 +22,40 @@ import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.{withRestoreOnRetry, withRetryNoSplit}
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.types.{ArrayType, BinaryType, IntegerType, MapType, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
+
+/**
+ * Why a plan did not fuse into a join chain, or why an otherwise fusable chain stopped growing.
+ * `reason` is a stable, greppable token; `detail` narrows it down to the specific plan node or
+ * predicate that ended the chain.
+ */
+private[execution] case class ChainBreak(reason: String, detail: String = "") {
+  override def toString: String = if (detail.isEmpty) reason else s"$reason($detail)"
+}
+
+private[execution] object ChainBreak {
+  /** The chain is turned off by configuration. */
+  val disabled: ChainBreak = ChainBreak("DISABLED")
+  /** This plan node is not a join kind that can take part in a chain (reports the node class). */
+  def notChainableJoin(plan: SparkPlan): ChainBreak =
+    ChainBreak("NOT_CHAINABLE_JOIN", plan.getClass.getSimpleName)
+  /** A chainable join kind, but one of the chain preconditions does not hold. */
+  def ineligible(why: String): ChainBreak = ChainBreak("INELIGIBLE", why)
+  /** A projection carrying computed expressions, which cannot be deferred past a probe. */
+  def computedProjection(plan: SparkPlan): ChainBreak =
+    ChainBreak("COMPUTED_PROJECTION", plan.getClass.getSimpleName)
+  /** A coalesce whose goal is not a plain target size, so batches cannot be streamed through. */
+  def coalesceGoal(goal: CoalesceGoal): ChainBreak =
+    ChainBreak("COALESCE_GOAL", goal.getClass.getSimpleName)
+  /** The chain formed but failed the per-row byte model in `worthwhile`. */
+  val notWorthwhile: ChainBreak = ChainBreak("NOT_WORTHWHILE")
+}
 
 /** A stage consumes the preceding logical output, but its payload stays in the original sources. */
 private[execution] case class JoinChainStage(
@@ -41,7 +69,10 @@ private[execution] case class JoinChainStage(
     joinTime: GpuMetric = NoopMetric)
 
 /** Fuse only a local stream-side chain. Exchanges, filters and computed projections end a chain. */
-object GpuJoinChain {
+object GpuJoinChain extends Logging {
+  /** Prefix for the per-join diagnostic line, so a whole benchmark run can be grepped at once. */
+  private val LOG_TAG = "RAPIDS_JOIN_CHAIN"
+
   private type Batches = Iterator[ColumnarBatch]
   private type Built = Either[ColumnarBatch, Batches]
   private case class Node(plan: GpuJoinExec, side: GpuBuildSide) {
@@ -59,10 +90,23 @@ object GpuJoinChain {
     def broadcast: Boolean = plan.isInstanceOf[GpuBroadcastHashJoinExecBase]
   }
   private case class Link(node: Node, projection: Seq[Int])
-  private case class Chain(input: SparkPlan, links: Seq[Link])
+  /** `break` records why the chain stopped growing past `input`, for diagnostics. */
+  private case class Chain(input: SparkPlan, links: Seq[Link], break: ChainBreak)
   private case class Inputs(stream: Batches, builds: Seq[Batches])
   private case class Prepared(stage: JoinChainStage,
       load: (Batches, Batches) => (Built, Batches), eager: (Built, Batches) => Batches)
+
+  /** The result of analyzing one plan node as a potential chain anchor. */
+  private sealed trait Outcome
+  /** A chain of more than one link that passed every check. */
+  private case class Fused(chain: Chain) extends Outcome
+  /**
+   * The node could anchor a chain but none was formed. `candidateLength` is how long the chain
+   * would have been, which distinguishes "nothing to chain with" from "rejected by the model".
+   */
+  private case class Unfused(reason: ChainBreak, candidateLength: Int) extends Outcome
+  /** The node itself cannot anchor a chain at all. */
+  private case class NotAnchored(reason: ChainBreak) extends Outcome
 
   private def ordinal(expr: Expression): Option[Int] = expr match {
     case ref: GpuBoundReference => Some(ref.ordinal)
@@ -76,15 +120,15 @@ object GpuJoinChain {
     case join: GpuShuffledHashJoinExec =>
       val original = Node(join, join.buildSide)
       val side = if (join.joinType == Inner && join.condition.isEmpty &&
-          childJoin(original.stream).isEmpty && childJoin(original.build).isDefined) {
+          childJoin(original.stream).isLeft && childJoin(original.build).isRight) {
         if (join.buildSide == GpuBuildRight) GpuBuildLeft else GpuBuildRight
       } else join.buildSide
       Some(Node(join, side))
     case join: GpuShuffledSymmetricHashJoinExec =>
       // Keep the chain on the streaming side. The alternate input must fit the normal build limit;
       // otherwise the existing symmetric sizing/sub-partition path is resumed at runtime.
-      val side = if (childJoin(join.left).isDefined) GpuBuildRight
-        else if (childJoin(join.right).isDefined) GpuBuildLeft
+      val side = if (childJoin(join.left).isRight) GpuBuildRight
+        else if (childJoin(join.right).isRight) GpuBuildLeft
         else {
           // At the anchor, prefer retaining the wider payload as the streaming source. Runtime
           // size and uniqueness checks still decide whether the selected build can be deferred.
@@ -96,7 +140,11 @@ object GpuJoinChain {
     case _ => None
   }
 
-  private def eligible(node: Node): Boolean = {
+  /**
+   * The first chain precondition this node violates, or None when it may anchor/extend a chain.
+   * Conditions are checked in a fixed order so the reported reason is stable across runs.
+   */
+  private def ineligible(node: Node): Option[String] = {
     def simpleKey(expr: GpuExpression): Boolean = expr match {
       case ref: GpuBoundReference => ref.dataType match {
         case _: ArrayType | _: MapType | _: StructType | BinaryType => false
@@ -107,14 +155,23 @@ object GpuJoinChain {
     val options = RapidsConf.getJoinOptions(node.plan.conf, node.target)
     val hashStrategy = options.strategy == JoinStrategy.AUTO ||
       options.strategy == JoinStrategy.HASH_ONLY
-    hashStrategy && node.plan.joinType == Inner && node.plan.condition.isEmpty &&
-      !node.plan.isSkewJoin && node.buildKeys.nonEmpty &&
-      node.buildKeys.forall(simpleKey) && node.streamKeys.forall(simpleKey)
+    if (!hashStrategy) Some(s"strategy=${options.strategy}")
+    else if (node.plan.joinType != Inner) Some(s"joinType=${node.plan.joinType}")
+    else if (node.plan.condition.isDefined) Some("joinCondition")
+    else if (node.plan.isSkewJoin) Some("skewJoin")
+    else if (node.buildKeys.isEmpty) Some("noBuildKeys")
+    else if (!node.buildKeys.forall(simpleKey)) Some("buildKeyType")
+    else if (!node.streamKeys.forall(simpleKey)) Some("streamKeyType")
+    else None
   }
 
-  private def childJoin(plan: SparkPlan): Option[(Node, Seq[Int])] = plan match {
+  private def eligible(node: Node): Boolean = ineligible(node).isEmpty
+
+  /** Walk one step down the stream side, reporting what ended the chain when it cannot continue. */
+  private def childJoin(plan: SparkPlan): Either[ChainBreak, (Node, Seq[Int])] = plan match {
     case coalesce: GpuCoalesceBatches if coalesce.goal.isInstanceOf[TargetSize] =>
       childJoin(coalesce.child)
+    case coalesce: GpuCoalesceBatches => Left(ChainBreak.coalesceGoal(coalesce.goal))
     case project: GpuProjectExec =>
       val refs = GpuBindReferences.bindGpuReferences(
         project.projectList, project.child.output, project.allMetrics).map(ordinal)
@@ -122,15 +179,21 @@ object GpuJoinChain {
         childJoin(project.child).map { case (join, projection) =>
           (join, refs.map(ref => projection(ref.get)))
         }
-      } else None
-    case _ => node(plan).filter(eligible).map(n => (n, plan.output.indices))
+      } else Left(ChainBreak.computedProjection(project))
+    case _ => node(plan) match {
+      case None => Left(ChainBreak.notChainableJoin(plan))
+      case Some(n) => ineligible(n) match {
+        case Some(why) => Left(ChainBreak.ineligible(why))
+        case None => Right((n, plan.output.indices))
+      }
+    }
   }
 
   private def collect(join: Node): Chain = childJoin(join.stream) match {
-    case Some((child, projection)) =>
+    case Right((child, projection)) =>
       val prefix = collect(child)
       prefix.copy(links = prefix.links :+ Link(join, projection))
-    case None => Chain(join.stream, Seq(Link(join, join.stream.output.indices)))
+    case Left(why) => Chain(join.stream, Seq(Link(join, join.stream.output.indices)), why)
   }
 
   private def worthwhile(chain: Chain): Boolean = {
@@ -145,11 +208,53 @@ object GpuJoinChain {
     savedPayload > mapTraffic + keyTraffic
   }
 
-  private[execution] def chainLength(plan: SparkPlan): Int = {
-    node(plan).filter(eligible).map { root =>
-      val chain = collect(root)
-      if (chain.links.size > 1 && worthwhile(chain)) chain.links.size else 1
-    }.getOrElse(0)
+  /**
+   * Classify one plan node as a chain anchor. This is a pure function of plan shape and does not
+   * consider `spark.rapids.sql.join.chain.enabled`, so an A/B run with the chain disabled still
+   * reports which plans would have fused.
+   */
+  private def analyze(plan: SparkPlan): Outcome = node(plan) match {
+    case None => NotAnchored(ChainBreak.notChainableJoin(plan))
+    case Some(root) => ineligible(root) match {
+      case Some(why) => NotAnchored(ChainBreak.ineligible(why))
+      case None =>
+        val chain = collect(root)
+        if (chain.links.size <= 1) Unfused(chain.break, chain.links.size)
+        else if (!worthwhile(chain)) Unfused(ChainBreak.notWorthwhile, chain.links.size)
+        else Fused(chain)
+    }
+  }
+
+  /**
+   * One greppable line per join operator, emitted on the driver as the RDD is built. Aggregate the
+   * trigger rate and the break-reason histogram across a benchmark run with something like:
+   * {{{
+   *   grep -hoE 'fused=true|reason=[A-Z_]+' driver.log | sort | uniq -c | sort -rn
+   * }}}
+   */
+  private def logOutcome(plan: SparkPlan, outcome: Outcome, enabled: Boolean,
+      verbose: Boolean): Unit = {
+    if (verbose || log.isDebugEnabled) {
+      val root = s"root=${plan.getClass.getSimpleName}"
+      val message = outcome match {
+        case Fused(chain) if enabled =>
+          s"$LOG_TAG fused=true length=${chain.links.size} stoppedBy=${chain.break} $root"
+        case Fused(chain) =>
+          s"$LOG_TAG fused=false reason=${ChainBreak.disabled} wouldFuse=true " +
+            s"length=${chain.links.size} $root"
+        case Unfused(reason, candidateLength) =>
+          s"$LOG_TAG fused=false reason=$reason candidateLength=$candidateLength $root"
+        case NotAnchored(reason) =>
+          s"$LOG_TAG fused=false reason=$reason $root"
+      }
+      if (verbose) logWarning(message) else logDebug(message)
+    }
+  }
+
+  private[execution] def chainLength(plan: SparkPlan): Int = analyze(plan) match {
+    case Fused(chain) => chain.links.size
+    case _: Unfused => 1
+    case _: NotAnchored => 0
   }
 
   private def prepare(link: Link): Prepared = {
@@ -188,104 +293,133 @@ object GpuJoinChain {
     Prepared(stage, load, eager)
   }
 
+  /**
+   * A metric the chain reports but a given join exec may not declare. Missing metrics degrade to
+   * no-ops rather than failing the query, since the chain spans several join implementations.
+   */
+  private def optionalMetric(plan: GpuExec, name: String): GpuMetric =
+    plan.allMetrics.getOrElse(name, NoopMetric)
+
   /** Narrow RDD dependencies align local build partitions without collecting across an exchange. */
   def execute(plan: SparkPlan): Option[RDD[ColumnarBatch]] = {
-    node(plan).filter(eligible).map(collect)
-      .filter(c => c.links.size > 1 && worthwhile(c)).map { chain =>
-        val prepared = chain.links.map(prepare)
-        val root = chain.links.last.node
-        val attrs = chain.input.output
-        val options = RapidsConf.getJoinOptions(plan.conf, root.target)
-        val opTime = root.plan.gpuLongMetric(GpuMetric.OP_TIME_LEGACY)
-        val streamTime = root.plan.gpuLongMetric(GpuMetric.STREAM_TIME)
-        val streamNvtx = if (root.broadcast) NvtxRegistry.BROADCAST_JOIN_STREAM
-          else NvtxRegistry.SHUFFLED_JOIN_STREAM
-        var inputs = chain.input.executeColumnar().mapPartitions { stream =>
-          Iterator.single(Inputs(stream, Seq.empty))
+    val enabled = RapidsConf.ENABLE_JOIN_CHAIN.get(plan.conf)
+    val verbose = RapidsConf.JOIN_CHAIN_LOG_DIAGNOSTICS.get(plan.conf)
+    // Analyze even when the chain is disabled so both sides of an A/B run report the same shape
+    // information. The analysis is plan-time only and runs once per join operator.
+    val outcome = if (enabled || verbose || log.isDebugEnabled) {
+      analyze(plan)
+    } else {
+      NotAnchored(ChainBreak.disabled)
+    }
+    logOutcome(plan, outcome, enabled, verbose)
+    outcome match {
+      case Fused(chain) if enabled => Some(buildRdd(plan, chain))
+      case _ => None
+    }
+  }
+
+  private def buildRdd(plan: SparkPlan, chain: Chain): RDD[ColumnarBatch] = {
+    val prepared = chain.links.map(prepare)
+    val root = chain.links.last.node
+    val attrs = chain.input.output
+    val options = RapidsConf.getJoinOptions(plan.conf, root.target)
+    val opTime = root.plan.gpuLongMetric(GpuMetric.OP_TIME_LEGACY)
+    val streamTime = root.plan.gpuLongMetric(GpuMetric.STREAM_TIME)
+    // Plan-time analysis only says a chain was built. These report whether it survived at
+    // runtime, per task, which the driver-side diagnostic line cannot observe.
+    val fusedTasks = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_FUSED_TASKS)
+    val oversizedFallbacks = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_FALLBACK_OVERSIZED)
+    val nonUniqueFallbacks = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_FALLBACK_NON_UNIQUE)
+    val streamNvtx = if (root.broadcast) NvtxRegistry.BROADCAST_JOIN_STREAM
+      else NvtxRegistry.SHUFFLED_JOIN_STREAM
+    var inputs = chain.input.executeColumnar().mapPartitions { stream =>
+      Iterator.single(Inputs(stream, Seq.empty))
+    }
+    chain.links.foreach { link =>
+      if (!link.node.broadcast) {
+        inputs = inputs.zipPartitions(link.node.build.executeColumnar()) { (bundles, build) =>
+          val bundle = bundles.next()
+          Iterator.single(bundle.copy(builds = bundle.builds :+ build))
         }
-        chain.links.foreach { link =>
-          if (!link.node.broadcast) {
-            inputs = inputs.zipPartitions(link.node.build.executeColumnar()) { (bundles, build) =>
-              val bundle = bundles.next()
-              Iterator.single(bundle.copy(builds = bundle.builds :+ build))
-            }
-          } else {
-            inputs = inputs.mapPartitions { bundles =>
-              val bundle = bundles.next()
-              Iterator.single(bundle.copy(builds = bundle.builds :+ Iterator.empty))
-            }
+      } else {
+        inputs = inputs.mapPartitions { bundles =>
+          val bundle = bundles.next()
+          Iterator.single(bundle.copy(builds = bundle.builds :+ Iterator.empty))
+        }
+      }
+    }
+    inputs.mapPartitions { bundles =>
+      val bundle = bundles.next()
+      var stream: Batches = new CollectTimeIterator(streamNvtx, bundle.stream, streamTime)
+      val owners = scala.collection.mutable.ArrayBuffer[LazySpillableColumnarBatch]()
+      val built = scala.collection.mutable.ArrayBuffer[
+        Either[LazySpillableColumnarBatch, Batches]]()
+      closeOnExcept(owners) { _ =>
+        prepared.zip(bundle.builds).foreach { case (stage, buildInput) =>
+          val (data, buffered) = stage.load(buildInput, stream)
+          stream = buffered
+          data match {
+            case Left(batch) =>
+              withResource(batch) { batch =>
+                val owned = LazySpillableColumnarBatch(batch, "join_chain_build")
+                closeOnExcept(owned) { _ =>
+                  owned.allowSpilling()
+                  owners += owned
+                  built += Left(owned)
+                }
+              }
+            case Right(iterator) => built += Right(iterator)
           }
         }
-        inputs.mapPartitions { bundles =>
-          val bundle = bundles.next()
-          var stream: Batches = new CollectTimeIterator(streamNvtx, bundle.stream, streamTime)
-          val owners = scala.collection.mutable.ArrayBuffer[LazySpillableColumnarBatch]()
-          val built = scala.collection.mutable.ArrayBuffer[
-            Either[LazySpillableColumnarBatch, Batches]]()
-          closeOnExcept(owners) { _ =>
-            prepared.zip(bundle.builds).foreach { case (stage, buildInput) =>
-              val (data, buffered) = stage.load(buildInput, stream)
-              stream = buffered
-              data match {
-                case Left(batch) =>
-                  withResource(batch) { batch =>
-                    val owned = LazySpillableColumnarBatch(batch, "join_chain_build")
-                    closeOnExcept(owned) { _ =>
-                      owned.allowSpilling()
-                      owners += owned
-                      built += Left(owned)
+        def eager(): Batches = {
+          prepared.indices.foreach { i =>
+            val refs = prepared(i).stage.streamProjection
+            stream = stream.map(batch => withResource(batch)(select(_, refs)))
+            val data = built(i).map(identity).left.map(_.releaseBatch())
+            stream = prepared(i).eager(data, stream)
+          }
+          stream
+        }
+        opTime.ns {
+          if (built.exists(_.isRight)) {
+            // Preserve out-of-core joins. A chain must never concatenate an oversized build.
+            oversizedFallbacks += 1
+            withResource(owners)(_ => eager())
+          } else {
+            val builds = owners.toVector
+            val stages = prepared.map(_.stage)
+            val keys = buildKeys(builds, stages)
+            closeOnExcept(keys) { _ =>
+              val unique = builds.indices.forall { i =>
+                keys(i).checkpoint()
+                withRetryNoSplit {
+                  withRestoreOnRetry(keys(i)) {
+                    withResource(GpuColumnVector.from(keys(i).getBatch)) { table =>
+                      val result = table.distinctCount(NullEquality.EQUAL) == builds(i).numRows
+                      keys(i).allowSpilling()
+                      result
                     }
-                  }
-                case Right(iterator) => built += Right(iterator)
-              }
-            }
-            def eager(): Batches = {
-              prepared.indices.foreach { i =>
-                val refs = prepared(i).stage.streamProjection
-                stream = stream.map(batch => withResource(batch)(select(_, refs)))
-                val data = built(i).map(identity).left.map(_.releaseBatch())
-                stream = prepared(i).eager(data, stream)
-              }
-              stream
-            }
-            opTime.ns {
-              if (built.exists(_.isRight)) {
-                // Preserve out-of-core joins. A chain must never concatenate an oversized build.
-                withResource(owners)(_ => eager())
-              } else {
-                val builds = owners.toVector
-                val stages = prepared.map(_.stage)
-                val keys = buildKeys(builds, stages)
-                closeOnExcept(keys) { _ =>
-                  val unique = builds.indices.forall { i =>
-                    keys(i).checkpoint()
-                    withRetryNoSplit {
-                      withRestoreOnRetry(keys(i)) {
-                        withResource(GpuColumnVector.from(keys(i).getBatch)) { table =>
-                          val result = table.distinctCount(NullEquality.EQUAL) == builds(i).numRows
-                          keys(i).allowSpilling()
-                          result
-                        }
-                      }
-                    }
-                  }
-                  if (unique) {
-                    chain.links.zip(builds).foreach { case (link, data) =>
-                      if (!link.node.broadcast) {
-                        link.node.plan.gpuLongMetric(GpuMetric.BUILD_DATA_SIZE) +=
-                          data.deviceMemorySize
-                      }
-                    }
-                    new JoinChainIterator(stream, attrs, builds, keys, stages, options, opTime)
-                  } else {
-                    withResource(keys)(_ => withResource(owners)(_ => eager()))
                   }
                 }
+              }
+              if (unique) {
+                chain.links.zip(builds).foreach { case (link, data) =>
+                  if (!link.node.broadcast) {
+                    link.node.plan.gpuLongMetric(GpuMetric.BUILD_DATA_SIZE) +=
+                      data.deviceMemorySize
+                  }
+                }
+                fusedTasks += 1
+                new JoinChainIterator(stream, attrs, builds, keys, stages, options, opTime)
+              } else {
+                nonUniqueFallbacks += 1
+                withResource(keys)(_ => withResource(owners)(_ => eager()))
               }
             }
           }
         }
       }
+    }
   }
 
   /** Reference-only projection, stripping contiguous-batch subclasses when rearranging columns. */

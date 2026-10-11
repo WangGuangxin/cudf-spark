@@ -801,6 +801,28 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(false)
 
+  val ENABLE_JOIN_CHAIN = conf("spark.rapids.sql.join.chain.enabled")
+    .doc("When enabled, consecutive GPU hash joins within a stage are fused into a single " +
+      "chain that defers payload materialization: only join keys are gathered between probes " +
+      "and the original payload columns are gathered once at the end. Set to false to make " +
+      "every join materialize its own output, which is the baseline for A/B measuring the " +
+      "chain. See also spark.rapids.sql.join.chain.logDiagnostics.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val JOIN_CHAIN_LOG_DIAGNOSTICS = conf("spark.rapids.sql.join.chain.logDiagnostics")
+    .doc("Log one line per GPU hash join describing whether it anchored a fused join chain " +
+      "and, if not, why the chain was not formed. Lines are tagged RAPIDS_JOIN_CHAIN and are " +
+      "emitted on the driver while the RDD is built, so they can be aggregated across a whole " +
+      "benchmark run to measure how often the chain actually triggers. When " +
+      "spark.rapids.sql.join.chain.enabled is false the analysis still runs and reports which " +
+      "plans would have fused, so both sides of an A/B comparison are observable. Without this " +
+      "the same lines are only emitted at DEBUG level.")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
+
   val JOIN_GATHERER_SIZE_ESTIMATE_THRESHOLD =
     conf("spark.rapids.sql.join.gatherer.sizeEstimateThreshold")
     .doc("When a join is gathered we try to output a batch that is close to the target batch " +
@@ -3382,6 +3404,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val exportColumnarRdd: Boolean = get(EXPORT_COLUMNAR_RDD)
 
   lazy val shuffledHashJoinOptimizeShuffle: Boolean = get(SHUFFLED_HASH_JOIN_OPTIMIZE_SHUFFLE)
+
+  lazy val isJoinChainEnabled: Boolean = get(ENABLE_JOIN_CHAIN)
+
+  lazy val joinChainLogDiagnostics: Boolean = get(JOIN_CHAIN_LOG_DIAGNOSTICS)
 
   lazy val useShuffledSymmetricHashJoin: Boolean = get(USE_SHUFFLED_SYMMETRIC_HASH_JOIN)
 

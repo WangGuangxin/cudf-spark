@@ -109,6 +109,42 @@ class MixedJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       config(sized, aqe = false).set(RapidsConf.GPU_BATCH_SIZE_BYTES.key, "1024"),
       sort = true)(identity)
 
+    testSparkResultsAreEqual(s"mixed join chain disabled sized=$sized",
+      spark => query(spark, recipes(0)),
+      config(sized, aqe = false).set(RapidsConf.ENABLE_JOIN_CHAIN.key, "false"),
+      sort = true)(identity)
+
+    test(s"join chain can be turned off for A/B measurement sized=$sized") {
+      // Sum the three runtime counters rather than asserting on `fused` alone: the point of the
+      // switch is that none of the chain path runs when it is off, independently of whether a
+      // given build would have passed the runtime uniqueness and sizing checks.
+      def chainTaskCount(plan: org.apache.spark.sql.execution.SparkPlan): Long =
+        PlanUtils.findOperators(plan, _.isInstanceOf[GpuJoinExec])
+          .collect { case j: GpuJoinExec => j }
+          .map { j =>
+            j.gpuLongMetric(GpuMetric.JOIN_CHAIN_FUSED_TASKS).value +
+              j.gpuLongMetric(GpuMetric.JOIN_CHAIN_FALLBACK_OVERSIZED).value +
+              j.gpuLongMetric(GpuMetric.JOIN_CHAIN_FALLBACK_NON_UNIQUE).value
+          }.sum
+
+      withGpuSparkSession(spark => {
+        val df = query(spark, recipes(0))
+        df.collect()
+        assert(chainTaskCount(df.queryExecution.executedPlan) > 0)
+      }, config(sized, aqe = false))
+
+      withGpuSparkSession(spark => {
+        val df = query(spark, recipes(0))
+        df.collect()
+        // The plan shape is unchanged and would still fuse; only execution is turned off, so an
+        // A/B run can still report which plans the baseline gave up.
+        val plan = df.queryExecution.executedPlan
+        assert(PlanUtils.findOperators(plan, _.isInstanceOf[GpuJoinExec])
+          .exists(GpuJoinChain.chainLength(_) == 3), plan.toString)
+        assert(chainTaskCount(plan) == 0)
+      }, config(sized, aqe = false).set(RapidsConf.ENABLE_JOIN_CHAIN.key, "false"))
+    }
+
     test(s"mixed plans fuse same-partition joins and stop at exchanges sized=$sized") {
       withGpuSparkSession(spark => {
         recipes.foreach { recipe =>
