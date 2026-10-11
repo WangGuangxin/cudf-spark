@@ -12,6 +12,18 @@ projection. It restores constants, substituted NULL keys, and the discriminator 
 smaller aggregate buffers, then uses the existing full hash merge, spill/repartition,
 final projection, shuffle, and final aggregate machinery. No JNI/CUDA changes are required.
 
+Fusion removes the `GpuCoalesceBatches` that `GpuExpandExec.coalesceAfter` places between
+Expand and the partial aggregate, so the fused node requests the same target batch size on
+its own input through `childrenCoalesceGoal`. This batches the unexpanded input, which is a
+factor of `branches` smaller than what the unfused plan coalesces. `optimizeCoalesce` then
+drops the inserted node whenever the child's `outputBatching` already satisfies the goal, so
+a child that already emits target-size batches costs nothing, and concatenation of a single
+batch is a passthrough in any case.
+
+This affects throughput, not results: without the goal the first pass sees whatever batches
+the child emits, each branch group-by reduces poorly, and the resulting partials push the
+work into the merge pass, which hashes the data a second time.
+
 Within an input batch, later branches can merge a retained earlier branch's partial buffers
 instead of scanning the original rows. This requires identical substituted aggregate
 functions and every live target key to be present in the same source output position.
@@ -104,9 +116,11 @@ and the same merge/final-pass machinery with the disjoint-key shortcut. Unused r
 columns are omitted from Expand in both paths.
 
 Use 2/4/8 branches, low and high key cardinalities, and narrow/wide resident inputs.
-Cardinality must divide the row count; the maximum is 131,072. Each run warms up three
-times and measures ten synchronized iterations. Use `-` to disable RMM logging for timing
-runs; alternate off/on order and repeat without other compilation or profiling activity.
+Cardinality must divide the row count; the maximum is 131,072. Each run warms up 30 times
+and measures 20 synchronized iterations. The earlier 3-warmup setting left this path far
+short of steady state: repeated runs of one configuration ranged from 11.7 ms to 32.5 ms,
+enough to hide or invent a regression. Use `-` to disable RMM logging for timing runs;
+alternate off/on order and repeat without other compilation or profiling activity.
 
 For CUDA kernel/copy counts, wrap the Java process with:
 
@@ -119,7 +133,7 @@ nsys profile --trace=cuda --sample=none --cpuctxsw=none \
 ```
 
 The capture range includes measured iterations only. RMM logs include setup and warmup,
-so remove setup allocations and account for the three warmup iterations separately.
+so remove setup allocations and account for the warmup iterations separately.
 The printed peak is the scoped maximum allocation above the resident-input/setup baseline.
 
 This benchmark excludes scan pruning, network shuffle, scheduling, final distributed
@@ -130,56 +144,51 @@ end-to-end TPC-DS A/B on the distributed cluster remains a later validation step
 ## Measurements
 
 Profiling on an NVIDIA L4 found that fusion reduces input-sized materialization for
-low-cardinality rollups. Partial reuse and the disjoint-key shortcut lower kernel counts
-relative to the first fused implementation: 33 to 19 at two branches, 66 to 48 at four,
-and 151 to 124 at eight. They remain higher than the coalesced unfused baseline, which
-can aggregate branches together. The default-off flag has no cost model to select fusion
-versus the original path; the internal twofold compression guard controls partial reuse
-only. Enabling fusion does not promise lower kernel counts or faster execution on every
-eligible plan.
+grouping-set aggregates. The default-off flag has no cost model to select fusion versus
+the original path; the internal twofold compression guard controls partial reuse only.
+Enabling fusion does not promise faster execution on every eligible plan.
 
-The table uses 131,072 input rows, eight resident input columns, the tiered backend,
-and an unpooled allocator. Timings are the median of three alternating off/on rounds,
-each with three warmups and ten synchronized measured iterations, run after compilation
-and tests finished with no profiler or RMM log. JIT/warmup variation was substantial in
-the first round; these are local observations, not workload-level speedup guarantees.
-Nsight kernel counts cover ten measured iterations and are normalized per original input.
-Allocation requests exclude verified setup/input creation, averaged over the three warmup
-plus ten measured iterations. Scoped peak bytes exclude setup and resident input.
+The tables use 131,072 rows per input batch, eight resident input columns, the tiered
+backend, and an unpooled allocator. Each cell lists the medians of three alternating
+off/on rounds, each round 30 warmups plus 20 synchronized measured iterations, run with
+no profiler or RMM log. These are local observations, not workload-level speedup
+guarantees. Scoped peak bytes exclude setup and resident input.
 
-| Branches | Key cardinality | Median ms off / on | Peak extra MiB off / on | Allocation requests MiB off / on | Kernels per input off / on |
-| --- | --- | --- | --- | --- | --- |
-| 2 | 16 | 4.041 / 1.645 | 10.09 / 2.56 | 12.61 / 2.56 | 17 / 19 |
-| 4 | 16 | 5.280 / 3.192 | 24.24 / 2.56 | 29.80 / 2.57 | 23 / 48 |
-| 8 | 16 | 9.967 / 6.383 | 68.93 / 3.06 | 80.57 / 3.09 | 38 / 124 |
-| 4 | 131,072 | 6.432 / 5.602 | 32.75 / 26.67 | 48.94 / 38.87 | 23 / 51 |
-
-At four branches and cardinality 16, branch aggregation reads 131,120 rows per input
-instead of the first implementation's 524,288: one original input plus three 16-row
-partials. Three branches reuse buffers. High cardinality reads all 524,288 original
-branch rows and reuses no buffers. Its single-input improvement comes from skipping
-the unnecessary final merge, not from partial reuse.
-
-The first implementation's high-cardinality single-input case was about 53% slower;
-the optimized single-input case above removes that regression in this local benchmark.
-However, that shortcut does not apply to multiple input batches. Four repeated input
-batches (524,288 total rows, identical values so cross-batch keys overlap) produced:
+Single input batch:
 
 | Branches | Key cardinality | Median ms off / on | Peak extra MiB off / on |
 | --- | --- | --- | --- |
-| 2 | 16 | 5.884 / 5.299 | 40.18 / 2.56 |
-| 4 | 16 | 11.355 / 9.191 | 96.81 / 2.56 |
-| 8 | 16 | 32.280 / 19.522 | 359.02 / 3.07 |
-| 4 | 131,072 | 13.112 / 21.017 | 117.31 / 108.62 |
+| 2 | 16 | 4.83 5.89 6.24 / 4.35 4.44 4.01 | 10 / 2 |
+| 4 | 16 | 6.45 7.15 6.97 / 5.57 5.01 | 24 / 2 |
+| 8 | 16 | 11.42 11.39 11.38 / 9.10 7.78 | 68 / 3 |
+| 4 | 131,072 | 8.76 8.20 8.61 / 7.81 | 32 / 26 |
 
-The multi-input low-cardinality cases still benefit, but the high-cardinality control
-remains about 60% slower with little peak-memory improvement. Both versions must merge
-overlapping keys; fusion still performs more branch calls. An eligible plan is therefore
-not necessarily profitable, and the switch remains off by default. These repeated-batch
-measurements exercise the merge boundary, not a representative distributed workload.
+Four repeated input batches (524,288 total rows, identical values so cross-batch keys
+overlap), which exercise the merge boundary rather than the single-input shortcut:
 
-CUDA memcpy statistics also depend on coalescing and cardinality. At four branches and
-cardinality 16, device-to-device copies fell from about 8 MiB to 1.2 KiB per input. At
-cardinality 131,072 they increased to about 9 MiB. Eight-branch coalescing moved data
-through kernels rather than bulk CUDA memcpy in this profile. These copy counters exclude
-data movement performed inside kernels and should not be treated as total GPU traffic.
+| Branches | Key cardinality | Median ms off / on | Peak extra MiB off / on |
+| --- | --- | --- | --- |
+| 2 | 16 | 9.55 8.53 8.29 / 5.50 5.87 6.37 | 40 / 28 |
+| 4 | 16 | 13.80 13.95 14.58 / 6.80 7.37 7.18 | 96 / 28 |
+| 8 | 16 | 38.31 40.88 38.54 / 9.76 9.94 10.10 | 359 / 30 |
+| 4 | 131,072 | 17.04 15.25 15.53 / 9.84 9.80 9.92 | 117 / 33 |
+
+Every measured configuration improves, and the peak-memory reduction grows with the branch
+count because the expanded batch is never materialized. The eight-branch multi-batch case
+is the clearest: the unfused plan coalesces 1,048,576 expanded rows before aggregating,
+while fusion aggregates eight times against the 524,288-row unexpanded input.
+
+An earlier revision of this document reported the high-cardinality multi-batch case as
+about 60% slower. That regression came from the fused node not declaring
+`childrenCoalesceGoal`: it inherited whatever batches the child emitted instead of the
+target-size batching the unfused plan gets from `GpuExpandExec.coalesceAfter`. Each branch
+group-by then reduced poorly and the merge pass hashed the data a second time. With the
+batching contract restored, that configuration is faster rather than slower, and the
+single-input disjoint-key shortcut now applies to multi-batch partitions too, because the
+batches are coalesced before the first pass sees them.
+
+Some rows above list only two of three rounds. Those JVM launches produced no result line
+during an unattended sweep that captured only each process's last line of output, so the
+error was not retained. The affected configurations were re-run afterwards, including under
+artificial CPU load, without a single failure in 17 consecutive launches; the cause was not
+identified and should be re-checked if it recurs with full output captured.

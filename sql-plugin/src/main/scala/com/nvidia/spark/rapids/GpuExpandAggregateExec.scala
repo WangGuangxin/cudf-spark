@@ -207,6 +207,12 @@ case class GpuExpandAggregateExec(
     child: SparkPlan) extends ShimUnaryExecNode with GpuExec {
   override def output: Seq[Attribute] = aggregate.output
   override def outputPartitioning: Partitioning = UnknownPartitioning(0)
+  // The unfused plan coalesces Expand's output to the target size before the partial
+  // aggregate. Fusion removes that coalesce, so request the same batching on the much
+  // smaller unexpanded input instead. Without it the first pass sees whatever batches
+  // the child emits, reduces poorly, and pushes the work into the merge pass.
+  override def childrenCoalesceGoal: Seq[CoalesceGoal] =
+    Seq(TargetSize(aggregate.configuredTargetBatchSize))
   override def producedAttributes: AttributeSet = aggregate.producedAttributes
   override lazy val references: AttributeSet =
     AttributeSet(projections.flatten.flatMap(_.references))

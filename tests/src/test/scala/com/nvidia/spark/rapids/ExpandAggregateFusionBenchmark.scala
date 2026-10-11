@@ -43,7 +43,8 @@ object ExpandAggregateFusionBenchmark {
     val width = args(3).toInt
     val inputBatches = if (args.length == 6) args(5).toInt else 1
     val rows = 128 * 1024
-    val iterations = 10
+    val iterations = 20
+    val warmups = 30
     val dimensions = branchCount - 1
     val targetSize = 1024L * 1024 * 1024
     require(branchCount >= 2 && branchCount <= 8 && width > dimensions &&
@@ -121,7 +122,13 @@ object ExpandAggregateFusionBenchmark {
             val expandedRows = new LocalGpuMetric
             val sourceRows = new LocalGpuMetric
             val reused = new LocalGpuMetric
-            withResource(new GpuExpandAggregateIterator(input, branches, metrics,
+            // Mirrors GpuExpandAggregateExec.childrenCoalesceGoal: the fused node coalesces
+            // the unexpanded input instead of Expand's expanded output.
+            val coalescedInput = new GpuCoalesceIterator(input,
+              attrs.map(_.dataType).toArray, TargetSize(targetSize), NoopMetric, NoopMetric,
+              NoopMetric, NoopMetric, NoopMetric, NoopMetric, NoopMetric,
+              "expandAggregateBenchmark")
+            withResource(new GpuExpandAggregateIterator(coalescedInput, branches, metrics,
                 expandedRows, reusedBranchBatches = reused,
                 branchInputRows = sourceRows)) { first =>
               withResource(new CloseableBufferedIterator(first)) { buffered =>
@@ -148,7 +155,7 @@ object ExpandAggregateFusionBenchmark {
               allMetrics = Map.empty))
           }
         }
-        (0 until 3).foreach(_ => run())
+        (0 until warmups).foreach(_ => run())
         Rmm.resetScopedMaximumBytesAllocated()
         Cuda.profilerStart()
         try {
