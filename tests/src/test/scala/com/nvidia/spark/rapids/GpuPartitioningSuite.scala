@@ -18,15 +18,17 @@ package com.nvidia.spark.rapids
 
 import java.math.RoundingMode
 
-import ai.rapids.cudf.{ColumnVector, Cuda, DType, Table}
+import ai.rapids.cudf.{ColumnVector, Cuda, DType, OrderByArg, Table}
 import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.shims.GpuHashPartitioning
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funsuite.AnyFunSuite
 
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.catalyst.expressions.ExprId
 import org.apache.spark.sql.rapids.GpuShuffleEnv
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
-import org.apache.spark.sql.types.{DecimalType, DoubleType, IntegerType, StringType}
+import org.apache.spark.sql.types.{DataType, DecimalType, DoubleType, IntegerType, StringType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 class GpuPartitioningSuite extends AnyFunSuite with BeforeAndAfterEach {
@@ -109,6 +111,27 @@ class GpuPartitioningSuite extends AnyFunSuite with BeforeAndAfterEach {
     }
   }
 
+  private def compareUnorderedBatches(expected: ColumnarBatch, actual: ColumnarBatch,
+      types: Array[DataType]): Unit = {
+    // cuDF partitioning does not guarantee row order within a partition.
+    withResource(extractColumnVectors(expected)) { e =>
+      withResource(extractColumnVectors(actual)) { a =>
+        withResource(new Table(e: _*)) { et =>
+          withResource(new Table(a: _*)) { at =>
+            val order = types.indices.map(OrderByArg.asc(_)).toArray
+            withResource(et.orderBy(order: _*)) { es =>
+              withResource(at.orderBy(order: _*)) { as =>
+                withResource(GpuColumnVector.from(es, types)) { eb =>
+                  withResource(GpuColumnVector.from(as, types)) { ab => compareBatches(eb, ab) }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   test("GPU partition") {
     TrampolineUtil.cleanupAnyExistingSession()
     val conf = new SparkConf().set(RapidsConf.SHUFFLE_COMPRESSION_CODEC.key, "none")
@@ -155,6 +178,44 @@ class GpuPartitioningSuite extends AnyFunSuite with BeforeAndAfterEach {
 
   test("GPU partition with copy compression") {
     testGpuPartitionWithCompression("copy")
+  }
+
+  for (codec <- Seq("none", "copy", "lz4", "zstd")) {
+    test(s"fused hash partition pack with $codec compression") {
+      TrampolineUtil.cleanupAnyExistingSession()
+      val conf = new SparkConf()
+        .set(RapidsConf.SHUFFLE_COMPRESSION_CODEC.key, codec)
+        .set(RapidsConf.SHUFFLE_PARTITION_PACK_ENABLED.key, "true")
+      rapidsConf = new RapidsConf(conf)
+      TestUtils.withGpuSparkSession(conf) { _ =>
+        GpuShuffleEnv.init(rapidsConf)
+        val keys = Seq(GpuBoundReference(0, IntegerType, true)(ExprId(0), "key"))
+        val hp = new GpuHashPartitioning(keys, 20) {
+          override def usesGPUShuffle: Boolean = true
+          override def usesKudoGPUSlicing: Boolean = false
+          override def partitionInternalAndClose(
+              batch: ColumnarBatch): (Array[Int], Array[GpuColumnVector]) = {
+            fail("Supported payload must use fused packing")
+          }
+        }
+        withResource(buildBatch()) { input =>
+          val reference = GpuHashPartitioning(keys, 20)
+          val (indices, columns) = reference.partitionInternalAndClose(
+            GpuColumnVector.incRefCounts(input))
+          withResource(reference.sliceInternalOnGpuAndClose(input.numRows(), indices, columns)) {
+            expected =>
+              val output = hp.columnarEvalAny(GpuColumnVector.incRefCounts(input))
+                .asInstanceOf[Array[(ColumnarBatch, Int)]]
+              withResource(output.map(_._1)) { actual =>
+                assert(actual.length == expected.length)
+                actual.zip(expected).foreach { case (a, e) =>
+                  compareUnorderedBatches(e, a, GpuColumnVector.extractTypes(input))
+                }
+              }
+          }
+        }
+      }
+    }
   }
 
   test("GPU kudo partitioning with serialization") {

@@ -17,9 +17,11 @@
 package com.nvidia.spark.rapids
 
 import ai.rapids.cudf.{ColumnVector, DType, PartitionedTable}
-import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
+import com.nvidia.spark.rapids.jni.PartitionPack
 import com.nvidia.spark.rapids.shims.ShimExpression
 
+import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Expression, HiveHash, Murmur3Hash}
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
@@ -36,32 +38,36 @@ trait GpuHashPartitioner extends Serializable {
   protected final def hashPartitionAndClose(batch: ColumnarBatch, numPartitions: Int,
       nvtxId: NvtxId): PartitionedTable = {
     withResource(batch) { cb =>
-      val parts = nvtxId {
-        if (hashFunc.children.isEmpty) {
-          // Spark permits HashPartitioning with no expressions. The hash is the initial seed for
-          // every row, so preserve the CPU partition ID and partition count without asking cuDF
-          // to hash zero input columns.
-          val emptyHash = hashFunc match {
-            case GpuMurmur3Hash(_, seed) => seed
-            case GpuHiveHash(_) => 0
-            case other => throw new IllegalStateException(
-              s"Unsupported empty hash expression: ${other.getClass.getSimpleName}")
-          }
-          val partitionId = Math.floorMod(emptyHash, numPartitions)
-          withResource(GpuScalar.from(partitionId, IntegerType)) { partLit =>
-            ColumnVector.fromScalar(partLit, cb.numRows)
-          }
-        } else {
-          withResource(hashFunc.columnarEval(cb)) { hash =>
-            withResource(GpuScalar.from(numPartitions, IntegerType)) { partsLit =>
-              hash.getBase.pmod(partsLit, DType.INT32)
-            }
-          }
-        }
-      }
-      withResource(parts) { parts =>
+      withResource(partitionIds(cb, numPartitions, nvtxId)) { parts =>
         withResource(GpuColumnVector.from(cb)) { table =>
           table.partition(parts, numPartitions)
+        }
+      }
+    }
+  }
+
+  protected final def partitionIds(cb: ColumnarBatch, numPartitions: Int,
+      nvtxId: NvtxId): ColumnVector = {
+    nvtxId {
+      if (hashFunc.children.isEmpty) {
+        // Spark permits HashPartitioning with no expressions. The hash is the initial seed for
+        // every row, so preserve the CPU partition ID and partition count without asking cuDF
+        // to hash zero input columns.
+        val emptyHash = hashFunc match {
+          case GpuMurmur3Hash(_, seed) => seed
+          case GpuHiveHash(_) => 0
+          case other => throw new IllegalStateException(
+            s"Unsupported empty hash expression: ${other.getClass.getSimpleName}")
+        }
+        val partitionId = Math.floorMod(emptyHash, numPartitions)
+        withResource(GpuScalar.from(partitionId, IntegerType)) { partLit =>
+          ColumnVector.fromScalar(partLit, cb.numRows)
+        }
+      } else {
+        withResource(hashFunc.columnarEval(cb)) { hash =>
+          withResource(GpuScalar.from(numPartitions, IntegerType)) { partsLit =>
+            hash.getBase.pmod(partsLit, DType.INT32)
+          }
         }
       }
     }
@@ -98,13 +104,34 @@ abstract class GpuHashPartitioningBase(expressions: Seq[Expression], numPartitio
   override def columnarEvalAny(batch: ColumnarBatch): Any = {
     //  We are doing this here because the cudf partition command is at this level
     NvtxRegistry.HASH_PARTITION {
-      val numRows = batch.numRows
-      val (partitionIndexes, partitionColumns) = {
-        NvtxRegistry.HASH_PARTITION_SLICE {
-          partitionInternalAndClose(batch)
-        }
+      val supported = usesPartitionPack && closeOnExcept(batch) { cb =>
+        withResource(GpuColumnVector.from(cb)) { table => PartitionPack.isSupported(table) }
       }
-      sliceInternalGpuOrCpuAndClose(numRows, partitionIndexes, partitionColumns)
+      if (supported) {
+        val packed = withResource(batch) { cb =>
+          if (cb.numRows == 0) {
+            Array.empty[ColumnarBatch]
+          } else {
+            val tables = withResource(partitionIds(cb, numPartitions,
+                NvtxRegistry.CALCULATE_PART)) { ids =>
+              withResource(GpuColumnVector.from(cb)) { table =>
+                PartitionPack.partitionAndPack(table, ids, numPartitions)
+              }
+            }
+            packedTablesToBatchesAndClose(tables)
+          }
+        }
+        GpuSemaphore.releaseIfNecessary(TaskContext.get())
+        packed.zipWithIndex
+      } else {
+        val numRows = batch.numRows
+        val (partitionIndexes, partitionColumns) = {
+          NvtxRegistry.HASH_PARTITION_SLICE {
+            partitionInternalAndClose(batch)
+          }
+        }
+        sliceInternalGpuOrCpuAndClose(numRows, partitionIndexes, partitionColumns)
+      }
     }
   }
 

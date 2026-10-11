@@ -2516,6 +2516,13 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
     val CPU, GPU = Value
   }
 
+  val SHUFFLE_PARTITION_PACK_ENABLED = conf("spark.rapids.shuffle.partitionPack.enabled")
+    .doc("Gather hash-partitioned flat fixed-width and string payloads directly into packed " +
+      "buffers for RAPIDS GPU shuffle. Unsupported payloads and Kudo use the existing path.")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
+
   val SHUFFLE_KUDO_WRITE_MODE = conf("spark.rapids.shuffle.kudo.serializer.write.mode")
     .doc("Kudo serializer mode. " +
       "\"CPU\": serialize shuffle outputs on the cpu. " +
@@ -3913,6 +3920,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val shuffleMaxMetadataSize: Long = get(SHUFFLE_MAX_METADATA_SIZE)
 
   lazy val shuffleCompressionCodec: String = get(SHUFFLE_COMPRESSION_CODEC)
+
+  lazy val shufflePartitionPackEnabled: Boolean = get(SHUFFLE_PARTITION_PACK_ENABLED)
 
   lazy val shuffleCompressionLz4ChunkSize: Long = get(SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE)
 

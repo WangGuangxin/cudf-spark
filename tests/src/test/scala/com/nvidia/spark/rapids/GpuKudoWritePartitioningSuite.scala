@@ -183,6 +183,7 @@ class GpuKudoWritePartitioningSuite extends AnyFunSuite with BeforeAndAfterEach
       .set(RapidsConf.SHUFFLE_COMPRESSION_CODEC.key, "none")
       .set(RapidsConf.SHUFFLE_KUDO_SERIALIZER_ENABLED.key, "true")
       .set(RapidsConf.SHUFFLE_KUDO_WRITE_MODE.key, "GPU")
+      .set(RapidsConf.SHUFFLE_PARTITION_PACK_ENABLED.key, "true")
   }
 
   /**
