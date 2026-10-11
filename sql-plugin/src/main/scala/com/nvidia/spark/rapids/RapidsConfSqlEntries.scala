@@ -1015,4 +1015,14 @@ private[rapids] trait RapidsConfSqlEntries extends RapidsConfResourceEntries {
     .booleanConf
     .createWithDefault(true)
 
+
+  val ENABLE_JOIN_CHAIN = conf("spark.rapids.sql.join.chain.enabled")
+    .doc("When enabled, consecutive GPU hash joins within a stage are fused into a single " +
+      "chain that defers payload materialization: only join keys are gathered between probes " +
+      "and the original payload columns are gathered once at the end. Set to false to make " +
+      "every join materialize its own output, which is the baseline for A/B measuring the " +
+      "chain. See also spark.rapids.sql.join.chain.logDiagnostics.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
 }

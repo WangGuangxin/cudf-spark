@@ -712,6 +712,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val shuffledHashJoinOptimizeShuffle: Boolean = get(SHUFFLED_HASH_JOIN_OPTIMIZE_SHUFFLE)
 
+  lazy val isJoinChainEnabled: Boolean = get(ENABLE_JOIN_CHAIN)
+
+  lazy val joinChainLogDiagnostics: Boolean = get(JOIN_CHAIN_LOG_DIAGNOSTICS)
+
   lazy val useShuffledSymmetricHashJoin: Boolean = get(USE_SHUFFLED_SYMMETRIC_HASH_JOIN)
 
   lazy val useShuffledAsymmetricHashJoin: Boolean =

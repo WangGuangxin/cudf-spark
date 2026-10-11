@@ -988,4 +988,16 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
       // 4. We have not yet implemented unified thread priority, so there's deadlock risks if this
       // value is improperly set.
       .createWithDefault(-1)
+
+  val JOIN_CHAIN_LOG_DIAGNOSTICS = conf("spark.rapids.sql.join.chain.logDiagnostics")
+    .doc("Log one line per GPU hash join describing whether it anchored a fused join chain " +
+      "and, if not, why the chain was not formed. Lines are tagged RAPIDS_JOIN_CHAIN and are " +
+      "emitted on the driver while the RDD is built, so they can be aggregated across a whole " +
+      "benchmark run to measure how often the chain actually triggers. When " +
+      "spark.rapids.sql.join.chain.enabled is false the analysis still runs and reports which " +
+      "plans would have fused, so both sides of an A/B comparison are observable. Without this " +
+      "the same lines are only emitted at DEBUG level.")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
 }
