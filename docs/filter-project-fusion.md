@@ -16,14 +16,22 @@ intermediate materialization on wide
 inputs with narrow outputs. It does not guarantee fewer kernels for every query.
 
 Eligibility requires deterministic expressions without side effects and a closed
-whitelist: integer/boolean references and literals, comparisons, logical operations,
-null checks, and safe integer addition, subtraction, and multiplication. Any data type
-can be projected as a direct reference, including strings and nested payloads. Throwing
-ANSI expressions, casts, division, UDFs, and nondeterministic expressions remain on the
-existing path. Projects that disable splitting are also left unchanged.
+whitelist: integer/boolean/decimal references and literals, comparisons, logical operations,
+null checks, and safe integer addition, subtraction, and multiplication. Decimal computations
+add non-ANSI addition, subtraction, multiplication and division, their precision/overflow
+wrappers, and non-ANSI casts between decimals and integral types or between decimal types.
+Existing scale alignment, rounding and null-on-overflow/divide-by-zero behavior is preserved.
+Any data type can be projected as a direct reference, including strings and nested payloads.
+Throwing ANSI arithmetic, ANSI decimal casts, other casts, non-decimal division, UDFs, and
+nondeterministic expressions remain on the existing path. Projects that disable splitting
+are also left unchanged.
 
 Fusion retains the projection backend selected by `spark.rapids.sql.projectAstEnabled`.
 Expression binding happens once on the driver; AST compilation remains partition-local.
+Decimal expressions use the existing tiered GPU evaluator rather than AST. With
+`spark.rapids.sql.projectPartialAstEnabled=true`, eligible integer outputs can still use
+partial AST alongside decimal outputs. This extension reduces filter/project materialization;
+it does not combine decimal arithmetic kernels or remove their required intermediate columns.
 OOM retries and row splitting restart the complete fused operation from the original
 spillable input. Results, row order, partitioning, and ordering follow the existing
 operators; batch sizes and counts may change. The fused node reports input/output rows
@@ -37,6 +45,10 @@ these metrics for profiling.
 `FilterProjectFusionSuite` compares CPU, GPU with fusion disabled, and GPU with fusion
 enabled and checks physical plans. `FilterProjectRetrySuite` covers retry/split OOM,
 spilled inputs, task abandonment, duplicate references, and empty dependencies.
+`FilterProjectDecimalSuite` adds CPU/OFF/ON checks for DECIMAL32/64/128, nullable predicates,
+different scales, arithmetic, rounding, overflow, zero divisors, CSE, precision-loss settings,
+partial AST interaction and ANSI fallback. `FilterProjectDecimalRetrySuite` covers retry/split
+OOMs, failures after decimal outputs have been allocated, and restoring spilled decimal inputs.
 
 `com.nvidia.spark.rapids.FilterProjectFusionBenchmark` is a manual operator benchmark in
 the tests module. Run it using the Spark 3.5.1 test runtime classpath. Its arguments are:

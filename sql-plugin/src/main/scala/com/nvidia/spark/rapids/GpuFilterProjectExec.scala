@@ -28,16 +28,24 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference,
   NamedExpression, SortOrder}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.rapids.{GpuAddBase, GpuAnd, GpuEqualTo, GpuGreaterThan,
+import org.apache.spark.sql.rapids.{GpuAddBase, GpuAnd, GpuDecimalDivide, GpuDecimalMultiply,
+  GpuEqualTo, GpuGreaterThan,
   GpuGreaterThanOrEqual, GpuLessThan, GpuLessThanOrEqual, GpuMultiply, GpuNot, GpuOr,
   GpuSubtractBase}
-import org.apache.spark.sql.types.{BooleanType, ByteType, DataType, IntegerType, LongType, ShortType}
+import org.apache.spark.sql.types.{BooleanType, ByteType, DataType, DecimalType, IntegerType, LongType, ShortType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object GpuFilterProjectExec extends Logging {
-  private def primitive(dt: DataType): Boolean = dt match {
+  private def supportedType(dt: DataType): Boolean = dt match {
     case BooleanType | ByteType | ShortType | IntegerType | LongType => true
+    case _: DecimalType => true
     case _ => false
+  }
+
+  private def decimalCast(cast: GpuCast): Boolean = {
+    def numeric(dt: DataType): Boolean = supportedType(dt) && dt != BooleanType
+    !cast.ansiMode && numeric(cast.child.dataType) && numeric(cast.dataType) &&
+      (cast.child.dataType.isInstanceOf[DecimalType] || cast.dataType.isInstanceOf[DecimalType])
   }
 
   private def pure(expr: Expression): Boolean = expr.deterministic && (expr match {
@@ -54,8 +62,16 @@ object GpuFilterProjectExec extends Logging {
 
   // Deliberately closed whitelist. Retryability alone also admits stateful expressions.
   private def safe(expr: Expression): Boolean = {
-    pure(expr) && primitive(expr.dataType) && (expr match {
+    pure(expr) && supportedType(expr.dataType) && (expr match {
       case _: AttributeReference | _: GpuLiteral => true
+      // Decimal wrappers and casts can throw without being fully described by hasSideEffects
+      // in every Spark shim. Keep explicit guards and preserve their existing evaluation.
+      case c: GpuCast => decimalCast(c) && safe(c.child)
+      case c: GpuCheckOverflow => c.nullOnOverflow && safe(c.child)
+      case m: GpuDecimalMultiply => !m.failOnError && m.children.forall(safe)
+      case d: GpuDecimalDivide =>
+        !d.failOnError && !d.failOnDivideByZero && d.children.forall(safe)
+      case p: GpuPromotePrecision => safe(p.child)
       case _: GpuAlias | _: GpuNot | _: GpuAnd | _: GpuOr |
            _: GpuEqualTo | _: GpuGreaterThan | _: GpuGreaterThanOrEqual |
            _: GpuLessThan | _: GpuLessThanOrEqual | _: GpuIsNull | _: GpuIsNotNull |
