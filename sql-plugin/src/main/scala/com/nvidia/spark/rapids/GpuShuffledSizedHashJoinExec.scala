@@ -465,7 +465,7 @@ abstract class GpuShuffledSizedHashJoinExec[HOST_BATCH_TYPE <: AutoCloseable] ex
     }
   }
 
-  /** A large/non-unique build resumes normal GPU sizing and sub-partition joins. */
+  /** A large build or excessive fanout resumes normal GPU sizing and sub-partition joins. */
   def joinChainEager(side: GpuBuildSide): (Either[ColumnarBatch, Iterator[ColumnarBatch]],
       Iterator[ColumnarBatch]) => Iterator[ColumnarBatch] = {
     val localType = joinType

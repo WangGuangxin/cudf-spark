@@ -42,9 +42,11 @@ class LeftSemiJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       nullable: Boolean = false, semiBuildRows: Int = 180): DataFrame = {
     val key = if (nullable) "CASE WHEN id % 13 = 0 THEN NULL ELSE CAST(id % 60 AS INT) END"
       else "CAST(id % 60 AS INT)"
-    val fact = spark.range(0, 240).selectExpr(
+    val input = spark.range(0, 240).selectExpr(
       (Seq(s"$key AS k") ++ (0 until 8).map(i => s"id * ${i + 2} AS p$i")): _*)
-      .repartition(2, col("k"))
+    // Spark can push a semi join below repartition, placing an exchange inside the chain.
+    // Broadcast fixtures need no repartition; keep all three probes in the same pipeline.
+    val fact = if (hint == "BROADCAST") input else input.repartition(2, col("k"))
     recipe.zipWithIndex.foldLeft(fact) { case (stream, (kind, i)) =>
       val name = s"d$i"
       val buildKey = if (nullable && kind == "left_semi") key else "CAST(id % 60 AS INT)"

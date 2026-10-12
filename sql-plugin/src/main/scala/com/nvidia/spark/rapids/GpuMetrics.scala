@@ -214,7 +214,8 @@ object GpuMetric extends Logging {
   val DESCRIPTION_BIG_JOIN_COUNT = "big joins"
   val DESCRIPTION_JOIN_CHAIN_FUSED_TASKS = "join chain fused tasks"
   val DESCRIPTION_JOIN_CHAIN_FALLBACK_OVERSIZED = "join chain fallbacks (oversized build)"
-  val DESCRIPTION_JOIN_CHAIN_FALLBACK_NON_UNIQUE = "join chain fallbacks (non-unique build)"
+  val DESCRIPTION_JOIN_CHAIN_FALLBACK_NON_UNIQUE =
+    "join chain fallbacks (non-unique build exceeds map budget)"
   val DESCRIPTION_SYNC_READ_TIME = "sync read time"
   val DESCRIPTION_ASYNC_READ_TIME = "async read time"
   val DESCRIPTION_ICEBERG_BUILD_ACTION_TIME = "iceberg build action tree time"
