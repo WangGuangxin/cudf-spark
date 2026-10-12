@@ -25,7 +25,7 @@ import com.nvidia.spark.rapids.RmmRapidsRetryIterator.{withRestoreOnRetry, withR
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftSemi}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.types.{ArrayType, BinaryType, IntegerType, MapType, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -66,7 +66,8 @@ private[execution] case class JoinChainStage(
     nullsEqual: Boolean,
     outputRows: GpuMetric = NoopMetric,
     outputBatches: GpuMetric = NoopMetric,
-    joinTime: GpuMetric = NoopMetric)
+    joinTime: GpuMetric = NoopMetric,
+    isLeftSemi: Boolean = false)
 
 /** Fuse only a local stream-side chain. Exchanges, filters and computed projections end a chain. */
 object GpuJoinChain extends Logging {
@@ -156,8 +157,11 @@ object GpuJoinChain extends Logging {
     val hashStrategy = options.strategy == JoinStrategy.AUTO ||
       options.strategy == JoinStrategy.HASH_ONLY
     if (!hashStrategy) Some(s"strategy=${options.strategy}")
-    else if (node.plan.joinType != Inner) Some(s"joinType=${node.plan.joinType}")
-    else if (node.plan.condition.isDefined) Some("joinCondition")
+    else if (node.plan.joinType != Inner && node.plan.joinType != LeftSemi) {
+      Some(s"joinType=${node.plan.joinType}")
+    } else if (node.plan.joinType == LeftSemi && node.side != GpuBuildRight) {
+      Some("leftSemiBuildSide")
+    } else if (node.plan.condition.isDefined) Some("joinCondition")
     else if (node.plan.isSkewJoin) Some("skewJoin")
     else if (node.buildKeys.isEmpty) Some("noBuildKeys")
     else if (!node.buildKeys.forall(simpleKey)) Some("buildKeyType")
@@ -196,14 +200,20 @@ object GpuJoinChain extends Logging {
 
   private def worthwhile(chain: Chain): Boolean = {
     // Per-row bytes screen out narrow chains; this does not predict selectivity or elapsed time.
-    val stages = chain.links.size.toLong
     val savedPayload = chain.links.dropRight(1).flatMap(_.node.plan.output)
       .map(_.dataType.defaultSize.toLong).sum
-    val composedMaps = (stages + 2) * (stages - 1) / 2
+    // Semi stages contribute no build payload map to subsequent probes.
+    val composedMaps = chain.links.indices.drop(1).map { i =>
+      1L + chain.links.take(i).count(_.node.plan.joinType != LeftSemi)
+    }.sum
     val mapTraffic = 2L * Integer.BYTES * composedMaps
     val keyTraffic = chain.links.drop(1).flatMap(_.node.streamKeys)
       .map(key => 2L * key.dataType.defaultSize + Integer.BYTES).sum
-    savedPayload > mapTraffic + keyTraffic
+    // Broadcast chains can filter a stream through small dimension tables before gathering
+    // its payload. The schema-only traffic estimate cannot account for that reduction or the
+    // avoided intermediate gathers, so do not reject narrow broadcast chains with this model.
+    // Runtime build-size and uniqueness checks still select the eager path when necessary.
+    chain.links.forall(_.node.broadcast) || savedPayload > mapTraffic + keyTraffic
   }
 
   /**
@@ -265,7 +275,8 @@ object GpuJoinChain extends Logging {
     val joinTime = plan.gpuLongMetric(GpuMetric.JOIN_TIME)
     val stage = JoinChainStage(n.buildKeys,
       n.streamKeys.map(_.asInstanceOf[GpuBoundReference].ordinal), link.projection,
-      n.side, GpuHashJoin.compareNullsEqual(plan.joinType, n.buildKeys), rows, batches, joinTime)
+      n.side, GpuHashJoin.compareNullsEqual(plan.joinType, n.buildKeys), rows, batches, joinTime,
+      isLeftSemi = plan.joinType == LeftSemi)
     val (load, eager): ((Batches, Batches) => (Built, Batches), (Built, Batches) => Batches) =
       plan match {
         case join: GpuBroadcastHashJoinExecBase =>
@@ -389,13 +400,18 @@ object GpuJoinChain extends Logging {
             val keys = buildKeys(builds, stages)
             closeOnExcept(keys) { _ =>
               val unique = builds.indices.forall { i =>
-                keys(i).checkpoint()
-                withRetryNoSplit {
-                  withRestoreOnRetry(keys(i)) {
-                    withResource(GpuColumnVector.from(keys(i).getBatch)) { table =>
-                      val result = table.distinctCount(NullEquality.EQUAL) == builds(i).numRows
-                      keys(i).allowSpilling()
-                      result
+                if (stages(i).isLeftSemi) {
+                  // Semi build keys are deduplicated; duplicate payload rows are immaterial.
+                  true
+                } else {
+                  keys(i).checkpoint()
+                  withRetryNoSplit {
+                    withRestoreOnRetry(keys(i)) {
+                      withResource(GpuColumnVector.from(keys(i).getBatch)) { table =>
+                        val result = table.distinctCount(NullEquality.EQUAL) == builds(i).numRows
+                        keys(i).allowSpilling()
+                        result
+                      }
                     }
                   }
                 }
@@ -436,21 +452,31 @@ object GpuJoinChain extends Logging {
       withRetryNoSplit {
         withRestoreOnRetry(builds(i)) {
           withResource(GpuProjectExec.project(builds(i).getBatch, stages(i).buildKeys)) { keys =>
-            // Copy build keys once, so they cannot pin an entire contiguous payload.
+            // Inner keys need an independent copy. Semi keys are copied by deduplication,
+            // retaining one row even for repeated NULL keys; probe null equality is unchanged.
+            val semi = stages(i).isLeftSemi
             withResource(GpuColumnVector.extractBases(keys).toSeq.safeMap { column =>
-              column.subVector(0, keys.numRows())
+              if (semi) column.incRefCount() else column.subVector(0, keys.numRows())
             }) { columns =>
-                withResource(new Table(columns: _*)) { table =>
-                  withResource(GpuColumnVector.from(table, GpuColumnVector.extractTypes(keys))) {
-                    batch =>
-                      val result = LazySpillableColumnarBatch(batch, "join_chain_build_keys")
-                      closeOnExcept(result) { owned =>
-                        builds(i).allowSpilling()
-                        owned.allowSpilling()
-                        owned
-                      }
+              withResource(new Table(columns: _*)) { table =>
+                val types = GpuColumnVector.extractTypes(keys)
+                val detached = if (semi) {
+                  withResource(table.dropDuplicates(columns.indices.toArray,
+                      Table.DuplicateKeepOption.KEEP_ANY, true)) { unique =>
+                    GpuColumnVector.from(unique, types)
+                  }
+                } else {
+                  GpuColumnVector.from(table, types)
+                }
+                withResource(detached) { batch =>
+                  val result = LazySpillableColumnarBatch(batch, "join_chain_build_keys")
+                  closeOnExcept(result) { owned =>
+                    builds(i).allowSpilling()
+                    owned.allowSpilling()
+                    owned
                   }
                 }
+              }
             }
           }
         }
@@ -591,16 +617,27 @@ private[execution] class JoinChainIterator(
                           Seq(withResource(selection.copyToColumnVector())(index))
                         } else {
                           maps.safeMap { old =>
-                            withResource(GpuColumnVector.from(old.data.getBatch)) { table =>
-                              withResource(table.gather(selection, OutOfBoundsPolicy.DONT_CHECK)) {
-                                gathered => index(gathered.getColumn(0))
+                            if (old == null) {
+                              null
+                            } else {
+                              withResource(GpuColumnVector.from(old.data.getBatch)) { table =>
+                                withResource(table.gather(selection,
+                                    OutOfBoundsPolicy.DONT_CHECK)) {
+                                  gathered => index(gathered.getColumn(0))
+                                }
                               }
                             }
                           }
                         }
                         closeOnExcept(prefix) { _ =>
-                          withResource(joined(1).toColumnView(0, joinedRows)) { right =>
-                            prefix :+ withResource(right.copyToColumnVector())(index)
+                          if (stage.isLeftSemi) {
+                            // Keep source indices aligned for later inner stages, without
+                            // retaining a map or exposing any semi-build payload columns.
+                            prefix :+ null
+                          } else {
+                            withResource(joined(1).toColumnView(0, joinedRows)) { right =>
+                              prefix :+ withResource(right.copyToColumnVector())(index)
+                            }
                           }
                         }
                       }
@@ -612,12 +649,14 @@ private[execution] class JoinChainIterator(
           }
           withResource(maps) { _ => maps = next }
           rows = maps.headOption.map(_.getRowCount.toInt).getOrElse(0)
-          maps.foreach(_.allowSpilling())
+          maps.filter(_ != null).foreach(_.allowSpilling())
         }
         counts += rows
-        val buildLayout = builds(i).dataTypes.indices.map(Origin(i + 1, _))
-        layout = if (stage.buildSide == GpuBuildRight) layout ++ buildLayout
-          else buildLayout ++ layout
+        if (!stage.isLeftSemi) {
+          val buildLayout = builds(i).dataTypes.indices.map(Origin(i + 1, _))
+          layout = if (stage.buildSide == GpuBuildRight) layout ++ buildLayout
+            else buildLayout ++ layout
+        }
       }
       if (rows == 0) {
         (None, counts.toSeq)
