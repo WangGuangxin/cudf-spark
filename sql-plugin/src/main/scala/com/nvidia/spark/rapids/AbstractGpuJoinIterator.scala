@@ -203,7 +203,10 @@ abstract class SplittableJoinIterator(
   // For some join types even if there is no stream data we might output something
   private var isInitialJoin = true
   // If the join explodes this holds batches from the stream side split into smaller pieces.
-  private val pendingSplits = scala.collection.mutable.Queue[LazySpillableColumnarBatch]()
+  private val pendingSplits = scala.collection.mutable.ListBuffer[LazySpillableColumnarBatch]()
+
+  /** Process nested splits immediately when row expansion requires repeated splitting. */
+  protected def splitBeforePending: Boolean = false
 
   protected def computeNumJoinRows(cb: LazySpillableColumnarBatch): Long
 
@@ -226,7 +229,7 @@ abstract class SplittableJoinIterator(
     isInitialJoin = false
     if (pendingSplits.nonEmpty || stream.hasNext) {
       val scb = if (pendingSplits.nonEmpty) {
-        pendingSplits.dequeue()
+        pendingSplits.remove(0)
       } else {
         stream.next()
       }
@@ -320,7 +323,9 @@ abstract class SplittableJoinIterator(
     } else {
       logInfo(msg)
     }
-    pendingSplits ++= splitStreamBatch(cb, numBatches)
+    val splits = splitStreamBatch(cb, numBatches)
+    if (splitBeforePending) pendingSplits.insertAll(0, splits)
+    else pendingSplits ++= splits
   }
 
   /**

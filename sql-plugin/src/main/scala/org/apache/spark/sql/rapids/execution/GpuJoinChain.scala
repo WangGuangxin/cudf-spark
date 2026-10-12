@@ -16,7 +16,7 @@
 
 package org.apache.spark.sql.rapids.execution
 
-import ai.rapids.cudf.{ColumnVector, ColumnView, DType, NullEquality, OutOfBoundsPolicy, Table}
+import ai.rapids.cudf.{ColumnVector, ColumnView, DType, GroupByAggregation, GroupByOptions, NullEquality, NullPolicy, OutOfBoundsPolicy, Table}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
@@ -67,7 +67,9 @@ private[execution] case class JoinChainStage(
     outputRows: GpuMetric = NoopMetric,
     outputBatches: GpuMetric = NoopMetric,
     joinTime: GpuMetric = NoopMetric,
-    isLeftSemi: Boolean = false)
+    isLeftSemi: Boolean = false,
+    buildKeysUnique: Boolean = true,
+    maxBuildMatches: Long = 1L)
 
 /** Fuse only a local stream-side chain. Exchanges, filters and computed projections end a chain. */
 object GpuJoinChain extends Logging {
@@ -132,7 +134,7 @@ object GpuJoinChain extends Logging {
         else if (childJoin(join.right).isRight) GpuBuildLeft
         else {
           // At the anchor, prefer retaining the wider payload as the streaming source. Runtime
-          // size and uniqueness checks still decide whether the selected build can be deferred.
+          // size and fanout checks still decide whether the selected build can be deferred.
           val leftWidth = join.left.output.map(_.dataType.defaultSize.toLong).sum
           val rightWidth = join.right.output.map(_.dataType.defaultSize.toLong).sum
           if (leftWidth < rightWidth) GpuBuildLeft else GpuBuildRight
@@ -212,7 +214,7 @@ object GpuJoinChain extends Logging {
     // Broadcast chains can filter a stream through small dimension tables before gathering
     // its payload. The schema-only traffic estimate cannot account for that reduction or the
     // avoided intermediate gathers, so do not reject narrow broadcast chains with this model.
-    // Runtime build-size and uniqueness checks still select the eager path when necessary.
+    // Runtime build-size and fanout checks still select the eager path when necessary.
     chain.links.forall(_.node.broadcast) || savedPayload > mapTraffic + keyTraffic
   }
 
@@ -399,24 +401,12 @@ object GpuJoinChain extends Logging {
             val stages = prepared.map(_.stage)
             val keys = buildKeys(builds, stages)
             closeOnExcept(keys) { _ =>
-              val unique = builds.indices.forall { i =>
-                if (stages(i).isLeftSemi) {
-                  // Semi build keys are deduplicated; duplicate payload rows are immaterial.
-                  true
-                } else {
-                  keys(i).checkpoint()
-                  withRetryNoSplit {
-                    withRestoreOnRetry(keys(i)) {
-                      withResource(GpuColumnVector.from(keys(i).getBatch)) { table =>
-                        val result = table.distinctCount(NullEquality.EQUAL) == builds(i).numRows
-                        keys(i).allowSpilling()
-                        result
-                      }
-                    }
-                  }
-                }
-              }
-              if (unique) {
+              val classified = classifyBuildKeys(keys, stages)
+              // Splitting the stream cannot bound a single row with excessive fanout. Keep
+              // the ordinary join's out-of-core path for that case, before probing any stage.
+              val fits = classified.forall(_.buildKeysUnique) ||
+                mapWorkPerRow(classified) <= maxMapRows(options.targetSize)
+              if (fits) {
                 chain.links.zip(builds).foreach { case (link, data) =>
                   if (!link.node.broadcast) {
                     link.node.plan.gpuLongMetric(GpuMetric.BUILD_DATA_SIZE) +=
@@ -424,7 +414,7 @@ object GpuJoinChain extends Logging {
                   }
                 }
                 fusedTasks += 1
-                new JoinChainIterator(stream, attrs, builds, keys, stages, options, opTime)
+                new JoinChainIterator(stream, attrs, builds, keys, classified, options, opTime)
               } else {
                 nonUniqueFallbacks += 1
                 withResource(keys)(_ => withResource(owners)(_ => eager()))
@@ -434,6 +424,66 @@ object GpuJoinChain extends Logging {
         }
       }
     }
+  }
+
+  /** Select the distinct fast path or bound the complete-key fanout, including skew. */
+  private[execution] def classifyBuildKeys(keys: Seq[LazySpillableColumnarBatch],
+      stages: Seq[JoinChainStage]): Seq[JoinChainStage] = {
+    stages.indices.map { i =>
+      val stage = stages(i)
+      if (stage.isLeftSemi) {
+        // Semi keys were deduplicated and never multiply the stream rows.
+        stage.copy(buildKeysUnique = true, maxBuildMatches = 1)
+      } else {
+        keys(i).checkpoint()
+        withRetryNoSplit {
+          withRestoreOnRetry(keys(i)) {
+            withResource(GpuColumnVector.from(keys(i).getBatch)) { table =>
+              val unique = table.distinctCount(NullEquality.EQUAL) == keys(i).numRows
+              val maxMatches = if (unique) {
+                1L
+              } else {
+                val groupOptions = GroupByOptions.builder()
+                  .withIgnoreNullKeys(!stage.nullsEqual).build()
+                withResource(table.groupBy(groupOptions, stage.buildKeys.indices: _*)
+                    .aggregate(GroupByAggregation.count(NullPolicy.INCLUDE).onColumn(0))) {
+                  counts =>
+                    withResource(counts.getColumn(counts.getNumberOfColumns - 1).max()) { max =>
+                      if (max.isValid) math.max(1L, max.getInt.toLong) else 1L
+                    }
+                }
+              }
+              keys(i).allowSpilling()
+              stage.copy(buildKeysUnique = unique, maxBuildMatches = maxMatches)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private[execution] def saturatingMultiply(left: Long, right: Long): Long =
+    if (left > Long.MaxValue / right) Long.MaxValue else left * right
+
+  private[execution] def mapTargetSize(target: Long): Long =
+    math.min(target, Int.MaxValue.toLong * 2 * Integer.BYTES)
+
+  private[execution] def maxMapRows(target: Long): Long =
+    math.max(1L, mapTargetSize(target) / (2 * Integer.BYTES))
+
+  /** Upper bound in pairs of INT32 indices: previous/composed source maps plus join maps.
+   * Products are conservative across stages since key correlations are not known here.
+   */
+  private[execution] def mapWorkPerRow(stages: Seq[JoinChainStage]): Long = {
+    var fanout = 1L
+    var sources = 1L
+    var work = 1L
+    stages.foreach { stage =>
+      fanout = saturatingMultiply(fanout, stage.maxBuildMatches)
+      if (!stage.isLeftSemi) sources += 1
+      work = math.max(work, saturatingMultiply(fanout, sources + 1))
+    }
+    work
   }
 
   /** Reference-only projection, stripping contiguous-batch subclasses when rearranging columns. */
@@ -497,11 +547,15 @@ private[execution] class JoinChainIterator(
     extends SplittableJoinIterator(NvtxRegistry.JOIN_GATHER,
       input.map { batch =>
         withResource(batch)(LazySpillableColumnarBatch(_, "join_chain_fact"))
-      }, attrs, builds.head, options.targetSize, options.sizeEstimateThreshold,
+      }, attrs, builds.head, GpuJoinChain.mapTargetSize(options.targetSize),
+      options.sizeEstimateThreshold,
       opTime, stages.last.joinTime) {
   private case class Origin(source: Int, column: Int)
   private val hashes = stages.map(stage =>
-    new GpuJoinHashCache(true, stage.nullsEqual, options.hashReuseEnabled))
+    new GpuJoinHashCache(stage.buildKeysUnique, stage.nullsEqual, options.hashReuseEnabled))
+  private val hasFanout = stages.exists(!_.buildKeysUnique)
+  private val mapWork = GpuJoinChain.mapWorkPerRow(stages)
+  override protected def splitBeforePending: Boolean = hasFanout
   private[execution] def hashBuildCount: Long = hashes.map(_.buildCount).sum
   override def close(): Unit = {
     if (!closed) {
@@ -515,8 +569,17 @@ private[execution] class JoinChainIterator(
     }
   }
 
-  override protected def computeNumJoinRows(batch: LazySpillableColumnarBatch): Long =
-    batch.numRows.toLong * stages.size
+  override protected def computeNumJoinRows(batch: LazySpillableColumnarBatch): Long = {
+    if (hasFanout) {
+      // Limit each splitting pass to eight pieces rather than queuing potentially millions
+      // of batches at once. Each piece is checked again before any probe allocation.
+      val maxSplits = 8L
+      math.min(GpuJoinChain.saturatingMultiply(batch.numRows.toLong, mapWork),
+        GpuJoinChain.saturatingMultiply(GpuJoinChain.maxMapRows(options.targetSize), maxSplits))
+    } else {
+      batch.numRows.toLong * stages.size
+    }
+  }
 
   private class IndexMap(val data: LazySpillableColumnarBatch) extends LazySpillableGatherMap {
     override val getRowCount: Long = data.numRows
@@ -564,7 +627,12 @@ private[execution] class JoinChainIterator(
         gatherer
       } catch {
         case oom @ (_: OutOfMemoryError | _: com.nvidia.spark.rapids.jni.GpuOOM) =>
-          splitAndSave(fact.getBatch, 2, Some(oom))
+          if (hasFanout && fact.numRows > 1) {
+            // A small input can still produce large maps. Allow reducing it down to one row.
+            splitAndSave(fact.getBatch, 2)
+          } else {
+            splitAndSave(fact.getBatch, 2, Some(oom))
+          }
           None
       }
     }

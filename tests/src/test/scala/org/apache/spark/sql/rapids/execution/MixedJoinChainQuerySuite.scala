@@ -97,7 +97,20 @@ class MixedJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       spark => query(spark, recipes(3), buildLeft = true, repeatedFact = true),
       config(sized, aqe = false), sort = true)(identity)
 
-    testSparkResultsAreEqual(s"mixed join duplicate-key fallback sized=$sized",
+    test(s"mixed non-unique builds actually fuse sized=$sized") {
+      withGpuSparkSession(spark => {
+        val df = query(spark, recipes(3), duplicates = true)
+        assert(df.collect().length == 320)
+        val joins = PlanUtils.findOperators(df.queryExecution.executedPlan,
+          _.isInstanceOf[GpuJoinExec]).map(_.asInstanceOf[GpuJoinExec])
+        assert(joins.exists(GpuJoinChain.chainLength(_) == 3))
+        assert(joins.map(_.gpuLongMetric(GpuMetric.JOIN_CHAIN_FUSED_TASKS).value).sum > 0)
+        assert(joins.map(_.gpuLongMetric(GpuMetric.JOIN_CHAIN_FALLBACK_NON_UNIQUE).value)
+          .sum == 0)
+      }, config(sized, aqe = false))
+    }
+
+    testSparkResultsAreEqual(s"mixed join non-unique keys sized=$sized",
       spark => query(spark, recipes(3), duplicates = true),
       config(sized, aqe = false), sort = true)(identity)
 
@@ -106,7 +119,7 @@ class MixedJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       config(sized, aqe = false).set(RapidsConf.GPU_BATCH_SIZE_BYTES.key, "1024"),
       sort = true)(identity)
 
-    testSparkResultsAreEqual(s"mixed join build-left duplicate fallback sized=$sized",
+    testSparkResultsAreEqual(s"mixed join build-left non-unique keys sized=$sized",
       spark => query(spark, recipes(3), duplicates = true, buildLeft = true,
         repeatedFact = true), config(sized, aqe = false), sort = true)(identity)
 
@@ -124,7 +137,7 @@ class MixedJoinChainQuerySuite extends SparkQueryCompareTestSuite {
     test(s"join chain can be turned off for A/B measurement sized=$sized") {
       // Sum the three runtime counters rather than asserting on `fused` alone: the point of the
       // switch is that none of the chain path runs when it is off, independently of whether a
-      // given build would have passed the runtime uniqueness and sizing checks.
+      // given build would have passed the runtime fanout and sizing checks.
       def chainTaskCount(plan: org.apache.spark.sql.execution.SparkPlan): Long =
         PlanUtils.findOperators(plan, _.isInstanceOf[GpuJoinExec])
           .collect { case j: GpuJoinExec => j }

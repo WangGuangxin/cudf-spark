@@ -84,7 +84,7 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
       action: Int => Unit = _ => (), targetSize: Long = options.targetSize,
       inputBatchRows: Int = 120, dimensionRows: Seq[Seq[Row]] = dims,
       retryKeys: Boolean = false, expectedHashBuilds: Option[Long] = None,
-      reuseHash: Boolean = true): Seq[Row] = {
+      reuseHash: Boolean = true, retryStats: Boolean = false): Seq[Row] = {
     val builds = dimensionRows.zip(dims).take(ss.length).safeMap { case (rows, shape) =>
       withResource(batch(rows, shape.head.size))(LazySpillableColumnarBatch(_, "test_dim"))
     }
@@ -94,9 +94,14 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
           RmmSpark.OomInjectionType.GPU.ordinal, 0)
       }
       withResource(GpuJoinChain.buildKeys(builds, ss)) { keys =>
+        if (retryStats) {
+          RmmSpark.forceRetryOOM(RmmSpark.getCurrentThreadId, 1,
+            RmmSpark.OomInjectionType.GPU.ordinal, 0)
+        }
+        val classified = GpuJoinChain.classifyBuildKeys(keys, ss)
         val input = fact.grouped(inputBatchRows).map(batch(_, 2))
         val attrs = (0 until 2).map(i => AttributeReference(s"c$i", IntegerType)())
-        val result = withResource(new JoinChainIterator(input, attrs, builds, keys, ss,
+        val result = withResource(new JoinChainIterator(input, attrs, builds, keys, classified,
             options.copy(targetSize = targetSize, hashReuseEnabled = reuseHash)) {
           override protected def beforeProbe(stage: Int): Unit = action(stage)
         }) { iterator =>
@@ -226,6 +231,141 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
     }
   }
 
+  private val duplicateDims = Seq(
+    dims.head ++ Seq(Seq[Integer](1, 20, 101), Seq[Integer](null, 30, 301)),
+    dims(1) ++ Seq(Seq[Integer](10, 8), Seq[Integer](20, 7)),
+    dims(2) ++ Seq(Seq[Integer](7, 701), Seq[Integer](8, 801)))
+
+  for (nullsEqual <- Seq(false, true); reuse <- Seq(false, true)) {
+    test(s"non-unique maps retain all payload matches nulls=$nullsEqual reuse=$reuse") {
+      val ss = stages.map(_.copy(nullsEqual = nullsEqual))
+      val rows = (0 until 3).flatMap(_ => fact)
+      val result = run(rows, ss, dimensionRows = duplicateDims, inputBatchRows = 5,
+        reuseHash = reuse, expectedHashBuilds = Some(if (reuse) 3L else 9L))
+      assert(sorted(result) == sorted(expected(rows, ss, duplicateDims)))
+    }
+  }
+
+  test("non-unique fanout splits stream batches before probing") {
+    val rows = (0 until 10).flatMap(_ => fact)
+    var probes = 0
+    val result = run(rows, stages, dimensionRows = duplicateDims, targetSize = 320,
+      inputBatchRows = rows.size, action = stage => if (stage == 0) probes += 1)
+    assert(probes > 1)
+    assert(sorted(result) == sorted(expected(rows, stages, duplicateDims)))
+  }
+
+  test("non-unique maps and cached hashes survive host and disk spilling") {
+    var spilled = 0L
+    val result = run(fact, stages, dimensionRows = duplicateDims, action = stage => {
+      if (stage == 1) {
+        spilled += SpillFramework.stores.deviceStore.spill(Long.MaxValue)
+        SpillFramework.stores.hostStore.spill(Long.MaxValue)
+      }
+    })
+    assert(spilled > 0)
+    assert(sorted(result) == sorted(expected(fact, stages, duplicateDims)))
+  }
+
+  test("recursive fanout splitting bounds pending spillable batches") {
+    val rows = Seq.fill(128)(Seq[Integer](1, 11))
+    var probes = 0
+    val result = run(rows, stages, dimensionRows = duplicateDims, targetSize = 320,
+      inputBatchRows = rows.size, action = stage => {
+        if (stage == 0) {
+          probes += 1
+          // Depth-first splits retain only a few siblings at each level, rather than all
+          // 128 one-row inputs. Include build/key/hash handles in this generous limit.
+          assert(SpillFramework.stores.deviceStore.numHandles < 64)
+        }
+      })
+    assert(probes == rows.size)
+    assert(sorted(result) == sorted(expected(rows, stages, duplicateDims)))
+  }
+
+  for (split <- Seq(false, true)) {
+    test(s"non-unique partial probe retries small inputs without duplicate metrics split=$split") {
+      val metrics = stages.map(_ => new LocalGpuMetric)
+      val ss = stages.zip(metrics).map { case (stage, metric) => stage.copy(outputRows = metric) }
+      var injected = false
+      val result = run(fact, ss, dimensionRows = duplicateDims, action = stage => {
+        if (stage == 1 && !injected) {
+          injected = true
+          if (split) throw new GpuSplitAndRetryOOM("non-unique chain test")
+          else throw new GpuRetryOOM("non-unique chain test")
+        }
+      })
+      assert(injected)
+      assert(sorted(result) == sorted(expected(fact, ss, duplicateDims)))
+      assert(metrics.head.value == expected(fact, ss.take(1), duplicateDims.take(1)).size)
+      assert(metrics.last.value == result.size)
+    }
+  }
+
+  for (nullsEqual <- Seq(false, true)) {
+    test(s"non-unique complete key tuples preserve null equality=$nullsEqual") {
+      val ss = stages.updated(0, stages.head.copy(buildKeys = Seq(ref(0), ref(1)),
+        streamKeyOrdinals = Seq(0, 1), nullsEqual = nullsEqual))
+      val builds = duplicateDims.updated(0, duplicateDims.head ++ dims.head)
+      val rows = Seq(Seq[Integer](1, 10), Seq[Integer](null, 30), Seq[Integer](2, 20))
+      assert(sorted(run(rows, ss, dimensionRows = builds)) ==
+        sorted(expected(rows, ss, builds)))
+    }
+  }
+
+  test("non-unique inner stages compose with deduplicated semi stages") {
+    val (ss, builds) = semiScenario(Set(1), nullsEqual = true)
+    val duplicates = builds.map(rows => rows ++ rows)
+    assert(sorted(run(fact, ss, dimensionRows = duplicates)) ==
+      sorted(expected(fact, ss, duplicates)))
+    assert(run(fact, stages, dimensionRows = duplicateDims.updated(1, Seq.empty)).isEmpty)
+    assert(run(Seq(Seq[Integer](99, 1)), stages, dimensionRows = duplicateDims).isEmpty)
+  }
+
+  test("duplicate null tuples only multiply null-equal probes") {
+    val rows = Seq.fill(5)(Seq[Integer](null, 30, 300)) ++ dims.head.take(2)
+    withResource(batch(rows, 3))(original =>
+      withResource(LazySpillableColumnarBatch(original, "test_dim")) { built =>
+        withResource(GpuJoinChain.buildKeys(Seq(built), stages.take(1))) { keys =>
+          val unequal = GpuJoinChain.classifyBuildKeys(keys, stages.take(1)).head
+          val equal = GpuJoinChain.classifyBuildKeys(keys,
+            Seq(stages.head.copy(nullsEqual = true))).head
+          assert(!unequal.buildKeysUnique)
+          assert(unequal.maxBuildMatches == 1)
+          assert(!equal.buildKeysUnique)
+          assert(equal.maxBuildMatches == 5)
+        }
+      })
+  }
+
+  test("non-unique fanout classification retries with spillable build keys") {
+    assert(sorted(run(fact, stages, dimensionRows = duplicateDims, retryStats = true)) ==
+      sorted(expected(fact, stages, duplicateDims)))
+    assert(RmmSpark.getAndResetNumRetryThrow(1) > 0)
+  }
+
+  test("composite fanout excludes any null component for null-unequal joins") {
+    val rows = Seq.fill(5)(Seq[Integer](1, null, 100)) ++
+      Seq.fill(3)(Seq[Integer](null, 20, 200))
+    val ss = Seq(stages.head.copy(buildKeys = Seq(ref(0), ref(1)),
+      streamKeyOrdinals = Seq(0, 1)))
+    withResource(batch(rows, 3))(original =>
+      withResource(LazySpillableColumnarBatch(original, "test_dim")) { built =>
+        withResource(GpuJoinChain.buildKeys(Seq(built), ss)) { keys =>
+          assert(GpuJoinChain.classifyBuildKeys(keys, ss).head.maxBuildMatches == 1)
+          val equal = GpuJoinChain.classifyBuildKeys(keys,
+            Seq(ss.head.copy(nullsEqual = true))).head
+          assert(equal.maxBuildMatches == 5)
+        }
+      })
+  }
+
+  test("fanout bounds saturate without overflowing or accepting excessive expansion") {
+    val huge = stages.map(_.copy(buildKeysUnique = false, maxBuildMatches = Int.MaxValue))
+    assert(GpuJoinChain.mapWorkPerRow(huge) == Long.MaxValue)
+    assert(GpuJoinChain.maxMapRows(Long.MaxValue) == Int.MaxValue.toLong)
+  }
+
   test("each join stage builds one hash state across stream batches") {
     val rows = (0 until 20).flatMap(_ => fact)
     assert(sorted(run(rows, stages, inputBatchRows = 5,
@@ -299,25 +439,30 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
     assert(RmmSpark.getAndResetNumRetryThrow(1) > 0)
   }
 
-  test("early close releases buffered input, payloads and composed maps") {
-    val builds = dims.safeMap { rows =>
-      withResource(batch(rows, rows.head.size))(LazySpillableColumnarBatch(_, "test_dim"))
-    }
-    withResource(builds) { _ =>
-      withResource(GpuJoinChain.buildKeys(builds, stages)) { keys =>
-        withResource(new CloseableBufferedIterator(Iterator(batch(fact, 2)))) { input =>
-          input.head
-          val attrs = (0 until 2).map(i => AttributeReference(s"c$i", IntegerType)())
-          withResource(new JoinChainIterator(input, attrs, builds, keys, stages,
-              options)) { iterator =>
-            assert(iterator.hasNext)
+  for (duplicates <- Seq(false, true)) {
+    test(s"early close releases input, payloads and maps duplicates=$duplicates") {
+      val dimensions = if (duplicates) duplicateDims else dims
+      val builds = dimensions.safeMap { rows =>
+        withResource(batch(rows, rows.head.size))(LazySpillableColumnarBatch(_, "test_dim"))
+      }
+      withResource(builds) { _ =>
+        withResource(GpuJoinChain.buildKeys(builds, stages)) { keys =>
+          withResource(new CloseableBufferedIterator(Iterator(batch(fact, 2)))) { input =>
+            input.head
+            val attrs = (0 until 2).map(i => AttributeReference(s"c$i", IntegerType)())
+            withResource(new JoinChainIterator(input, attrs, builds, keys,
+                GpuJoinChain.classifyBuildKeys(keys, stages),
+                options.copy(targetSize = if (duplicates) 320 else options.targetSize))) {
+              iterator =>
+              assert(iterator.hasNext)
+            }
+            assert(!input.hasNext)
           }
-          assert(!input.hasNext)
         }
       }
+      assert(SpillFramework.stores.deviceStore.numHandles == 0)
+      assert(SpillFramework.stores.hostStore.numHandles == 0)
     }
-    assert(SpillFramework.stores.deviceStore.numHandles == 0)
-    assert(SpillFramework.stores.hostStore.numHandles == 0)
   }
 
   for (split <- Seq(false, true)) {

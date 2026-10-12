@@ -97,14 +97,14 @@ class NarrowBroadcastJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       }
     }
 
-    test(s"narrow broadcast duplicate keys retain eager fallback length=$length") {
+    test(s"narrow broadcast duplicate keys actually fuse length=$length") {
       withGpuSparkSession(spark => {
         val df = star(spark, length, duplicates = true)
         df.collect()
         val plan = df.queryExecution.executedPlan
         assert(joins(plan).exists(GpuJoinChain.chainLength(_) == length), plan.toString)
-        assert(metric(plan, GpuMetric.JOIN_CHAIN_FUSED_TASKS) == 0)
-        assert(metric(plan, GpuMetric.JOIN_CHAIN_FALLBACK_NON_UNIQUE) > 0)
+        assert(metric(plan, GpuMetric.JOIN_CHAIN_FUSED_TASKS) > 0)
+        assert(metric(plan, GpuMetric.JOIN_CHAIN_FALLBACK_NON_UNIQUE) == 0)
       }, config(aqe = false))
     }
   }

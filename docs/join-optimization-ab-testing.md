@@ -48,3 +48,18 @@ On 2026-10-11, 174 GPU tests passed: 79 iterator/resource tests and 95 CPU/GPU c
 and configuration tests. Logs and source/artifact fingerprints are retained under
 `.cache/join-ab-switches/2026-10-11/`. No JNI source change is needed for these switches;
 the build reuses the previously installed JNI artifact.
+
+Join chains also support non-unique inner build keys under `chain.enabled`. Each stage
+retains the distinct hash fast path for unique keys and uses a regular hash join for
+non-unique keys, preserving every matching build payload. Semi stages still deduplicate
+build keys. Payloads stay in their original sources until the final gather.
+
+Duplicate builds require an additional group-by count to obtain the maximum multiplicity
+of a complete key tuple. Null tuples count only when probe null equality allows matches.
+The product of these maxima bounds intermediate index-map growth and drives input splitting;
+it is conservative because it does not account for selectivity or correlations between stages.
+Nested splits are processed before their pending siblings to bound buffered batch metadata.
+A task falls back before probing if even one input row would exceed the map budget, or a
+build is oversized. `joinChainFallbackNonUnique` now counts excessive non-unique fanout,
+rather than every duplicate build. Keep `chain.enabled` fixed when testing hash reuse,
+and compare chain on/off for this extension. Performance still needs workload measurement.
