@@ -57,18 +57,24 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
     JoinChainStage(Seq(ref(0)), Seq(0), Seq(1, 3, 4, 2), GpuBuildRight, false))
 
   // Independent row oracle, including reordered projections and a later key from a dimension.
-  private def expected(fact: Seq[Row], ss: Seq[JoinChainStage]): Seq[Row] = {
-    ss.zip(dims).foldLeft(fact) { case (rows, (stage, dim)) =>
+  private def expected(fact: Seq[Row], ss: Seq[JoinChainStage],
+      dimensionRows: Seq[Seq[Row]] = dims): Seq[Row] = {
+    ss.zip(dimensionRows).foldLeft(fact) { case (rows, (stage, dim)) =>
       rows.flatMap { original =>
         val row = stage.streamProjection.map(original)
-        dim.filter { build =>
+        val matches = dim.filter { build =>
           stage.streamKeyOrdinals.zip(stage.buildKeys).forall { case (s, b) =>
             val l = row(s)
             val r = build(b.asInstanceOf[GpuBoundReference].ordinal)
             if (l == null || r == null) stage.nullsEqual && l == r else l == r
           }
-        }.map { build =>
-          if (stage.buildSide == GpuBuildRight) row ++ build else build ++ row
+        }
+        if (stage.isLeftSemi) {
+          if (matches.nonEmpty) Seq(row) else Seq.empty
+        } else {
+          matches.map { build =>
+            if (stage.buildSide == GpuBuildRight) row ++ build else build ++ row
+          }
         }
       }
     }
@@ -79,7 +85,7 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
       inputBatchRows: Int = 120, dimensionRows: Seq[Seq[Row]] = dims,
       retryKeys: Boolean = false, expectedHashBuilds: Option[Long] = None,
       reuseHash: Boolean = true): Seq[Row] = {
-    val builds = dimensionRows.zip(dims).safeMap { case (rows, shape) =>
+    val builds = dimensionRows.zip(dims).take(ss.length).safeMap { case (rows, shape) =>
       withResource(batch(rows, shape.head.size))(LazySpillableColumnarBatch(_, "test_dim"))
     }
     withResource(builds) { _ =>
@@ -117,6 +123,108 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
   private def sorted(rows: Seq[Row]): Seq[String] = rows.map(_.mkString(",")).sorted
   private val fact = Seq(Seq[Integer](1, 11), Seq[Integer](2, 22),
     Seq[Integer](3, 33), Seq[Integer](null, 44), Seq[Integer](1, 55))
+
+  private def semiScenario(indices: Set[Int], nullsEqual: Boolean):
+      (Seq[JoinChainStage], Seq[Seq[Row]]) = {
+    val dimensions = Seq(dims.head,
+      Seq(Seq[Integer](1, 7), Seq[Integer](2, 8), Seq[Integer](null, 9)),
+      Seq(Seq[Integer](1, 700), Seq[Integer](2, 800), Seq[Integer](null, 900)))
+    var width = 2
+    val ss = dimensions.indices.map { i =>
+      val semi = indices.contains(i)
+      val stage = JoinChainStage(Seq(ref(0)), Seq(0), 0 until width, GpuBuildRight,
+        nullsEqual, isLeftSemi = semi)
+      if (!semi) width += dimensions(i).head.size
+      stage
+    }
+    val builds = dimensions.zipWithIndex.map { case (rows, i) =>
+      if (indices.contains(i)) rows ++ rows else rows
+    }
+    (ss, builds)
+  }
+
+  for (semi <- Seq(Set(0), Set(1), Set(2), Set(0, 1), Set(0, 2), Set(1, 2), Set(0, 1, 2));
+      nullsEqual <- Seq(false, true)) {
+    test(s"semi stages $semi preserve stream duplicates and null equality=$nullsEqual") {
+      val (ss, builds) = semiScenario(semi, nullsEqual)
+      val rows = (0 until 20).flatMap(_ => fact)
+      val result = run(rows, ss, targetSize = 64, inputBatchRows = 5,
+        dimensionRows = builds, expectedHashBuilds = Some(ss.length.toLong))
+      assert(sorted(result) == sorted(expected(rows, ss, builds)))
+    }
+  }
+
+  test("semi stages preserve build-left layout and reordered projections") {
+    val (_, builds) = semiScenario(Set(0, 2), nullsEqual = false)
+    val ss = Seq(
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(0, 1), GpuBuildRight, false,
+        isLeftSemi = true),
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(0, 1), GpuBuildLeft, false),
+      JoinChainStage(Seq(ref(0)), Seq(1), Seq(3, 2, 1, 0), GpuBuildRight, false,
+        isLeftSemi = true))
+    assert(sorted(run(fact, ss, dimensionRows = builds)) ==
+      sorted(expected(fact, ss, builds)))
+  }
+
+  for (nullsEqual <- Seq(false, true)) {
+    test(s"semi multi-column keys deduplicate complete tuples null equality=$nullsEqual") {
+      val rows = Seq(Seq[Integer](1, 10), Seq[Integer](1, 10), Seq[Integer](2, 20),
+        Seq[Integer](1, null), Seq[Integer](null, 30), Seq[Integer](null, null))
+      val unique = dims.head ++ Seq(Seq[Integer](1, null, 500),
+        Seq[Integer](null, null, 600))
+      val builds = Seq(unique ++ unique)
+      val ss = Seq(JoinChainStage(Seq(ref(0), ref(1)), Seq(0, 1), Seq(0, 1),
+        GpuBuildRight, nullsEqual, isLeftSemi = true))
+      assert(sorted(run(rows, ss, dimensionRows = builds)) ==
+        sorted(expected(rows, ss, builds)))
+      assert(run(rows, ss, dimensionRows = Seq(Seq.empty)).isEmpty)
+      assert(run(Seq.empty, ss, dimensionRows = builds).isEmpty)
+    }
+  }
+
+  test("semi build key deduplication retries and hashes are reusable") {
+    val (ss, builds) = semiScenario(Set(0, 1, 2), nullsEqual = true)
+    val result = run(fact, ss, dimensionRows = builds, retryKeys = true,
+      expectedHashBuilds = Some(ss.length.toLong))
+    assert(sorted(result) == sorted(expected(fact, ss, builds)))
+    assert(RmmSpark.getAndResetNumRetryThrow(1) > 0)
+  }
+
+  test("semi placeholders survive composed-map spilling") {
+    val (ss, builds) = semiScenario(Set(0, 2), nullsEqual = false)
+    var spilled = 0L
+    val result = run(fact, ss, action = stage => {
+      if (stage == 1) {
+        spilled += SpillFramework.stores.deviceStore.spill(Long.MaxValue)
+        SpillFramework.stores.hostStore.spill(Long.MaxValue)
+      }
+    }, dimensionRows = builds)
+    assert(spilled > 0)
+    assert(sorted(result) == sorted(expected(fact, ss, builds)))
+  }
+
+  for (split <- Seq(false, true)) {
+    test(s"semi partial probe OOM restores maps and counters split=$split") {
+      val (rawStages, builds) = semiScenario(Set(0, 2), nullsEqual = false)
+      val metrics = rawStages.map(_ => new LocalGpuMetric)
+      val ss = rawStages.zip(metrics).map { case (stage, metric) =>
+        stage.copy(outputRows = metric)
+      }
+      val rows = (0 until 48).flatMap(_ => fact)
+      var injected = false
+      val result = run(rows, ss, action = stage => {
+        if (stage == 1 && !injected) {
+          injected = true
+          if (split) throw new GpuSplitAndRetryOOM("semi chain test")
+          else throw new GpuRetryOOM("semi chain test")
+        }
+      }, inputBatchRows = 240, dimensionRows = builds)
+      assert(injected)
+      assert(sorted(result) == sorted(expected(rows, ss, builds)))
+      assert(metrics.head.value == expected(rows, ss.take(1), builds.take(1)).size)
+      assert(metrics.last.value == result.size)
+    }
+  }
 
   test("each join stage builds one hash state across stream batches") {
     val rows = (0 until 20).flatMap(_ => fact)
@@ -275,7 +383,7 @@ class BroadcastJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       .set("spark.sql.autoBroadcastJoinThreshold", "-1")
       .set(RapidsConf.GPU_BATCH_SIZE_BYTES.key, "1024"), sort = true)(identity)
 
-  test("reference projections participate; computed projections and narrow chains use eager") {
+  test("reference projections and narrow chains participate; computed projections use eager") {
     val conf = new SparkConf().set("spark.sql.adaptive.enabled", "false")
       .set("spark.sql.autoBroadcastJoinThreshold", "-1")
     withGpuSparkSession(spark => {
@@ -301,7 +409,7 @@ class BroadcastJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       val narrowJoin = PlanUtils.findOperators(narrow.queryExecution.executedPlan,
         _.isInstanceOf[GpuBroadcastHashJoinExecBase]).head
         .asInstanceOf[GpuBroadcastHashJoinExecBase]
-      assert(GpuJoinChain.chainLength(narrowJoin) == 1)
+      assert(GpuJoinChain.chainLength(narrowJoin) == 2)
     }, conf)
   }
 }
