@@ -31,8 +31,11 @@ class NarrowBroadcastJoinChainQuerySuite extends SparkQueryCompareTestSuite {
 
   // Only INT keys survive each reference projection. These two/three-stage star joins were
   // rejected by the schema-width model even though the dimension probes reduce the fact rows.
-  private def star(spark: SparkSession, length: Int, duplicates: Boolean): DataFrame = {
-    val fact = spark.range(0, 240).selectExpr(
+  private def star(spark: SparkSession, length: Int, duplicates: Boolean,
+      inputPartitions: Int = 0): DataFrame = {
+    val source = if (inputPartitions > 0) spark.range(0, 240, 1, inputPartitions)
+      else spark.range(0, 240)
+    val fact = source.selectExpr(
       (0 until length).map(i => s"CAST(id % ${60 - 20 * i} AS INT) AS k$i"): _*)
     (0 until length).foldLeft(fact) { (stream, i) =>
       val key = s"d$i"
@@ -106,6 +109,22 @@ class NarrowBroadcastJoinChainQuerySuite extends SparkQueryCompareTestSuite {
         assert(metric(plan, GpuMetric.JOIN_CHAIN_FUSED_TASKS) > 0)
         assert(metric(plan, GpuMetric.JOIN_CHAIN_FALLBACK_NON_UNIQUE) == 0)
       }, config(aqe = false))
+    }
+  }
+
+  test("broadcast classification metadata follows the build-key cache switch") {
+    val cpu = withCpuSparkSession(spark =>
+      star(spark, 2, duplicates = false, inputPartitions = 12).collect(), config(aqe = false))
+    for (enabled <- Seq(false, true)) {
+      withGpuSparkSession(spark => {
+        val df = star(spark, 2, duplicates = false, inputPartitions = 12)
+        compareResults(true, 0.0, cpu, df.collect())
+        val plan = df.queryExecution.executedPlan
+        assert(metric(plan, GpuMetric.JOIN_CHAIN_FUSED_TASKS) > 0, plan.toString)
+        assert(metric(plan, GpuMetric.JOIN_CHAIN_BUILD_KEY_STATS) > 0, plan.toString)
+        val hits = metric(plan, GpuMetric.JOIN_CHAIN_BUILD_KEY_STATS_CACHE_HITS)
+        assert((hits > 0) == enabled, plan.toString)
+      }, config(aqe = false).set(RapidsConf.JOIN_BUILD_KEY_CACHE_ENABLED.key, enabled.toString))
     }
   }
 

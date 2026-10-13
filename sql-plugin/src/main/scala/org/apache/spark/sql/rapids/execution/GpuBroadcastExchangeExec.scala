@@ -83,6 +83,10 @@ class SerializeConcatHostBuffersDeserializeBatch(
   // executor-local cache for build-side hash join state
   @transient private var hashBuildCacheInternal: HashBuildCache = null
 
+  // This object's lifetime identifies an immutable broadcast on this executor. Only
+  // scalar key statistics are cached; no task-owned GPU resources or metrics are retained.
+  @transient private[execution] lazy val joinChainBuildKeyStats = new JoinChainBuildKeyStatsCache
+
   private def maybeGpuBatch: Option[SpillableColumnarBatch] = Option(batchInternal)
 
   private def hashBuildCache: HashBuildCache = this.synchronized {
@@ -292,6 +296,7 @@ class SerializeConcatHostBuffersDeserializeBatch(
    * Public for tests.
    */
   def closeInternal(): Unit = this.synchronized {
+    joinChainBuildKeyStats.clear()
     Seq(hashBuildCacheInternal, data, batchInternal).safeClose()
     data = null
     batchInternal = null

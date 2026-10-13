@@ -419,6 +419,32 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
     assert(SpillFramework.stores.deviceStore.numHandles == 0)
   }
 
+  test("broadcast key stats reuse preserves current stage metrics") {
+    val cache = new JoinChainBuildKeyStatsCache
+    val classifications = new LocalGpuMetric
+    val hits = new LocalGpuMetric
+    withResource(batch(dims.head, dims.head.head.size)) { payload =>
+      withResource(LazySpillableColumnarBatch(payload, "test_stats_build")) { built =>
+        withResource(GpuJoinChain.buildKeys(Seq(built), stages.take(1))) { keys =>
+          val first = GpuJoinChain.classifyBuildKey(keys.head, stages.head, Some(cache),
+            classifications, hits)
+          val currentRows = new LocalGpuMetric
+          val current = stages.head.copy(outputRows = currentRows, streamProjection = Seq(1, 0))
+          val second = GpuJoinChain.classifyBuildKey(keys.head, current, Some(cache),
+            classifications, hits)
+          assert(second.buildKeysUnique == first.buildKeysUnique)
+          assert(second.maxBuildMatches == first.maxBuildMatches)
+          assert(second.outputRows eq currentRows)
+          assert(second.streamProjection == current.streamProjection)
+          assert(classifications.value == 1)
+          assert(hits.value == 1)
+        }
+      }
+    }
+    assert(SpillFramework.stores.deviceStore.numHandles == 0)
+    assert(SpillFramework.stores.hostStore.numHandles == 0)
+  }
+
   test("cached build keys own separate device buffers") {
     withResource(batch(dims.head, 3)) { original =>
       withResource(LazySpillableColumnarBatch(original, "test_dim")) { built =>
