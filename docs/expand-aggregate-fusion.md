@@ -32,6 +32,10 @@ at most one branch is cached, and a smaller compatible result can replace it. In
 arguments (including branch-specific NULLs), incompatible key layouts, and uncompressed
 results continue to aggregate the original input. COUNT merges sum existing counts; they never
 count partial rows. Integral SUM, MIN, and MAX use their existing merge implementations.
+Branches containing decimal SUM or AVG always aggregate the original rows. A finer
+group's decimal buffer can overflow even when a coarser group's original rows cancel
+without overflow; reusing that buffer would propagate an incorrect NULL. AVG also avoids
+the changed floating-point reduction order introduced by regrouping partial buffers.
 
 When a partition has exactly one nonempty input batch and every branch emits one unsplit
 result, the unique branch discriminators prove that the restored keys are disjoint.
@@ -55,9 +59,11 @@ materialization and subsequent coalescing; aggregation still reads required inpu
   key; ambiguous or pruned discriminators retain the original plan.
 - Grouping keys support boolean, integer, date, timestamp, and string. Floating-point,
   decimal, binary, and nested grouping keys remain on the existing path.
-- Aggregates support non-distinct COUNT with one supported scalar argument, integer SUM,
-  and integer MIN/MAX. Arguments must be direct references or literals. Aggregate FILTER,
-  computed arguments, AVG, collections, and throwing ANSI COUNT/SUM are excluded.
+- Aggregates support non-distinct COUNT with one supported scalar argument, integer and
+  decimal SUM, numeric AVG, and integer MIN/MAX. Deterministic computed arguments are
+  supported, including decimal `UnscaledValue` inputs produced by Spark's SUM optimization.
+  Aggregate FILTER, collections, nondeterministic arguments, and throwing ANSI
+  COUNT/SUM/AVG are excluded.
 - Only pure Partial mode without required child distribution is eligible. Single-pass
   sort strategies (`allowSinglePassAgg` or `forceSinglePassAgg`) retain the original
   operator. The full hash merge output-skipping configuration remains effective.
