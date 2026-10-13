@@ -32,10 +32,11 @@ at most one branch is cached, and a smaller compatible result can replace it. In
 arguments (including branch-specific NULLs), incompatible key layouts, and uncompressed
 results continue to aggregate the original input. COUNT merges sum existing counts; they never
 count partial rows. Integral SUM, MIN, and MAX use their existing merge implementations.
-Branches containing decimal SUM or AVG always aggregate the original rows. A finer
-group's decimal buffer can overflow even when a coarser group's original rows cancel
-without overflow; reusing that buffer would propagate an incorrect NULL. AVG also avoids
-the changed floating-point reduction order introduced by regrouping partial buffers.
+Branches containing decimal SUM always aggregate the original rows. A finer group's
+decimal buffer can overflow even when a coarser group's original rows cancel without
+overflow; reusing that buffer would propagate an incorrect NULL. AVG remains unfused:
+without safe partial-buffer reuse, separate branch aggregation can increase calls and
+repeat preprocessing compared with the existing Expand/coalesce/aggregate path.
 
 When a partition has exactly one nonempty input batch and every branch emits one unsplit
 result, the unique branch discriminators prove that the restored keys are disjoint.
@@ -60,10 +61,10 @@ materialization and subsequent coalescing; aggregation still reads required inpu
 - Grouping keys support boolean, integer, date, timestamp, and string. Floating-point,
   decimal, binary, and nested grouping keys remain on the existing path.
 - Aggregates support non-distinct COUNT with one supported scalar argument, integer and
-  decimal SUM, numeric AVG, and integer MIN/MAX. Deterministic computed arguments are
+  decimal SUM, and integer MIN/MAX. Deterministic computed arguments are
   supported, including decimal `UnscaledValue` inputs produced by Spark's SUM optimization.
-  Aggregate FILTER, collections, nondeterministic arguments, and throwing ANSI
-  COUNT/SUM/AVG are excluded.
+  AVG (including decimal AVG and aggregates mixing SUM with AVG), aggregate FILTER,
+  collections, nondeterministic arguments, and throwing ANSI COUNT/SUM are excluded.
 - Only pure Partial mode without required child distribution is eligible. Single-pass
   sort strategies (`allowSinglePassAgg` or `forceSinglePassAgg`) retain the original
   operator. The full hash merge output-skipping configuration remains effective.
@@ -95,7 +96,8 @@ bytes; use RMM logs and CUDA profiling for allocation/kernel evidence.
 `ExpandAggregateFusionSuite` checks CPU/off/on equality and actual fusion plans for
 nullable grouping keys and measures, duplicate sets, branch-specific NULL aggregate
 arguments, integer widening/overflow, boolean/date/timestamp/string keys, empty input,
-AQE, both fusion-switch combinations, and fallback eligibility.
+AQE, both fusion-switch combinations, and fallback eligibility, including numeric and
+decimal AVG and mixed SUM/AVG queries.
 `ExpandAggregateRetrySuite` covers native retry/split OOM before and after branch progress,
 late postprocess/reduction failures on original and reused inputs, all-null reductions,
 compression guards, safe merge bypass, multiple inputs, spill restoration, early close,

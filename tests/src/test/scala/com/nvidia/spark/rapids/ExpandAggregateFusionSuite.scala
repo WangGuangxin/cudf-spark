@@ -199,8 +199,8 @@ class ExpandAggregateFusionSuite extends SparkQueryCompareTestSuite {
       "sum(CAST(v AS DECIMAL(38,2)))",
       "sum(coalesce(CAST(v AS DECIMAL(38,2)) * CAST(v AS DECIMAL(12,0)), 0))",
       "avg(v)", "avg(CAST(v AS DECIMAL(6,2)))",
-      "avg(CAST(v AS DECIMAL(38,2)))", "sum(v + 1)")) {
-    test(s"CPU/off/on preserve decimal and computed aggregate buffers: $aggregate") {
+      "avg(CAST(v AS DECIMAL(38,2)))", "sum(v),avg(v)", "sum(v + 1)")) {
+    test(s"CPU/off/on preserve numeric aggregates and AVG fallback: $aggregate") {
       def query(spark: SparkSession): DataFrame = {
         data(spark).createOrReplaceTempView("fusion_numeric")
         spark.sql(s"SELECT a,b,grouping_id(),$aggregate FROM fusion_numeric " +
@@ -212,7 +212,8 @@ class ExpandAggregateFusionSuite extends SparkQueryCompareTestSuite {
           val df = query(spark)
           compareResults(true, 1e-9, cpu, df.collect())
           assert(PlanUtils.findOperators(df.queryExecution.executedPlan,
-            _.isInstanceOf[GpuExpandAggregateExec]).nonEmpty == enabled,
+            _.isInstanceOf[GpuExpandAggregateExec]).nonEmpty ==
+              (enabled && !aggregate.contains("avg(")),
             df.queryExecution.executedPlan.toString)
         }, configuration(enabled))
       }
@@ -229,13 +230,12 @@ class ExpandAggregateFusionSuite extends SparkQueryCompareTestSuite {
         Row(2, largest.negate()), Row(3, null))
       spark.createDataFrame(spark.sparkContext.parallelize(rows, 1), schema)
         .createOrReplaceTempView("fusion_decimal_overflow")
-      spark.sql("SELECT a,grouping_id(),sum(d),avg(d) FROM fusion_decimal_overflow " +
+      spark.sql("SELECT a,grouping_id(),sum(d) FROM fusion_decimal_overflow " +
         "GROUP BY ROLLUP(a)")
     }
     val cpu = withCpuSparkSession(s => query(s).collect(), configuration(false))
     val total = cpu.find(_.getLong(1) == 1L).get
     assert(total.getDecimal(2).signum() == 0)
-    assert(total.getDecimal(3).signum() == 0)
     for (enabled <- Seq(false, true)) {
       withGpuSparkSession({ spark =>
         val df = query(spark)
@@ -253,12 +253,12 @@ class ExpandAggregateFusionSuite extends SparkQueryCompareTestSuite {
     }
   }
 
-  test("decimal sum and average preserve all-null and empty grouping sets") {
+  test("decimal sum preserves all-null and empty grouping sets") {
     for (empty <- Seq(false, true)) {
       def query(spark: SparkSession): DataFrame = {
         data(spark, empty).selectExpr("a", "CAST(NULL AS DECIMAL(38,2)) AS d")
           .createOrReplaceTempView("fusion_decimal_nulls")
-        spark.sql("SELECT a,grouping_id(),sum(d),avg(d) FROM fusion_decimal_nulls " +
+        spark.sql("SELECT a,grouping_id(),sum(d) FROM fusion_decimal_nulls " +
           "GROUP BY ROLLUP(a)")
       }
       val cpu = withCpuSparkSession(s => query(s).collect(), configuration(false))
