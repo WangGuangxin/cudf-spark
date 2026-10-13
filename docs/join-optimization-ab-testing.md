@@ -16,9 +16,22 @@ rebuilding hash state, or reproject keys while reusing a hash state for the stab
 When hash reuse is disabled, ordinary hash joins also omit the key-buffer copies used to
 detach retained hash state from contiguous payload allocations.
 
-Fused chains keep their projected dimension keys as part of chain execution. To measure the
-ordinary build-key cache, disable `chain.enabled` in both variants, then toggle only
-`buildKeyCache.enabled`. Hash reuse can be measured with chains either enabled or disabled;
+Fused chains keep their projected dimension keys as part of chain execution. With
+`buildKeyCache.enabled`, broadcast chains also reuse immutable build-key uniqueness/fanout
+statistics between tasks on the same executor. The bounded CPU-only cache is attached to
+the broadcast value, keyed by original key-column positions and null equality. Broadcast
+post-projections bypass it; shuffled and semi builds retain their existing classification.
+GPU key batches, hash handles, stream projections, and task metrics are not shared.
+Classification executes outside the cache monitor, and failed attempts do not publish results.
+Concurrent misses can compute more than once. Empty stream partitions in broadcast-only
+inner/left-semi chains return before loading builds or classifying keys. Sized/shuffled chains
+preserve the existing build/stream read order.
+
+At DEBUG metric level, `joinChainBuildKeyStats` counts successful classifications and
+`joinChainBuildKeyStatsCacheHits` counts metadata hits. Use these with actual fused-task counts
+to verify whether broadcast preparation work decreased. Projected-key copies remain local.
+To measure the ordinary build-key cache, disable `chain.enabled` in both variants, then toggle
+only `buildKeyCache.enabled`. Hash reuse can be measured with chains either enabled or disabled;
 keep the chain setting fixed between those variants. Bitmap tracking affects hash outer joins
 that track matches on the buffered build side; inner joins do not allocate such a tracker.
 The switches preserve current correctness fixes and spill/retry handling. They do not force

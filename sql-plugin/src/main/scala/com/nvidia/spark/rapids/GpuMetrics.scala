@@ -140,6 +140,8 @@ object GpuMetric extends Logging {
   val SMALL_JOIN_COUNT = "sizedSmallJoin"
   val BIG_JOIN_COUNT = "sizedBigJoin"
   val JOIN_CHAIN_FUSED_TASKS = "joinChainFusedTasks"
+  val JOIN_CHAIN_BUILD_KEY_STATS = "joinChainBuildKeyStats"
+  val JOIN_CHAIN_BUILD_KEY_STATS_CACHE_HITS = "joinChainBuildKeyStatsCacheHits"
   val JOIN_CHAIN_FALLBACK_OVERSIZED = "joinChainFallbackOversized"
   val JOIN_CHAIN_FALLBACK_NON_UNIQUE = "joinChainFallbackNonUnique"
   val SYNC_READ_TIME = "shuffleSyncReadTime"
@@ -201,6 +203,8 @@ object GpuMetric extends Logging {
   val DESCRIPTION_SMALL_JOIN_COUNT = "small joins"
   val DESCRIPTION_BIG_JOIN_COUNT = "big joins"
   val DESCRIPTION_JOIN_CHAIN_FUSED_TASKS = "join chain fused tasks"
+  val DESCRIPTION_JOIN_CHAIN_BUILD_KEY_STATS = "join chain build key classifications"
+  val DESCRIPTION_JOIN_CHAIN_BUILD_KEY_STATS_CACHE_HITS = "join chain build key stats cache hits"
   val DESCRIPTION_JOIN_CHAIN_FALLBACK_OVERSIZED = "join chain fallbacks (oversized build)"
   val DESCRIPTION_JOIN_CHAIN_FALLBACK_NON_UNIQUE =
     "join chain fallbacks (non-unique build exceeds map budget)"

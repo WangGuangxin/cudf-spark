@@ -57,6 +57,33 @@ private[execution] object ChainBreak {
   val notWorthwhile: ChainBreak = ChainBreak("NOT_WORTHWHILE")
 }
 
+/** Only immutable CPU metadata is shared between tasks using the same broadcast. */
+private[execution] case class JoinChainBuildKeyStats(unique: Boolean, maxMatches: Long)
+
+private[execution] class JoinChainBuildKeyStatsCache(maxEntries: Int = 64) {
+  require(maxEntries > 0)
+  private var entries = Map.empty[(Vector[Int], Boolean), JoinChainBuildKeyStats]
+
+  def clear(): Unit = synchronized { entries = Map.empty }
+
+  def getOrCompute(ordinals: Seq[Int], nullsEqual: Boolean)
+      (compute: => JoinChainBuildKeyStats): JoinChainBuildKeyStats = {
+    val key = (ordinals.toVector, nullsEqual)
+    val found = synchronized { entries.get(key) }
+    found.getOrElse {
+      // Never hold the cache monitor during GPU work or a retry. Concurrent misses may
+      // compute twice, but neither wait for another task while holding its GPU semaphore.
+      val result = compute
+      synchronized {
+        entries.get(key).getOrElse {
+          if (entries.size < maxEntries) entries += key -> result
+          result
+        }
+      }
+    }
+  }
+}
+
 /** A stage consumes the preceding logical output, but its payload stays in the original sources. */
 private[execution] case class JoinChainStage(
     buildKeys: Seq[GpuExpression],
@@ -97,7 +124,8 @@ object GpuJoinChain extends Logging {
   private case class Chain(input: SparkPlan, links: Seq[Link], break: ChainBreak)
   private case class Inputs(stream: Batches, builds: Seq[Batches])
   private case class Prepared(stage: JoinChainStage,
-      load: (Batches, Batches) => (Built, Batches), eager: (Built, Batches) => Batches)
+      load: (Batches, Batches) => (Built, Batches), eager: (Built, Batches) => Batches,
+      statsCache: () => Option[JoinChainBuildKeyStatsCache])
 
   /** The result of analyzing one plan node as a potential chain anchor. */
   private sealed trait Outcome
@@ -279,7 +307,8 @@ object GpuJoinChain extends Logging {
       n.streamKeys.map(_.asInstanceOf[GpuBoundReference].ordinal), link.projection,
       n.side, GpuHashJoin.compareNullsEqual(plan.joinType, n.buildKeys), rows, batches, joinTime,
       isLeftSemi = plan.joinType == LeftSemi)
-    val (load, eager): ((Batches, Batches) => (Built, Batches), (Built, Batches) => Batches) =
+    val (load, eager, statsCache): ((Batches, Batches) => (Built, Batches),
+        (Built, Batches) => Batches, () => Option[JoinChainBuildKeyStatsCache]) =
       plan match {
         case join: GpuBroadcastHashJoinExecBase =>
           val broadcast = join.broadcastExchange.executeColumnarBroadcast[Any]()
@@ -295,13 +324,24 @@ object GpuJoinChain extends Logging {
               join.doJoin(batch, stream, options, rows, batches, opTime, joinTime)
             case Right(_) => throw new IllegalStateException("broadcast build must be one batch")
           }
-          (loader, fallback)
+          val stats = () => {
+            // Post-broadcast projections can change values and key positions. Cache only
+            // keys bound directly to this immutable broadcast's original columns.
+            if (options.buildKeyCacheEnabled && projection.isEmpty) {
+              broadcast.value match {
+                case batch: SerializeConcatHostBuffersDeserializeBatch =>
+                  Some(batch.joinChainBuildKeyStats)
+                case _ => None
+              }
+            } else None
+          }
+          (loader, fallback, stats)
         case join: GpuShuffledHashJoinExec =>
-          (join.joinChainBuildLoader(n.side), join.joinChainEager(n.side))
+          (join.joinChainBuildLoader(n.side), join.joinChainEager(n.side), () => None)
         case join: GpuShuffledSymmetricHashJoinExec =>
-          (join.joinChainBuildLoader(n.side), join.joinChainEager(n.side))
+          (join.joinChainBuildLoader(n.side), join.joinChainEager(n.side), () => None)
       }
-    Prepared(stage, load, eager)
+    Prepared(stage, load, eager, statsCache)
   }
 
   /**
@@ -329,8 +369,21 @@ object GpuJoinChain extends Logging {
     }
   }
 
+  /** Keep the first live batch buffered; empty inner/semi streams need no build work. */
+  private[execution] def bufferNonemptyStream(input: Iterator[ColumnarBatch]):
+      CloseableBufferedIterator[ColumnarBatch] = {
+    val buffered = new CloseableBufferedIterator(input)
+    closeOnExcept(buffered) { stream =>
+      while (stream.hasNext && stream.head.numRows() == 0) {
+        withResource(stream.next())(_ => ())
+      }
+      stream
+    }
+  }
+
   private def buildRdd(plan: SparkPlan, chain: Chain): RDD[ColumnarBatch] = {
     val prepared = chain.links.map(prepare)
+    val broadcastOnly = chain.links.forall(_.node.broadcast)
     val root = chain.links.last.node
     val attrs = chain.input.output
     val options = RapidsConf.getJoinOptions(plan.conf, root.target)
@@ -341,6 +394,8 @@ object GpuJoinChain extends Logging {
     val fusedTasks = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_FUSED_TASKS)
     val oversizedFallbacks = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_FALLBACK_OVERSIZED)
     val nonUniqueFallbacks = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_FALLBACK_NON_UNIQUE)
+    val classifications = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_BUILD_KEY_STATS)
+    val statsCacheHits = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_BUILD_KEY_STATS_CACHE_HITS)
     val streamNvtx = if (root.broadcast) NvtxRegistry.BROADCAST_JOIN_STREAM
       else NvtxRegistry.SHUFFLED_JOIN_STREAM
     var inputs = chain.input.executeColumnar().mapPartitions { stream =>
@@ -361,63 +416,74 @@ object GpuJoinChain extends Logging {
     }
     inputs.mapPartitions { bundles =>
       val bundle = bundles.next()
-      var stream: Batches = new CollectTimeIterator(streamNvtx, bundle.stream, streamTime)
-      val owners = scala.collection.mutable.ArrayBuffer[LazySpillableColumnarBatch]()
-      val built = scala.collection.mutable.ArrayBuffer[
-        Either[LazySpillableColumnarBatch, Batches]]()
-      closeOnExcept(owners) { _ =>
-        prepared.zip(bundle.builds).foreach { case (stage, buildInput) =>
-          val (data, buffered) = stage.load(buildInput, stream)
-          stream = buffered
-          data match {
-            case Left(batch) =>
-              withResource(batch) { batch =>
-                val owned = LazySpillableColumnarBatch(batch, "join_chain_build")
-                closeOnExcept(owned) { _ =>
-                  owned.allowSpilling()
-                  owners += owned
-                  built += Left(owned)
-                }
-              }
-            case Right(iterator) => built += Right(iterator)
-          }
-        }
-        def eager(): Batches = {
-          prepared.indices.foreach { i =>
-            val refs = prepared(i).stage.streamProjection
-            stream = stream.map(batch => withResource(batch)(select(_, refs)))
-            val data = built(i).map(identity).left.map(_.releaseBatch())
-            stream = prepared(i).eager(data, stream)
-          }
-          stream
-        }
-        opTime.ns {
-          if (built.exists(_.isRight)) {
-            // Preserve out-of-core joins. A chain must never concatenate an oversized build.
-            oversizedFallbacks += 1
-            withResource(owners)(_ => eager())
-          } else {
-            val builds = owners.toVector
-            val stages = prepared.map(_.stage)
-            val keys = buildKeys(builds, stages)
-            closeOnExcept(keys) { _ =>
-              val classified = classifyBuildKeys(keys, stages)
-              // Splitting the stream cannot bound a single row with excessive fanout. Keep
-              // the ordinary join's out-of-core path for that case, before probing any stage.
-              val fits = classified.forall(_.buildKeysUnique) ||
-                mapWorkPerRow(classified) <= maxMapRows(options.targetSize)
-              if (fits) {
-                chain.links.zip(builds).foreach { case (link, data) =>
-                  if (!link.node.broadcast) {
-                    link.node.plan.gpuLongMetric(GpuMetric.BUILD_DATA_SIZE) +=
-                      data.deviceMemorySize
+      val timedStream = new CollectTimeIterator(streamNvtx, bundle.stream, streamTime)
+      // Sized/shuffled loaders may need to read the build before pulling a GPU stream batch.
+      val buffered = if (broadcastOnly) bufferNonemptyStream(timedStream)
+        else new CloseableBufferedIterator(timedStream)
+      if (broadcastOnly && !buffered.hasNext) {
+        withResource(buffered)(_ => Iterator.empty)
+      } else closeOnExcept(buffered) { _ =>
+        var stream: Batches = buffered
+        val owners = scala.collection.mutable.ArrayBuffer[LazySpillableColumnarBatch]()
+        val built = scala.collection.mutable.ArrayBuffer[
+          Either[LazySpillableColumnarBatch, Batches]]()
+        closeOnExcept(owners) { _ =>
+          prepared.zip(bundle.builds).foreach { case (stage, buildInput) =>
+            val (data, buffered) = stage.load(buildInput, stream)
+            stream = buffered
+            data match {
+              case Left(batch) =>
+                withResource(batch) { batch =>
+                  val owned = LazySpillableColumnarBatch(batch, "join_chain_build")
+                  closeOnExcept(owned) { _ =>
+                    owned.allowSpilling()
+                    owners += owned
+                    built += Left(owned)
                   }
                 }
-                fusedTasks += 1
-                new JoinChainIterator(stream, attrs, builds, keys, classified, options, opTime)
-              } else {
-                nonUniqueFallbacks += 1
-                withResource(keys)(_ => withResource(owners)(_ => eager()))
+              case Right(iterator) => built += Right(iterator)
+            }
+          }
+          def eager(): Batches = {
+            prepared.indices.foreach { i =>
+              val refs = prepared(i).stage.streamProjection
+              stream = stream.map(batch => withResource(batch)(select(_, refs)))
+              val data = built(i).map(identity).left.map(_.releaseBatch())
+              stream = prepared(i).eager(data, stream)
+            }
+            stream
+          }
+          opTime.ns {
+            if (built.exists(_.isRight)) {
+              // Preserve out-of-core joins. A chain must never concatenate an oversized build.
+              oversizedFallbacks += 1
+              withResource(owners)(_ => eager())
+            } else {
+              val builds = owners.toVector
+              val stages = prepared.map(_.stage)
+              val keys = buildKeys(builds, stages)
+              closeOnExcept(keys) { _ =>
+                val classified = keys.zip(prepared).map { case (key, stage) =>
+                  classifyBuildKey(key, stage.stage, stage.statsCache(),
+                    classifications, statsCacheHits)
+                }
+                // Splitting the stream cannot bound a single row with excessive fanout. Keep
+                // the ordinary join's out-of-core path for that case, before probing any stage.
+                val fits = classified.forall(_.buildKeysUnique) ||
+                  mapWorkPerRow(classified) <= maxMapRows(options.targetSize)
+                if (fits) {
+                  chain.links.zip(builds).foreach { case (link, data) =>
+                    if (!link.node.broadcast) {
+                      link.node.plan.gpuLongMetric(GpuMetric.BUILD_DATA_SIZE) +=
+                        data.deviceMemorySize
+                    }
+                  }
+                  fusedTasks += 1
+                  new JoinChainIterator(stream, attrs, builds, keys, classified, options, opTime)
+                } else {
+                  nonUniqueFallbacks += 1
+                  withResource(keys)(_ => withResource(owners)(_ => eager()))
+                }
               }
             }
           }
@@ -429,17 +495,23 @@ object GpuJoinChain extends Logging {
   /** Select the distinct fast path or bound the complete-key fanout, including skew. */
   private[execution] def classifyBuildKeys(keys: Seq[LazySpillableColumnarBatch],
       stages: Seq[JoinChainStage]): Seq[JoinChainStage] = {
-    stages.indices.map { i =>
-      val stage = stages(i)
-      if (stage.isLeftSemi) {
-        // Semi keys were deduplicated and never multiply the stream rows.
-        stage.copy(buildKeysUnique = true, maxBuildMatches = 1)
-      } else {
-        keys(i).checkpoint()
-        withRetryNoSplit {
-          withRestoreOnRetry(keys(i)) {
-            withResource(GpuColumnVector.from(keys(i).getBatch)) { table =>
-              val unique = table.distinctCount(NullEquality.EQUAL) == keys(i).numRows
+    stages.indices.map(i => classifyBuildKey(keys(i), stages(i)))
+  }
+
+  private[execution] def classifyBuildKey(key: LazySpillableColumnarBatch,
+      stage: JoinChainStage, cache: Option[JoinChainBuildKeyStatsCache] = None,
+      classifications: GpuMetric = NoopMetric, cacheHits: GpuMetric = NoopMetric):
+      JoinChainStage = {
+    if (stage.isLeftSemi) {
+      // Semi keys were deduplicated and never multiply the stream rows.
+      stage.copy(buildKeysUnique = true, maxBuildMatches = 1)
+    } else {
+      def compute(): JoinChainBuildKeyStats = {
+        key.checkpoint()
+        val result = withRetryNoSplit {
+          withRestoreOnRetry(key) {
+            withResource(GpuColumnVector.from(key.getBatch)) { table =>
+              val unique = table.distinctCount(NullEquality.EQUAL) == key.numRows
               val maxMatches = if (unique) {
                 1L
               } else {
@@ -453,12 +525,28 @@ object GpuJoinChain extends Logging {
                     }
                 }
               }
-              keys(i).allowSpilling()
-              stage.copy(buildKeysUnique = unique, maxBuildMatches = maxMatches)
+              key.allowSpilling()
+              JoinChainBuildKeyStats(unique, maxMatches)
             }
           }
         }
+        classifications += 1
+        result
       }
+      val stats = cache match {
+        case Some(shared) =>
+          val ordinals = stage.buildKeys.map(_.asInstanceOf[GpuBoundReference].ordinal)
+          var computed = false
+          val result = shared.getOrCompute(ordinals, stage.nullsEqual) {
+            computed = true
+            compute()
+          }
+          if (!computed) cacheHits += 1
+          result
+        case None => compute()
+      }
+      // Never cache a stage: its metrics and stream projections belong to the current task.
+      stage.copy(buildKeysUnique = stats.unique, maxBuildMatches = stats.maxMatches)
     }
   }
 
