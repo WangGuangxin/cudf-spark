@@ -33,8 +33,9 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.Partial
 import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.rapids.aggregate.{GpuAggregateExpression, GpuBasicSum, GpuCount,
-  GpuMax, GpuMin}
+import org.apache.spark.sql.rapids.aggregate.{GpuAggregateExpression, GpuAverage,
+  GpuBasicAverage, GpuBasicDecimalAverage, GpuBasicDecimalSum, GpuBasicSum, GpuCount,
+  GpuDecimal128Average, GpuDecimal128Sum, GpuDecimalSum, GpuMax, GpuMin}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -63,11 +64,16 @@ object GpuExpandAggregateExec extends Logging {
   private def supportedAggregate(expr: GpuAggregateExpression): Boolean = {
     val fn = expr.aggregateFunction
     expr.mode == Partial && !expr.isDistinct && expr.filter.isEmpty &&
-      fn.deterministic && fn.children.forall(simple) && (fn match {
+      fn.deterministic && (fn match {
         case c: GpuCount => c.children.length == 1 && !c.failOnError &&
           keyType(c.children.head.dataType)
         case s: GpuBasicSum => !s.failOnErrorOverride && integral(s.child.dataType) &&
           integral(s.resultType)
+        case s: GpuBasicDecimalSum => !s.failOnErrorOverride
+        case s: GpuDecimal128Sum => !s.failOnErrorOverride
+        case a: GpuBasicAverage => !a.failOnError
+        case a: GpuBasicDecimalAverage => !a.failOnError
+        case a: GpuDecimal128Average => !a.failOnError
         case _: GpuMin | _: GpuMax => fn.children.length == 1 &&
           integral(fn.children.head.dataType)
         case _ => false
@@ -154,7 +160,17 @@ object GpuExpandAggregateExec extends Logging {
       }
     }
     val sources = projections.indices.map { target =>
+      // A finer group's decimal partial can overflow even when the coarser group does not.
+      // Reaggregating that buffer would propagate a NULL that the original rows avoid.
+      // Average also changes floating-point reduction order when partials are reused.
+      val canReuse = functionsByBranch(target).forall { e =>
+        e.aggregateFunction match {
+          case _: GpuDecimalSum | _: GpuAverage => false
+          case _ => true
+        }
+      }
       (0 until target).filter { source =>
+        canReuse &&
         keyOrdinals.forall { i =>
           projections(target)(i).isInstanceOf[GpuLiteral] ||
             projections(target)(i).semanticEquals(projections(source)(i))

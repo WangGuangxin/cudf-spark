@@ -195,7 +195,82 @@ class ExpandAggregateFusionSuite extends SparkQueryCompareTestSuite {
     }
   }
 
-  for (aggregate <- Seq("avg(v)", "count(distinct v)", "sum(v + 1)",
+  for (aggregate <- Seq("sum(CAST(v AS DECIMAL(8,2)))",
+      "sum(CAST(v AS DECIMAL(38,2)))",
+      "sum(coalesce(CAST(v AS DECIMAL(38,2)) * CAST(v AS DECIMAL(12,0)), 0))",
+      "avg(v)", "avg(CAST(v AS DECIMAL(6,2)))",
+      "avg(CAST(v AS DECIMAL(38,2)))", "sum(v + 1)")) {
+    test(s"CPU/off/on preserve decimal and computed aggregate buffers: $aggregate") {
+      def query(spark: SparkSession): DataFrame = {
+        data(spark).createOrReplaceTempView("fusion_numeric")
+        spark.sql(s"SELECT a,b,grouping_id(),$aggregate FROM fusion_numeric " +
+          "GROUP BY CUBE(a,b)")
+      }
+      val cpu = withCpuSparkSession(s => query(s).collect(), configuration(false))
+      for (enabled <- Seq(false, true)) {
+        withGpuSparkSession({ spark =>
+          val df = query(spark)
+          compareResults(true, 1e-9, cpu, df.collect())
+          assert(PlanUtils.findOperators(df.queryExecution.executedPlan,
+            _.isInstanceOf[GpuExpandAggregateExec]).nonEmpty == enabled,
+            df.queryExecution.executedPlan.toString)
+        }, configuration(enabled))
+      }
+    }
+  }
+
+  test("decimal overflow in finer groups does not poison a cancelling grand total") {
+    def query(spark: SparkSession): DataFrame = {
+      val schema = StructType(Seq(StructField("a", IntegerType),
+        StructField("d", DecimalType(38, 0))))
+      val largest = new java.math.BigDecimal("9" * 38)
+      // Alternate signs so the grand total never overflows, while each detail group does.
+      val rows = Seq(Row(1, largest), Row(2, largest.negate()), Row(1, largest),
+        Row(2, largest.negate()), Row(3, null))
+      spark.createDataFrame(spark.sparkContext.parallelize(rows, 1), schema)
+        .createOrReplaceTempView("fusion_decimal_overflow")
+      spark.sql("SELECT a,grouping_id(),sum(d),avg(d) FROM fusion_decimal_overflow " +
+        "GROUP BY ROLLUP(a)")
+    }
+    val cpu = withCpuSparkSession(s => query(s).collect(), configuration(false))
+    val total = cpu.find(_.getLong(1) == 1L).get
+    assert(total.getDecimal(2).signum() == 0)
+    assert(total.getDecimal(3).signum() == 0)
+    for (enabled <- Seq(false, true)) {
+      withGpuSparkSession({ spark =>
+        val df = query(spark)
+        compareResults(true, 0.0, cpu, df.collect())
+        val fused = PlanUtils.findOperators(df.queryExecution.executedPlan,
+          _.isInstanceOf[GpuExpandAggregateExec])
+        assert(fused.nonEmpty == enabled, df.queryExecution.executedPlan.toString)
+        fused.foreach { node =>
+          val exec = node.asInstanceOf[GpuExpandAggregateExec]
+          val branches = GpuExpandAggregateExec.bind(exec.aggregate, exec.projections,
+            exec.expandOutput, exec.child.output, spark.sessionState.conf, exec.allMetrics)
+          assert(branches.forall(b => b.merge.isEmpty && !b.cacheResult))
+        }
+      }, configuration(enabled))
+    }
+  }
+
+  test("decimal sum and average preserve all-null and empty grouping sets") {
+    for (empty <- Seq(false, true)) {
+      def query(spark: SparkSession): DataFrame = {
+        data(spark, empty).selectExpr("a", "CAST(NULL AS DECIMAL(38,2)) AS d")
+          .createOrReplaceTempView("fusion_decimal_nulls")
+        spark.sql("SELECT a,grouping_id(),sum(d),avg(d) FROM fusion_decimal_nulls " +
+          "GROUP BY ROLLUP(a)")
+      }
+      val cpu = withCpuSparkSession(s => query(s).collect(), configuration(false))
+      for (enabled <- Seq(false, true)) {
+        withGpuSparkSession({ spark =>
+          compareResults(true, 0.0, cpu, query(spark).collect())
+        }, configuration(enabled))
+      }
+    }
+  }
+
+  for (aggregate <- Seq("count(distinct v)",
       "sum(v) FILTER (WHERE v > 0)")) {
     test(s"unsupported aggregation retains the original plan: $aggregate") {
       withGpuSparkSession({ spark =>
