@@ -34,8 +34,7 @@ import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, UnknownPartit
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.aggregate.{GpuAggregateExpression, GpuAverage,
-  GpuBasicAverage, GpuBasicDecimalAverage, GpuBasicDecimalSum, GpuBasicSum, GpuCount,
-  GpuDecimal128Average, GpuDecimal128Sum, GpuDecimalSum, GpuMax, GpuMin}
+  GpuBasicDecimalSum, GpuBasicSum, GpuCount, GpuDecimal128Sum, GpuDecimalSum, GpuMax, GpuMin}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -71,9 +70,8 @@ object GpuExpandAggregateExec extends Logging {
           integral(s.resultType)
         case s: GpuBasicDecimalSum => !s.failOnErrorOverride
         case s: GpuDecimal128Sum => !s.failOnErrorOverride
-        case a: GpuBasicAverage => !a.failOnError
-        case a: GpuBasicDecimalAverage => !a.failOnError
-        case a: GpuDecimal128Average => !a.failOnError
+        // AVG branches cannot reuse partial buffers, so retain the unfused batching path.
+        case _: GpuAverage => false
         case _: GpuMin | _: GpuMax => fn.children.length == 1 &&
           integral(fn.children.head.dataType)
         case _ => false

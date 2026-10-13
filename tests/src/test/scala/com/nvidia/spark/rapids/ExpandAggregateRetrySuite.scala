@@ -26,11 +26,11 @@ import com.nvidia.spark.rapids.spill.SpillFramework
 
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.rapids.aggregate.{CudfAggregate, GpuBasicAverage, GpuBasicSum,
-  GpuCount, GpuDecimal128Sum}
+import org.apache.spark.sql.rapids.aggregate.{CudfAggregate, GpuBasicSum, GpuCount,
+  GpuDecimal128Sum}
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 import org.apache.spark.sql.rapids.metrics.source.MockTaskContext
-import org.apache.spark.sql.types.{DataType, DecimalType, DoubleType, IntegerType, LongType}
+import org.apache.spark.sql.types.{DataType, DecimalType, IntegerType, LongType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object ExpandAggregateRetrySuite {
@@ -168,14 +168,14 @@ class ExpandAggregateRetrySuite extends RmmSparkRetrySuiteBase {
   }
 
   for (fault <- Seq("none", "retry", "split"); allNull <- Seq(false, true)) {
-    test(s"decimal and average buffers survive branch retries: $fault, allNull=$allNull") {
+    test(s"decimal and count buffers survive branch retries: $fault, allNull=$allNull") {
       val (agg, expand) = ExpandAggregateFusionSuite.fixture()
       val value = expand.child.output(1)
       val decimal = DecimalType(38, 0)
       val functions = Seq(
         GpuDecimal128Sum(GpuCast(value, decimal)(), decimal, failOnErrorOverride = false,
           forceWindowSumToNotBeReplaced = false),
-        GpuBasicAverage(value, DoubleType, failOnError = false))
+        GpuCount(Seq(value), failOnError = false))
       val expressions = agg.aggregateExpressions.take(2).zip(functions).map { case (e, fn) =>
         e.copy(origAggregateFunction = fn)
       }
@@ -196,7 +196,7 @@ class ExpandAggregateRetrySuite extends RmmSparkRetrySuiteBase {
             RmmSpark.OomInjectionType.GPU.ordinal, 0)
           case _ =>
         }
-        val results = ArrayBuffer[(Option[Int], Long, Option[Long], Boolean, Double, Long)]()
+        val results = ArrayBuffer[(Option[Int], Long, Option[Long], Boolean, Long)]()
         while (iter.hasNext) {
           withResource(iter.next()) { sb =>
             withResource(sb.getColumnarBatch()) { cb =>
@@ -207,7 +207,7 @@ class ExpandAggregateRetrySuite extends RmmSparkRetrySuiteBase {
                   val sum = if (columns(3).getBoolean(i) || columns(2).isNullAt(i)) None
                     else Some(columns(2).getDecimal(i, 38, 0).toJavaBigDecimal.longValueExact())
                   results += ((key, columns(1).getLong(i), sum, columns(3).getBoolean(i),
-                    columns(4).getDouble(i), columns(5).getLong(i)))
+                    columns(4).getLong(i)))
                 }
               }
             }
@@ -216,10 +216,10 @@ class ExpandAggregateRetrySuite extends RmmSparkRetrySuiteBase {
         val actual = results.groupBy(r => (r._1, r._2)).map { case (key, pieces) =>
           val sums = pieces.flatMap(_._3)
           (key, (if (sums.isEmpty) None else Some(sums.sum), pieces.forall(_._4),
-            pieces.map(_._5).sum, pieces.map(_._6).sum))
+            pieces.map(_._5).sum))
         }
         val expectedValues = expected(allNull).map { case (key, (count, sum, _, _, _)) =>
-          (key, (sum, count == 0, sum.getOrElse(0L).toDouble, count))
+          (key, (sum, count == 0, count))
         }
         assert(actual == expectedValues)
         assert(reused.value == 0)
