@@ -79,6 +79,46 @@ class MixedJoinChainQuerySuite extends SparkQueryCompareTestSuite {
     }, config(sized = false, aqe = false))
   }
 
+  private def selectivePrefix(spark: SparkSession, smallLeft: Boolean): DataFrame = {
+    val fact = spark.range(0, 20000).repartition(2, col("id"))
+      .selectExpr("id AS k", "id % 100 AS supplier")
+    val suppliers = spark.range(0, 2).selectExpr("id AS s", "id AS nation")
+      .hint("BROADCAST")
+    val prefix = fact.join(suppliers, col("supplier") === col("s"))
+      .select("k", "nation")
+    val orders = spark.range(0, 20000).repartition(2, col("id"))
+      .selectExpr("id AS o").hint("MERGE")
+    val joined = if (smallLeft) prefix.join(orders, col("k") === col("o"))
+      else orders.join(prefix, col("o") === col("k"))
+    val nations = spark.range(0, 2).selectExpr("id AS n").hint("BROADCAST")
+    joined.join(nations, col("nation") === col("n")).select("k", "nation")
+  }
+
+  for (smallLeft <- Seq(false, true); reuse <- Seq(false, true)) {
+    testSparkResultsAreEqual(s"selective symmetric boundary left=$smallLeft reuse=$reuse",
+      spark => selectivePrefix(spark, smallLeft),
+      config(sized = true, aqe = false).set(RapidsConf.JOIN_HASH_REUSE_ENABLED.key,
+        reuse.toString), sort = true)(identity)
+
+    test(s"selective prefix preserves symmetric sizing left=$smallLeft reuse=$reuse") {
+      withGpuSparkSession(spark => {
+        val df = selectivePrefix(spark, smallLeft)
+        df.collect()
+        val joins = PlanUtils.findOperators(df.queryExecution.executedPlan,
+          _.isInstanceOf[GpuJoinExec])
+        val symmetric = joins.collect { case j: GpuShuffledSymmetricHashJoinExec => j }
+        assert(symmetric.size == 1, df.queryExecution.toString)
+        val join = symmetric.head
+        assert(GpuJoinChain.chainLength(join) == 0)
+        assert(join.gpuLongMetric(GpuMetric.SMALL_JOIN_COUNT).value == 2)
+        // The filtered prefix has 400 rows of two LONGs. The alternate build has 20,000 LONGs.
+        assert(join.gpuLongMetric(GpuMetric.BUILD_DATA_SIZE).value < 20000L * 8)
+        assert(joins.forall(GpuJoinChain.chainLength(_) <= 1))
+      }, config(sized = true, aqe = false).set(RapidsConf.JOIN_HASH_REUSE_ENABLED.key,
+        reuse.toString))
+    }
+  }
+
   for (sized <- Seq(false, true); aqe <- Seq(false, true); recipe <- recipes) {
     val label = recipe.mkString(" -> ")
     testSparkResultsAreEqual(s"mixed join chain $label sized=$sized AQE=$aqe",
@@ -172,18 +212,26 @@ class MixedJoinChainQuerySuite extends SparkQueryCompareTestSuite {
           df.collect()
           val joins = PlanUtils.findOperators(df.queryExecution.executedPlan,
             _.isInstanceOf[GpuJoinExec])
-          assert(joins.exists(GpuJoinChain.chainLength(_) == 3), df.queryExecution.toString)
+          val symmetric = joins.collect { case j: GpuShuffledSymmetricHashJoinExec => j }
+          if (symmetric.nonEmpty) {
+            assert(symmetric.forall(GpuJoinChain.chainLength(_) == 0))
+            assert(!joins.exists(GpuJoinChain.chainLength(_) == 3), df.queryExecution.toString)
+          } else {
+            assert(joins.exists(GpuJoinChain.chainLength(_) == 3), df.queryExecution.toString)
+          }
         }
         val left = query(spark, recipes(3), buildLeft = true, repeatedFact = true)
         left.collect()
         val leftJoins = PlanUtils.findOperators(left.queryExecution.executedPlan,
           _.isInstanceOf[GpuJoinExec])
-        assert(leftJoins.exists(GpuJoinChain.chainLength(_) == 3))
         if (sized) {
           val symmetric = leftJoins.collect { case j: GpuShuffledSymmetricHashJoinExec => j }
           assert(symmetric.nonEmpty)
           assert(symmetric.forall(_.gpuLongMetric(GpuMetric.NUM_OUTPUT_ROWS).value > 0))
-          assert(symmetric.forall(_.gpuLongMetric(GpuMetric.SMALL_JOIN_COUNT).value == 0))
+          assert(symmetric.forall(GpuJoinChain.chainLength(_) == 0))
+          assert(symmetric.forall(_.gpuLongMetric(GpuMetric.SMALL_JOIN_COUNT).value > 0))
+        } else {
+          assert(leftJoins.exists(GpuJoinChain.chainLength(_) == 3))
         }
 
         val shuffled = query(spark, recipes(3), exchangeAfter = 1)

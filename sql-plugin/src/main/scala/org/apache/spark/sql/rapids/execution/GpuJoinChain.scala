@@ -155,19 +155,10 @@ object GpuJoinChain extends Logging {
         if (join.buildSide == GpuBuildRight) GpuBuildLeft else GpuBuildRight
       } else join.buildSide
       Some(Node(join, side))
-    case join: GpuShuffledSymmetricHashJoinExec =>
-      // Keep the chain on the streaming side. The alternate input must fit the normal build limit;
-      // otherwise the existing symmetric sizing/sub-partition path is resumed at runtime.
-      val side = if (childJoin(join.left).isRight) GpuBuildRight
-        else if (childJoin(join.right).isRight) GpuBuildLeft
-        else {
-          // At the anchor, prefer retaining the wider payload as the streaming source. Runtime
-          // size and fanout checks still decide whether the selected build can be deferred.
-          val leftWidth = join.left.output.map(_.dataType.defaultSize.toLong).sum
-          val rightWidth = join.right.output.map(_.dataType.defaultSize.toLong).sum
-          if (leftWidth < rightWidth) GpuBuildLeft else GpuBuildRight
-        }
-      Some(Node(join, side))
+    // Symmetric joins choose their build side using actual input sizes. Treat them as chain
+    // boundaries so a selective prefix can finish before sizing, instead of forcing the other
+    // (potentially much larger) input to be the build merely to extend the chain.
+    case _: GpuShuffledSymmetricHashJoinExec => None
     case _ => None
   }
 
