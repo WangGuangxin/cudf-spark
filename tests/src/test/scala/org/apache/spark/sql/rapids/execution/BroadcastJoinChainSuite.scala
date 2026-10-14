@@ -407,6 +407,53 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
     }
   }
 
+  private def dimensionOnlyStages: Seq[JoinChainStage] = Seq(
+    stages.head,
+    stages(1).copy(streamProjection = Seq(3), streamKeyOrdinals = Seq(0)),
+    stages(2).copy(streamProjection = Seq(1), streamKeyOrdinals = Seq(0)))
+
+  for (reuse <- Seq(false, true); nullsEqual <- Seq(false, true); semi <- Seq(false, true)) {
+    test(s"dead fact maps survive spills reuse=$reuse nulls=$nullsEqual semi=$semi") {
+      val raw = dimensionOnlyStages
+      val ss = raw.updated(2, raw(2).copy(isLeftSemi = semi))
+        .map(_.copy(nullsEqual = nullsEqual))
+      val rows = fact ++ fact
+      var spilled = 0L
+      val result = run(rows, ss, inputBatchRows = 2, dimensionRows = duplicateDims,
+        reuseHash = reuse, action = stage => {
+          if (stage > 0) {
+            spilled += SpillFramework.stores.deviceStore.spill(Long.MaxValue)
+            SpillFramework.stores.hostStore.spill(Long.MaxValue)
+          }
+        })
+      assert(spilled > 0)
+      assert(result.nonEmpty)
+      assert(sorted(result) == sorted(expected(rows, ss, duplicateDims)))
+    }
+  }
+
+  for (split <- Seq(false, true)) {
+    test(s"dead fact maps restore after a partial probe retry split=$split") {
+      val metrics = stages.map(_ => new LocalGpuMetric)
+      val ss = dimensionOnlyStages.zip(metrics).map { case (stage, metric) =>
+        stage.copy(outputRows = metric)
+      }
+      var injected = false
+      val result = run(fact, ss, dimensionRows = duplicateDims, action = stage => {
+        if (stage == 2 && !injected) {
+          injected = true
+          if (split) throw new GpuSplitAndRetryOOM("dead source chain test")
+          else throw new GpuRetryOOM("dead source chain test")
+        }
+      })
+      assert(injected)
+      assert(sorted(result) == sorted(expected(fact, ss, duplicateDims)))
+      assert(metrics.head.value == expected(fact, ss.take(1), duplicateDims.take(1)).size)
+      assert(metrics.last.value == result.size)
+      assert(run(Seq(Seq[Integer](99, 1)), ss, dimensionRows = duplicateDims).isEmpty)
+    }
+  }
+
   test("partial maps restore after spilling to host and disk") {
     var spilled = 0L
     val result = run(fact, stages, stage => {

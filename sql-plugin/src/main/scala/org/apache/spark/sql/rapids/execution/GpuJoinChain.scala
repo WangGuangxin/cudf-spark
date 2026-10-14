@@ -565,6 +565,28 @@ object GpuJoinChain extends Logging {
     work
   }
 
+  /** Sources needed after each probe, for later keys or the complete chain output. */
+  private[execution] def liveSourcesAfterStages(factWidth: Int, buildWidths: Seq[Int],
+      stages: Seq[JoinChainStage]): Seq[Set[Int]] = {
+    var layout: Seq[Int] = Seq.fill(factWidth)(0)
+    val probeSources = stages.zipWithIndex.map { case (stage, i) =>
+      layout = stage.streamProjection.map(layout)
+      val needed = stage.streamKeyOrdinals.map(layout).toSet
+      if (!stage.isLeftSemi) {
+        val build = Seq.fill(buildWidths(i))(i + 1)
+        layout = if (stage.buildSide == GpuBuildRight) layout ++ build else build ++ layout
+      }
+      needed
+    }
+    var needed = layout.toSet
+    stages.indices.reverse.map { i =>
+      // Keep source slots aligned, but do not mark a future build as already live.
+      val live = needed.filter(_ <= i + 1)
+      needed = needed ++ probeSources(i)
+      live
+    }.reverse
+  }
+
   /** Reference-only projection, stripping contiguous-batch subclasses when rearranging columns. */
   private[execution] def select(batch: ColumnarBatch, ordinals: Seq[Int]): ColumnarBatch = {
     val columns = ordinals.safeMap { i =>
@@ -644,6 +666,8 @@ private[execution] class JoinChainIterator(
   private case class Origin(source: Int, column: Int)
   private val hashes = stages.map(stage =>
     new GpuJoinHashCache(stage.buildKeysUnique, stage.nullsEqual, options.hashReuseEnabled))
+  private val liveSources = GpuJoinChain.liveSourcesAfterStages(
+    attrs.length, builds.map(_.numCols), stages)
   private val hasFanout = stages.exists(!_.buildKeysUnique)
   private val mapWork = GpuJoinChain.mapWorkPerRow(stages)
   override protected def splitBeforePending: Boolean = hasFanout
@@ -769,14 +793,17 @@ private[execution] class JoinChainIterator(
                     keys(i).allowSpilling()
                     val joinedRows = joined(0).getRowCount.toInt
                     if (joinedRows == 0) {
-                      Seq.empty[IndexMap]
+                      (Seq.empty[IndexMap], 0)
                     } else {
                       withResource(joined(0).toColumnView(0, joinedRows)) { selection =>
+                        val live = liveSources(i)
                         val prefix = if (maps.isEmpty) {
-                          Seq(withResource(selection.copyToColumnVector())(index))
+                          Seq(if (live.contains(0)) {
+                            withResource(selection.copyToColumnVector())(index)
+                          } else null)
                         } else {
-                          maps.safeMap { old =>
-                            if (old == null) {
+                          maps.zipWithIndex.safeMap { case (old, source) =>
+                            if (old == null || !live.contains(source)) {
                               null
                             } else {
                               withResource(GpuColumnVector.from(old.data.getBatch)) { table =>
@@ -789,15 +816,16 @@ private[execution] class JoinChainIterator(
                           }
                         }
                         closeOnExcept(prefix) { _ =>
-                          if (stage.isLeftSemi) {
-                            // Keep source indices aligned for later inner stages, without
-                            // retaining a map or exposing any semi-build payload columns.
+                          val result = if (stage.isLeftSemi || !live.contains(i + 1)) {
+                            // Preserve source slots for semi builds and payloads that no later
+                            // key or output uses, without allocating or composing their maps.
                             prefix :+ null
                           } else {
                             withResource(joined(1).toColumnView(0, joinedRows)) { right =>
                               prefix :+ withResource(right.copyToColumnVector())(index)
                             }
                           }
+                          (result, joinedRows)
                         }
                       }
                     }
@@ -806,8 +834,9 @@ private[execution] class JoinChainIterator(
               }
             }
           }
-          withResource(maps) { _ => maps = next }
-          rows = maps.headOption.map(_.getRowCount.toInt).getOrElse(0)
+          withResource(maps) { _ => maps = next._1 }
+          // The fact map can be dead even when dimension-derived rows are still live.
+          rows = next._2
           maps.filter(_ != null).foreach(_.allowSpilling())
         }
         counts += rows

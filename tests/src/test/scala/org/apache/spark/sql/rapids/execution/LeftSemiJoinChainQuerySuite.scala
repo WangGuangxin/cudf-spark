@@ -81,13 +81,21 @@ class LeftSemiJoinChainQuerySuite extends SparkQueryCompareTestSuite {
   }
 
   for (recipe <- recipes; hint <- Seq("BROADCAST", "SHUFFLE_HASH", "MERGE")) {
-    test(s"semi chain fuses repeated build keys ${recipe.mkString(" -> ")} hint=$hint") {
+    test(s"semi chain repeated keys respect boundaries ${recipe.mkString(" -> ")} hint=$hint") {
       withGpuSparkSession(spark => {
         val df = query(spark, recipe, hint)
         df.collect()
         val plan = df.queryExecution.executedPlan
-        assert(joins(plan).exists(GpuJoinChain.chainLength(_) == recipe.length), plan.toString)
-        assert(metric(plan, GpuMetric.JOIN_CHAIN_FUSED_TASKS) > 0, plan.toString)
+        if (hint == "MERGE" && recipe.contains("inner")) {
+          val symmetric = joins(plan).collect { case j: GpuShuffledSymmetricHashJoinExec => j }
+          assert(symmetric.nonEmpty, plan.toString)
+          assert(symmetric.forall(GpuJoinChain.chainLength(_) == 0), plan.toString)
+          // Semi joins may be reordered into a shorter chain on one side of this boundary.
+          assert(joins(plan).forall(GpuJoinChain.chainLength(_) < recipe.length), plan.toString)
+        } else {
+          assert(joins(plan).exists(GpuJoinChain.chainLength(_) == recipe.length), plan.toString)
+          assert(metric(plan, GpuMetric.JOIN_CHAIN_FUSED_TASKS) > 0, plan.toString)
+        }
         assert(metric(plan, GpuMetric.JOIN_CHAIN_FALLBACK_NON_UNIQUE) == 0)
         if (hint == "MERGE") {
           assert(joins(plan).exists {

@@ -18,12 +18,46 @@ package org.apache.spark.sql.rapids.execution
 
 import java.util.concurrent.{Callable, CyclicBarrier, Executors, TimeUnit}
 
+import com.nvidia.spark.rapids.{GpuBoundReference, GpuBuildLeft, GpuBuildRight}
 import com.nvidia.spark.rapids.Arm.withResource
 import org.scalatest.funsuite.AnyFunSuite
 
+import org.apache.spark.sql.catalyst.expressions.ExprId
+import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 class JoinChainPreparationSuite extends AnyFunSuite {
+  private def ref(i: Int): GpuBoundReference =
+    GpuBoundReference(i, IntegerType, nullable = true)(ExprId(i), s"c$i")
+
+  test("Q21-shaped projections drop fact and orders maps after the orders probe") {
+    val stages = Seq(
+      JoinChainStage(Seq(ref(0)), Seq(1), Seq(0, 1), GpuBuildLeft, false),
+      JoinChainStage(Seq(ref(0)), Seq(2), Seq(1, 2, 3), GpuBuildRight, false),
+      JoinChainStage(Seq(ref(0)), Seq(1), Seq(0, 1), GpuBuildRight, false))
+    assert(GpuJoinChain.liveSourcesAfterStages(2, Seq(3, 1, 1), stages) ==
+      Seq(Set(0, 1), Set(1), Set(1, 3)))
+  }
+
+  test("dimension-derived keys preserve a source until its last use") {
+    val stages = Seq(
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(0, 1), GpuBuildRight, false),
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(3), GpuBuildLeft, false),
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(1), GpuBuildRight, false))
+    assert(GpuJoinChain.liveSourcesAfterStages(2, Seq(3, 2, 2), stages) ==
+      Seq(Set(1), Set(2), Set(2, 3)))
+  }
+
+  test("semi stages do not add a payload source and final columns remain live") {
+    val stages = Seq(
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(0, 1), GpuBuildRight, false),
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(3, 1), GpuBuildRight, false,
+        isLeftSemi = true),
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(0, 1), GpuBuildLeft, false))
+    assert(GpuJoinChain.liveSourcesAfterStages(2, Seq(3, 2, 2), stages) ==
+      Seq(Set(0, 1), Set(0, 1), Set(0, 1, 3)))
+  }
+
   private class TrackedBatch(rows: Int) extends ColumnarBatch(Array.empty, rows) {
     var released = false
     override def close(): Unit = {

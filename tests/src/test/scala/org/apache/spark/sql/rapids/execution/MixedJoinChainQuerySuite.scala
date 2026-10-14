@@ -137,14 +137,21 @@ class MixedJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       spark => query(spark, recipes(3), buildLeft = true, repeatedFact = true),
       config(sized, aqe = false), sort = true)(identity)
 
-    test(s"mixed non-unique builds actually fuse sized=$sized") {
+    test(s"mixed non-unique builds respect symmetric boundaries sized=$sized") {
       withGpuSparkSession(spark => {
         val df = query(spark, recipes(3), duplicates = true)
         assert(df.collect().length == 320)
         val joins = PlanUtils.findOperators(df.queryExecution.executedPlan,
           _.isInstanceOf[GpuJoinExec]).map(_.asInstanceOf[GpuJoinExec])
-        assert(joins.exists(GpuJoinChain.chainLength(_) == 3))
-        assert(joins.map(_.gpuLongMetric(GpuMetric.JOIN_CHAIN_FUSED_TASKS).value).sum > 0)
+        val fused = joins.map(_.gpuLongMetric(GpuMetric.JOIN_CHAIN_FUSED_TASKS).value).sum
+        if (sized) {
+          assert(joins.exists(_.isInstanceOf[GpuShuffledSymmetricHashJoinExec]))
+          assert(joins.forall(GpuJoinChain.chainLength(_) <= 1))
+          assert(fused == 0)
+        } else {
+          assert(joins.exists(GpuJoinChain.chainLength(_) == 3))
+          assert(fused > 0)
+        }
         assert(joins.map(_.gpuLongMetric(GpuMetric.JOIN_CHAIN_FALLBACK_NON_UNIQUE).value)
           .sum == 0)
       }, config(sized, aqe = false))
