@@ -86,7 +86,8 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
       retryKeys: Boolean = false, expectedHashBuilds: Option[Long] = None,
       reuseHash: Boolean = true, retryStats: Boolean = false): Seq[Row] = {
     val builds = dimensionRows.zip(dims).take(ss.length).safeMap { case (rows, shape) =>
-      withResource(batch(rows, shape.head.size))(LazySpillableColumnarBatch(_, "test_dim"))
+      val width = rows.headOption.map(_.size).getOrElse(shape.head.size)
+      withResource(batch(rows, width))(LazySpillableColumnarBatch(_, "test_dim"))
     }
     withResource(builds) { _ =>
       if (retryKeys) {
@@ -458,6 +459,76 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
       }
     }
     assert(SpillFramework.stores.deviceStore.numHandles == 0)
+  }
+
+  test("identity build keys borrow their payload through spilling and key close") {
+    val rows = Seq(Seq[Integer](1, 10), Seq[Integer](2, 20), Seq[Integer](null, 30))
+    val stage = stages.head.copy(buildKeys = Seq(ref(0), ref(1)))
+    val owned = withResource(batch(rows, 2))(LazySpillableColumnarBatch(_, "key_only_build"))
+    withResource(owned) { built =>
+      withResource(GpuJoinChain.buildKeys(Seq(built), Seq(stage))) { keys =>
+        assert(keys.head.getBatch eq built.getBatch)
+        keys.head.checkpoint()
+        assert(SpillFramework.stores.deviceStore.spill(Long.MaxValue) > 0)
+        SpillFramework.stores.hostStore.spill(Long.MaxValue)
+        keys.head.restore()
+        withResource(GpuColumnVector.extractBases(keys.head.getBatch)(1).copyToHost()) { col =>
+          assert(col.getInt(2) == 30)
+        }
+      }
+      // Closing borrowed keys may spill, but must leave the payload owner usable.
+      withResource(GpuColumnVector.extractBases(built.getBatch)(0).copyToHost()) { col =>
+        assert(col.getInt(0) == 1)
+        assert(col.isNull(2))
+      }
+    }
+    assert(SpillFramework.stores.deviceStore.numHandles == 0)
+    assert(SpillFramework.stores.hostStore.numHandles == 0)
+  }
+
+  test("reordered complete keys detach and semi complete keys still deduplicate") {
+    val rows = Seq(Seq[Integer](1, 10), Seq[Integer](1, 10), Seq[Integer](null, 30))
+    withResource(batch(rows, 2)) { original =>
+      withResource(LazySpillableColumnarBatch(original, "test_full_key_build")) { built =>
+        val reordered = stages.head.copy(buildKeys = Seq(ref(1), ref(0)))
+        withResource(GpuJoinChain.buildKeys(Seq(built), Seq(reordered))) { keys =>
+          withResource(GpuColumnVector.extractBases(original)(1).getData) { payload =>
+            withResource(GpuColumnVector.extractBases(keys.head.getBatch)(0).getData) { key =>
+              assert(payload.getAddress != key.getAddress)
+            }
+          }
+          withResource(GpuColumnVector.extractBases(keys.head.getBatch)(0).copyToHost()) { col =>
+            assert(col.getInt(0) == 10)
+            assert(col.getInt(2) == 30)
+          }
+        }
+        val semi = stages.head.copy(buildKeys = Seq(ref(0), ref(1)), isLeftSemi = true)
+        withResource(GpuJoinChain.buildKeys(Seq(built), Seq(semi))) { keys =>
+          assert(keys.head.numRows == 2)
+          assert(built.numRows == 3)
+        }
+      }
+    }
+    assert(SpillFramework.stores.deviceStore.numHandles == 0)
+  }
+
+  for (reuse <- Seq(false, true); nullsEqual <- Seq(false, true)) {
+    test(s"key-only builds survive repeated probes and spilling reuse=$reuse nulls=$nullsEqual") {
+      val dimensions = Seq(Seq(Seq[Integer](1), Seq[Integer](2), Seq[Integer](null)),
+        Seq(Seq[Integer](1), Seq[Integer](1), Seq[Integer](2), Seq[Integer](null)))
+      val ss = Seq.fill(2)(stages.head.copy(nullsEqual = nullsEqual))
+      val rows = fact ++ fact
+      var spilled = 0L
+      val result = run(rows, ss, inputBatchRows = 2, dimensionRows = dimensions,
+        reuseHash = reuse, action = stage => {
+          if (stage == 1) {
+            spilled += SpillFramework.stores.deviceStore.spill(Long.MaxValue)
+            SpillFramework.stores.hostStore.spill(Long.MaxValue)
+          }
+        })
+      assert(spilled > 0)
+      assert(sorted(result) == sorted(expected(rows, ss, dimensions)))
+    }
   }
 
   test("build key copies retry with spillable payloads") {

@@ -578,10 +578,22 @@ object GpuJoinChain extends Logging {
       stages: Seq[JoinChainStage]): Seq[LazySpillableColumnarBatch] = {
     builds.foreach(_.checkpoint())
     builds.indices.safeMap { i =>
-      withRetryNoSplit {
+      val build = builds(i)
+      val stage = stages(i)
+      val identity = !stage.isLeftSemi && stage.buildKeys.length == build.numCols &&
+        stage.buildKeys.zipWithIndex.forall {
+          case (ref: GpuBoundReference, ordinal) =>
+            ref.ordinal == ordinal && ref.dataType == build.dataTypes(ordinal)
+          case _ => false
+        }
+      if (identity) {
+        // The entire payload is the key table, so detaching would only duplicate its buffers.
+        // Borrow the owner: closing the key wrapper must not close the chain's build payload.
+        LazySpillableColumnarBatch.spillOnly(build)
+      } else withRetryNoSplit {
         withRestoreOnRetry(builds(i)) {
           withResource(GpuProjectExec.project(builds(i).getBatch, stages(i).buildKeys)) { keys =>
-            // Inner keys need an independent copy. Semi keys are copied by deduplication,
+            // Partial/reordered inner keys need an independent copy. Semi keys are deduplicated,
             // retaining one row even for repeated NULL keys; probe null equality is unchanged.
             val semi = stages(i).isLeftSemi
             withResource(GpuColumnVector.extractBases(keys).toSeq.safeMap { column =>
