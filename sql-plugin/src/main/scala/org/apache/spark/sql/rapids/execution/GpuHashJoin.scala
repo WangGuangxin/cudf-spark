@@ -15,7 +15,7 @@
  */
 package org.apache.spark.sql.rapids.execution
 
-import ai.rapids.cudf.{ColumnView, DistinctHashJoin => CudfDistinctHashJoin, DType, GatherMap, HashJoin => CudfHashJoin, NullEquality, OutOfBoundsPolicy, Scalar, Table}
+import ai.rapids.cudf.{DistinctHashJoin => CudfDistinctHashJoin, DType, GatherMap, HashJoin => CudfHashJoin, NullEquality, OutOfBoundsPolicy, Table}
 import ai.rapids.cudf.ast.CompiledExpression
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
@@ -1433,6 +1433,8 @@ abstract class BaseHashJoinIterator(
     }
   }
 
+  private lazy val iteratorHashProvider = new IteratorHashBackendProvider(regularHash, distinctHash)
+
   private[this] var cachedBackendsDisabled = false
 
   protected def selectHashJoinPlan(
@@ -1450,7 +1452,10 @@ abstract class BaseHashJoinIterator(
       rightRowCount,
       compareNullsEqual)
     val availableProvider =
-      if (cachedBackendsDisabled) OnDemandHashBackendProvider else hashBackendProvider
+      if (cachedBackendsDisabled) OnDemandHashBackendProvider
+      else if (hashBackendProvider == OnDemandHashBackendProvider) iteratorHashProvider
+      else if (!joinOptions.hashReuseEnabled) OnDemandHashBackendProvider
+      else hashBackendProvider
     try {
       availableProvider.backend(probe, request)
     } catch {
@@ -1704,19 +1709,6 @@ abstract class BaseHashJoinIterator(
     }
   }
 
-  // Reuse the buffered hash only when it is also the selected physical build side.
-  protected def reusableInnerJoin(left: Table, right: Table): GatherMapsResult = {
-    val selected = JoinBuildSideSelection.selectPhysicalBuildSide(
-      joinOptions.buildSideSelection, buildSide, left.getRowCount, right.getRowCount)
-    if (selected != buildSide) {
-      JoinImpl.innerHashJoin(left, right, compareNullsEqual,
-        joinOptions.buildSideSelection, buildSide)
-    } else {
-      val maps = if (buildSide == GpuBuildRight) regularHash.innerJoin(right, left)
-        else regularHash.innerJoin(left, right).reverse
-      GatherMapsResult(maps(0), maps(1))
-    }
-  }
 
   override def createGatherer(
       cb: LazySpillableColumnarBatch,
@@ -1731,26 +1723,26 @@ abstract class BaseHashJoinIterator(
     val spillOnlyCb = LazySpillableColumnarBatch.spillOnly(cb)
     try {
       withProjectedBuiltKeys { keys =>
-      val retryables = Seq(built, keys, spillOnlyCb) ++ hashBatch.operation
-      retryables.foreach(_.checkpoint())
-      withRetryNoSplit {
-        withRestoreOnRetry(retryables) {
-          // We need a new LSCB that will be taken over by the gatherer, or closed
-          closeOnExcept(LazySpillableColumnarBatch(spillOnlyCb.getBatch, "stream_data")) {
-            streamBatch =>
-              // the original stream data batch is not spillable until
-              // we ask it to be right here, because we called `getBatch` on it
-              // to make up the new lazy spillable (`streamBatch`)
-              spillOnlyCb.allowSpilling()
+        val retryables = Seq(built, keys, spillOnlyCb) ++ hashBatch.operation
+        retryables.foreach(_.checkpoint())
+        withRetryNoSplit {
+          withRestoreOnRetry(retryables) {
+            // We need a new LSCB that will be taken over by the gatherer, or closed
+            closeOnExcept(LazySpillableColumnarBatch(spillOnlyCb.getBatch, "stream_data")) {
+              streamBatch =>
+                // the original stream data batch is not spillable until
+                // we ask it to be right here, because we called `getBatch` on it
+                // to make up the new lazy spillable (`streamBatch`)
+                spillOnlyCb.allowSpilling()
 
-              withResource(GpuColumnVector.incRefCounts(keys.getBatch)) { builtKeys =>
-                // The local reference keeps keys alive while the cached batch can be spilled.
-                keys.allowSpilling()
-                joinGatherer(builtKeys, built, streamBatch, hashBatch)
-              }
+                withResource(GpuColumnVector.incRefCounts(keys.getBatch)) { builtKeys =>
+                  // The local reference keeps keys alive while the cached batch can be spilled.
+                  keys.allowSpilling()
+                  joinGatherer(builtKeys, built, streamBatch, hashBatch)
+                }
+            }
           }
         }
-      }
       }
     } catch {
       // This should work for all join types. There should be no need to do this for any
@@ -1823,12 +1815,6 @@ abstract class BaseHashJoinIterator(
       streamCb.allowSpilling()
       joinGatherer(buildKeys, LazySpillableColumnarBatch.spillOnly(buildData), streamKeys, streamCb,
         hashBatch)
-    }
-  }
-
-  override def close(): Unit = {
-    if (!closed) {
-      super.close()
     }
   }
 
@@ -2330,12 +2316,7 @@ class HashJoinStreamSideIterator(
     if (builtSideTracker.isEmpty) {
       // No stream row could have matched, so directly initialize every build row as unmatched.
       builtSideTracker = Some(withRetryNoSplit {
-        withResource(trueColumnTable(built.numRows)) { trackerTable =>
-          closeOnExcept(GpuColumnVector.from(
-            trackerTable, Array[DataType](DataTypes.BooleanType))) { trackerBatch =>
-            SpillableColumnarBatch(trackerBatch, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
-          }
-        }
+        OuterJoinTracker(built.numRows, joinOptions.outerBitmapEnabled)
       })
     }
   }

@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-package com.nvidia.spark.rapids
+package org.apache.spark.sql.rapids.execution
 
 import ai.rapids.cudf.{ColumnVector, Table}
+import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.jni.GpuRetryOOM
@@ -25,7 +26,6 @@ import com.nvidia.spark.rapids.spill.SpillFramework
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.plans.{FullOuter, JoinType, LeftOuter, RightOuter}
 import org.apache.spark.sql.rapids.GpuLessThan
-import org.apache.spark.sql.rapids.execution.{HashJoinStreamSideIterator, HashOuterJoinIterator, JoinBuildSideSelection, JoinOptions, JoinStrategy, LazyCompiledCondition}
 import org.apache.spark.sql.types.{DataType, IntegerType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -154,9 +154,11 @@ class HashOuterJoinIteratorSuite extends RmmSparkRetrySuiteBase {
               compareNullsEqual = false, None, NoopMetric, NoopMetric) {
             override protected def joinGathererLeftRight(
                 leftKeys: Table, leftData: LazySpillableColumnarBatch,
-                rightKeys: Table, rightData: LazySpillableColumnarBatch): Option[JoinGatherer] = {
+                rightKeys: Table, rightData: LazySpillableColumnarBatch,
+                hashBatch: HashJoinBatch): Option[JoinGatherer] = {
               attempts += 1
-              val gatherer = super.joinGathererLeftRight(leftKeys, leftData, rightKeys, rightData)
+              val gatherer = super.joinGathererLeftRight(leftKeys, leftData, rightKeys,
+                rightData, hashBatch)
               if (attempts == 1) {
                 withResource(gatherer) { _ =>
                   throw new GpuRetryOOM("retry after marking outer join matches")

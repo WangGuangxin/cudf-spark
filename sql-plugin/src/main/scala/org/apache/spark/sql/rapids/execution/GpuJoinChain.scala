@@ -21,6 +21,7 @@ import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.{withRestoreOnRetry, withRetryNoSplit}
+import com.nvidia.spark.rapids.SplittableJoinIterator.PreparedJoinBatch
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
@@ -632,7 +633,7 @@ private[execution] class JoinChainIterator(
     stages: Seq[JoinChainStage],
     options: JoinOptions,
     opTime: GpuMetric = NoopMetric)
-    extends SplittableJoinIterator(NvtxRegistry.JOIN_GATHER,
+    extends SplittableJoinIterator[PreparedJoinBatch](NvtxRegistry.JOIN_GATHER,
       input.map { batch =>
         withResource(batch)(LazySpillableColumnarBatch(_, "join_chain_fact"))
       }, attrs, builds.head, GpuJoinChain.mapTargetSize(options.targetSize),
@@ -657,7 +658,10 @@ private[execution] class JoinChainIterator(
     }
   }
 
-  override protected def computeNumJoinRows(batch: LazySpillableColumnarBatch): Long = {
+  override protected def prepareJoinBatch(batch: LazySpillableColumnarBatch):
+      PreparedJoinBatch = PreparedJoinBatch(computeNumJoinRows(batch))
+
+  private def computeNumJoinRows(batch: LazySpillableColumnarBatch): Long = {
     if (hasFanout) {
       // Limit each splitting pass to eight pieces rather than queuing potentially millions
       // of batches at once. Each piece is checked again before any probe allocation.
@@ -695,7 +699,7 @@ private[execution] class JoinChainIterator(
   protected def beforeProbe(stage: Int): Unit = ()
 
   override protected def createGatherer(fact: LazySpillableColumnarBatch,
-      numJoinRows: Option[Long]): Option[JoinGatherer] = {
+      prepared: Option[PreparedJoinBatch]): Option[JoinGatherer] = {
     if (fact.numRows == 0 || builds.exists(_.numRows == 0)) {
       None
     } else {
@@ -740,7 +744,7 @@ private[execution] class JoinChainIterator(
           beforeProbe(i)
           val next = stage.joinTime.ns {
             val origins = stage.streamKeyOrdinals.map(layout)
-            withResource(origins.safeMap { origin =>
+            val joinedMaps = withResource(origins.safeMap { origin =>
               val source = sources(origin.source)
               withResource(GpuColumnVector.from(source.getBatch)) { table =>
                 withResource(new Table(table.getColumn(origin.column))) { key =>
@@ -762,40 +766,41 @@ private[execution] class JoinChainIterator(
             }) { streamColumns =>
               withResource(new Table(streamColumns: _*)) { streamKeys =>
                 withResource(GpuColumnVector.from(keys(i).getBatch)) { buildKeys =>
-                  withResource(hashes(i).innerJoin(buildKeys, streamKeys)) { joined =>
-                    keys(i).allowSpilling()
-                    val joinedRows = joined(0).getRowCount.toInt
-                    if (joinedRows == 0) {
-                      Seq.empty[IndexMap]
+                  hashes(i).innerJoin(buildKeys, streamKeys)
+                }
+              }
+            }
+            withResource(joinedMaps) { joined =>
+              keys(i).allowSpilling()
+              val joinedRows = joined(0).getRowCount.toInt
+              if (joinedRows == 0) {
+                Seq.empty[IndexMap]
+              } else {
+                withResource(joined(0).toColumnView(0, joinedRows)) { selection =>
+                  val prefix = if (maps.isEmpty) {
+                    Seq(withResource(selection.copyToColumnVector())(index))
+                  } else {
+                    maps.safeMap { old =>
+                      if (old == null) {
+                        null
+                      } else {
+                        withResource(GpuColumnVector.from(old.data.getBatch)) { table =>
+                          withResource(table.gather(selection,
+                              OutOfBoundsPolicy.DONT_CHECK)) {
+                            gathered => index(gathered.getColumn(0))
+                          }
+                        }
+                      }
+                    }
+                  }
+                  closeOnExcept(prefix) { _ =>
+                    if (stage.isLeftSemi) {
+                      // Keep source indices aligned for later inner stages, without
+                      // retaining a map or exposing any semi-build payload columns.
+                      prefix :+ null
                     } else {
-                      withResource(joined(0).toColumnView(0, joinedRows)) { selection =>
-                        val prefix = if (maps.isEmpty) {
-                          Seq(withResource(selection.copyToColumnVector())(index))
-                        } else {
-                          maps.safeMap { old =>
-                            if (old == null) {
-                              null
-                            } else {
-                              withResource(GpuColumnVector.from(old.data.getBatch)) { table =>
-                                withResource(table.gather(selection,
-                                    OutOfBoundsPolicy.DONT_CHECK)) {
-                                  gathered => index(gathered.getColumn(0))
-                                }
-                              }
-                            }
-                          }
-                        }
-                        closeOnExcept(prefix) { _ =>
-                          if (stage.isLeftSemi) {
-                            // Keep source indices aligned for later inner stages, without
-                            // retaining a map or exposing any semi-build payload columns.
-                            prefix :+ null
-                          } else {
-                            withResource(joined(1).toColumnView(0, joinedRows)) { right =>
-                              prefix :+ withResource(right.copyToColumnVector())(index)
-                            }
-                          }
-                        }
+                      withResource(joined(1).toColumnView(0, joinedRows)) { right =>
+                        prefix :+ withResource(right.copyToColumnVector())(index)
                       }
                     }
                   }

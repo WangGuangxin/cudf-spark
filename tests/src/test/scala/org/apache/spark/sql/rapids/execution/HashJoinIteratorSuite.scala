@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-package com.nvidia.spark.rapids
+package org.apache.spark.sql.rapids.execution
 
 import ai.rapids.cudf.{ColumnVector, Table}
+import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.jni.GpuRetryOOM
 import com.nvidia.spark.rapids.spill.SpillFramework
@@ -24,7 +25,6 @@ import com.nvidia.spark.rapids.spill.SpillFramework
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.rapids.GpuAdd
-import org.apache.spark.sql.rapids.execution.{HashJoinIterator, JoinBuildSideSelection, JoinBuildSideStats, JoinOptions, JoinStrategy}
 import org.apache.spark.sql.types.{DataType, IntegerType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -77,12 +77,13 @@ class HashJoinIteratorSuite extends RmmSparkRetrySuiteBase {
               leftKeys: Table,
               leftData: LazySpillableColumnarBatch,
               rightKeys: Table,
-              rightData: LazySpillableColumnarBatch): Option[JoinGatherer] = {
+              rightData: LazySpillableColumnarBatch,
+              hashBatch: HashJoinBatch): Option[JoinGatherer] = {
             joinAttempts += 1
             if (retryJoin && joinAttempts == 1) {
               throw new GpuRetryOOM("retry join after projecting build keys")
             }
-            super.joinGathererLeftRight(leftKeys, leftData, rightKeys, rightData)
+            super.joinGathererLeftRight(leftKeys, leftData, rightKeys, rightData, hashBatch)
           }
         }
         withResource(iterator) { iter =>

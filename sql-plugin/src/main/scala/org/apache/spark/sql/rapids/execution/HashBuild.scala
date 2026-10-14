@@ -1007,3 +1007,71 @@ object HashBuildFactory {
     }
   }
 }
+
+/** Iterator-owned hash state for joins without an exchange-owned cached provider. */
+private[execution] final class IteratorHashBackendProvider(
+    regular: GpuJoinHashCache,
+    distinct: GpuJoinHashCache) extends HashBackendProvider {
+  override val readyStats: Option[JoinBuildSideStats] = None
+
+  override def backend(
+      probe: HashProbeContext,
+      request: BackendJoinRequest): HashProbeBackend = {
+    val selected = request.requiredBuildSide.getOrElse {
+      if (probe.selection == JoinBuildSideSelection.AUTO) probe.planBuildSide
+      else JoinBuildSideSelection.selectPhysicalBuildSide(probe.selection,
+        probe.planBuildSide, probe.leftRowCount, probe.rightRowCount)
+    }
+    val supported = request match {
+      case BackendJoinRequest.Inner | BackendJoinRequest.LeftOuter |
+          BackendJoinRequest.RightOuter | _: BackendJoinRequest.Distinct.Inner |
+          BackendJoinRequest.Distinct.LeftOuter | BackendJoinRequest.Distinct.RightOuter => true
+      case _ => false
+    }
+    if (selected != probe.planBuildSide || !supported) {
+      OnDemandHashBackendProvider.backend(probe, request)
+    } else {
+      new IteratorHashProbeBackend(selected, regular, distinct)
+    }
+  }
+}
+
+private final class IteratorHashProbeBackend(
+    override val buildSide: GpuBuildSide,
+    regular: GpuJoinHashCache,
+    distinct: GpuJoinHashCache) extends HashProbeBackend {
+  override val isCached: Boolean = false
+  override def outputRowCount(joinType: JoinType, probeKeys: Table): Option[Long] = None
+  override def restore(): Unit = {
+    regular.restore()
+    distinct.restore()
+  }
+  // The iterator owns both caches; a per-probe operation must not retire them.
+  override def close(): Unit = {}
+
+  override protected def doExecute(
+      request: BackendJoinRequest,
+      leftKeys: Table,
+      rightKeys: Table,
+      outputRowCount: Option[Long]): GatherMapsResult = {
+    request match {
+      case BackendJoinRequest.Distinct.LeftOuter =>
+        GatherMapsResult.makeFromRight(distinct.leftDistinctJoin(rightKeys, leftKeys))
+      case BackendJoinRequest.Distinct.RightOuter =>
+        GatherMapsResult.makeFromLeft(distinct.leftDistinctJoin(leftKeys, rightKeys))
+      case _ =>
+        val maps = request match {
+          case BackendJoinRequest.Inner =>
+            if (buildSide == GpuBuildRight) regular.innerJoin(rightKeys, leftKeys)
+            else regular.innerJoin(leftKeys, rightKeys).reverse
+          case BackendJoinRequest.LeftOuter => regular.leftJoin(rightKeys, leftKeys)
+          case BackendJoinRequest.RightOuter => regular.leftJoin(leftKeys, rightKeys).reverse
+          case _: BackendJoinRequest.Distinct.Inner =>
+            if (buildSide == GpuBuildRight) distinct.innerJoin(rightKeys, leftKeys)
+            else distinct.innerJoin(leftKeys, rightKeys).reverse
+          case _ => throw new IllegalStateException(s"unexpected iterator hash request $request")
+        }
+        GatherMapsResult(maps(0), maps(1))
+    }
+  }
+}

@@ -80,30 +80,38 @@ private class BooleanOuterJoinTracker(
     private var tracking: Option[SpillableColumnarBatch]) extends OuterJoinTracker {
   override def sizeInBytes: Long = tracking.get.sizeInBytes
 
+  private def validIndices(gatherIndices: ColumnView): Table = {
+    withResource(gatherIndices.copyToColumnVector()) { indices =>
+      withResource(new Table(indices)) { indexTable =>
+        withResource(Scalar.fromInt(Int.MinValue)) { invalid =>
+          withResource(gatherIndices.notEqualTo(invalid)) { valid =>
+            indexTable.filter(valid)
+          }
+        }
+      }
+    }
+  }
+
+  private def updatedTracking(indices: ColumnView): SpillableColumnarBatch = {
+    val table = withResource(tracking.get.getColumnarBatch()) { batch =>
+      GpuColumnVector.from(batch)
+    }
+    withResource(table) { current =>
+      withResource(Scalar.fromBool(false)) { matched =>
+        withResource(Table.scatter(Array(matched), indices, current)) { updated =>
+          SpillableColumnarBatch(GpuColumnVector.from(updated, Array[DataType](BooleanType)),
+            SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+        }
+      }
+    }
+  }
+
   override def update(gatherIndices: ColumnView): Unit = {
     if (gatherIndices.getRowCount > 0) {
-      withResource(gatherIndices.copyToColumnVector()) { indices =>
-        withResource(new Table(indices)) { indexTable =>
-          withResource(Scalar.fromInt(Int.MinValue)) { invalid =>
-            withResource(gatherIndices.notEqualTo(invalid)) { valid =>
-              withResource(indexTable.filter(valid)) { filtered =>
-                val updated = withResource(tracking.get.getColumnarBatch()) { batch =>
-                  withResource(GpuColumnVector.from(batch)) { table =>
-                    withResource(Scalar.fromBool(false)) { matched =>
-                      Table.scatter(Array(matched), filtered.getColumn(0), table)
-                    }
-                  }
-                }
-                val next = withResource(updated) { table =>
-                  SpillableColumnarBatch(GpuColumnVector.from(table, Array[DataType](BooleanType)),
-                    SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
-                }
-                closeOnExcept(next) { _ =>
-                  withResource(tracking) { _ => tracking = Some(next) }
-                }
-              }
-            }
-          }
+      withResource(validIndices(gatherIndices)) { filtered =>
+        val next = updatedTracking(filtered.getColumn(0))
+        closeOnExcept(next) { _ =>
+          withResource(tracking) { _ => tracking = Some(next) }
         }
       }
     }
