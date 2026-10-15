@@ -199,31 +199,41 @@ class BroadcastHashJoinSuite extends SparkQueryCompareTestSuite {
         "left")
   }
 
-  test("broadcast hash join reuse same broadcast in multiple joins plan") {
-    val conf = broadcastReuseConf.clone()
-      .set("spark.sql.exchange.reuse", "true")
-      .set("spark.rapids.sql.metrics.level", "DEBUG")
-    withGpuSparkSession(spark => {
-      val probe = streamedProbeDf(spark)
-      val build = broadcast(distinctBuildDf(spark))
-      val joined = probe
-        .join(build, Seq("join_key"), "inner")
-        .select("join_key", "probe_value")
-        .join(build, Seq("join_key"), "inner")
-        .select("join_key", "probe_value")
+  for (chainEnabled <- Seq(false, true)) {
+    test(s"broadcast hash join reuse same broadcast in multiple joins plan chain=$chainEnabled") {
+      val conf = broadcastReuseConf.clone()
+        .set(RapidsConf.ENABLE_JOIN_CHAIN.key, chainEnabled.toString)
+        .set("spark.sql.exchange.reuse", "true")
+        .set("spark.rapids.sql.metrics.level", "DEBUG")
+      withGpuSparkSession(spark => {
+        val probe = streamedProbeDf(spark)
+        val build = broadcast(distinctBuildDf(spark))
+        val joined = probe
+          .join(build, Seq("join_key"), "inner")
+          .select("join_key", "probe_value")
+          .join(build, Seq("join_key"), "inner")
+          .select("join_key", "probe_value")
 
-      assertResult(128)(joined.collect().length)
-      val plan = joined.queryExecution.executedPlan
-      val bhjs = PlanUtils.findOperators(plan, _.isInstanceOf[GpuBroadcastHashJoinExec])
-      val reusedExchanges = PlanUtils.findOperators(plan, _.isInstanceOf[ReusedExchangeExec])
-      assertResult(2)(bhjs.size)
-      assert(reusedExchanges.nonEmpty)
+        assertResult(128)(joined.collect().length)
+        val plan = joined.queryExecution.executedPlan
+        val bhjs = PlanUtils.findOperators(plan, _.isInstanceOf[GpuBroadcastHashJoinExec])
+        val reusedExchanges = PlanUtils.findOperators(plan, _.isInstanceOf[ReusedExchangeExec])
+        assertResult(2)(bhjs.size)
+        assert(reusedExchanges.nonEmpty)
 
-      val totalBuilds = bhjs.map(_.metrics("hashTableBuilds").value).sum
-      val totalReuses = bhjs.map(_.metrics("hashTableReuses").value).sum
-      assertResult(1L)(totalBuilds)
-      assert(totalReuses > 0L, s"expected at least one hash-table reuse, got $totalReuses")
-    }, conf)
+        val totalBuilds = bhjs.map(_.metrics("hashTableBuilds").value).sum
+        val totalReuses = bhjs.map(_.metrics("hashTableReuses").value).sum
+        if (chainEnabled) {
+          // Execution-time fusion retains the join nodes but uses chain-owned hash state.
+          val fusedTasks = bhjs.map(_.metrics(GpuMetric.JOIN_CHAIN_FUSED_TASKS).value).sum
+          assert(fusedTasks > 0L, s"expected fused join-chain tasks, got $fusedTasks")
+          assertResult(0L)(totalBuilds)
+        } else {
+          assertResult(1L)(totalBuilds)
+          assert(totalReuses > 0L, s"expected at least one hash-table reuse, got $totalReuses")
+        }
+      }, conf)
+    }
   }
 
   Seq("leftsemi", "leftanti").foreach { joinType =>
