@@ -1018,8 +1018,7 @@ private[execution] final class IteratorHashBackendProvider(
       probe: HashProbeContext,
       request: BackendJoinRequest): HashProbeBackend = {
     val selected = request.requiredBuildSide.getOrElse {
-      if (probe.selection == JoinBuildSideSelection.AUTO) probe.planBuildSide
-      else JoinBuildSideSelection.selectPhysicalBuildSide(probe.selection,
+      JoinBuildSideSelection.selectPhysicalBuildSide(probe.selection,
         probe.planBuildSide, probe.leftRowCount, probe.rightRowCount)
     }
     val supported = request match {
