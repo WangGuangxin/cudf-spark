@@ -66,6 +66,7 @@ object GpuFilterProjectExec extends Logging {
       case _: AttributeReference | _: GpuLiteral => true
       // Decimal wrappers and casts can throw without being fully described by hasSideEffects
       // in every Spark shim. Keep explicit guards and preserve their existing evaluation.
+      case a: GpuProjectAstExpression => safe(a.child)
       case c: GpuCast => decimalCast(c) && safe(c.child)
       case c: GpuCheckOverflow => c.nullOnOverflow && safe(c.child)
       case m: GpuDecimalMultiply => !m.failOnError && m.children.forall(safe)
@@ -99,12 +100,6 @@ object GpuFilterProjectExec extends Logging {
     case p @ GpuProjectExec(projects, f: GpuFilterExec, allowSplit) =>
       if (allowSplit && f.coalesceAfter && eligible(f.condition, projects)) {
         GpuFilterProjectExec(f.condition, projects, f.child, useAst = false)
-      } else {
-        skipped(p, explain)
-      }
-    case p @ GpuProjectAstExec(projects, f: GpuFilterExec) =>
-      if (f.coalesceAfter && eligible(f.condition, projects)) {
-        GpuFilterProjectExec(f.condition, projects, f.child, useAst = true)
       } else {
         skipped(p, explain)
       }

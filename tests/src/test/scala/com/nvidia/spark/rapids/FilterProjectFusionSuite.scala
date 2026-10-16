@@ -72,7 +72,9 @@ class FilterProjectFusionSuite extends SparkQueryCompareTestSuite {
             _.isInstanceOf[GpuFilterProjectExec])
           assert(fused.nonEmpty == enabled, df.queryExecution.executedPlan.toString)
           if (enabled) {
-            assert(fused.forall(_.asInstanceOf[GpuFilterProjectExec].useAst == ast))
+            val hasAst = fused.exists(_.expressions.exists(_.exists(
+              _.isInstanceOf[GpuProjectAstExpression])))
+            assert(hasAst == ast)
           }
         }, configuration(enabled, ast))
       }

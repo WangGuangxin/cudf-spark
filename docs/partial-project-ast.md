@@ -36,9 +36,10 @@ preserved. Native compiled expressions are cached per task and released on task
 completion, including early downstream termination. Existing pre-splitting,
 OOM retries and nondeterministic checkpoints continue to apply.
 
-The existing `projectAstEnabled` flag retains precedence when the entire
-projection qualifies for `GpuProjectAstExec`. If the whole projection does not
-qualify, the new flag independently controls partial AST evaluation.
+On main, the existing `projectAstEnabled` flag selects per-expression
+`GpuProjectAstExpression` evaluation inside `GpuProjectExec` and retains precedence.
+The new flag controls partial AST evaluation when `projectAstEnabled=false`, without
+wrapping the existing AST backend a second time.
 
 Correctness coverage is in `PartialProjectAstSuite` and
 `PartialProjectAstRetrySuite`, including CPU/off/on comparisons, mixed string and

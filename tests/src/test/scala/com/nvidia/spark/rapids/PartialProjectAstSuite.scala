@@ -194,8 +194,9 @@ class PartialProjectAstSuite extends SparkQueryCompareTestSuite {
       withGpuSparkSession({ spark =>
         val df = data(spark).selectExpr("b * 2 + 1 as arithmetic")
         df.collect()
-        val legacy = PlanUtils.findOperators(df.queryExecution.executedPlan,
-          _.isInstanceOf[GpuProjectAstExec])
+        val legacy = projections(df).flatMap(_.exprTiers.flatten).flatMap(_.collect {
+          case expression: GpuProjectAstExpression => expression
+        })
         assert(legacy.nonEmpty == allAst)
         assert(astExpressions(projections(df)).nonEmpty == (partial && !allAst))
       }, configuration(partial).set(RapidsConf.ENABLE_PROJECT_AST.key, allAst.toString))
