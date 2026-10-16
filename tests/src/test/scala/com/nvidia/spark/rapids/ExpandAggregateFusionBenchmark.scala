@@ -25,6 +25,7 @@ import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.spill.SpillFramework
 
 import org.apache.spark.SparkConf
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, NamedExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.Partial
 import org.apache.spark.sql.internal.SQLConf
@@ -33,7 +34,7 @@ import org.apache.spark.sql.types.{IntegerType, LongType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 /** Manual partial-stage benchmark, including Expand coalescing and the existing merge path. */
-object ExpandAggregateFusionBenchmark {
+object ExpandAggregateFusionBenchmark extends Logging {
   def main(args: Array[String]): Unit = {
     require(args.length == 5 || args.length == 6,
       "Arguments: enabled branches cardinality inputColumns rmmLogFile [inputBatches]")
@@ -164,7 +165,7 @@ object ExpandAggregateFusionBenchmark {
             run()
             (System.nanoTime() - start) / 1e6
           }.sorted
-          println(s"enabled=$enabled branches=$branchCount cardinality=$cardinality " +
+          logInfo(s"enabled=$enabled branches=$branchCount cardinality=$cardinality " +
             s"width=$width rows=$rows inputBatches=$inputBatches iterations=$iterations " +
             s"medianMs=${times(iterations / 2)} " +
             s"peakExtraBytes=${Rmm.getScopedMaximumBytesAllocated} " +
