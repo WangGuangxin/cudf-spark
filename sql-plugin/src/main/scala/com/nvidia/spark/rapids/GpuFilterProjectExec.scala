@@ -349,13 +349,14 @@ private[rapids] class GpuFilterProject(bound: BoundFilterProject) extends AutoCl
         }
       } else {
         val indices = mask.map { m =>
-          withResource(Scalar.fromInt(0)) { start =>
+          val indexTable = withResource(Scalar.fromInt(0)) { start =>
             withResource(ColumnVector.sequence(start, batch.numRows())) { sequence =>
-              withResource(new Table(sequence)) { table =>
-                withResource(table.filter(m)) { selected =>
-                  selected.getColumn(0).incRefCount()
-                }
-              }
+              new Table(sequence)
+            }
+          }
+          withResource(indexTable) { table =>
+            withResource(table.filter(m)) { selected =>
+              selected.getColumn(0).incRefCount()
             }
           }
         }
