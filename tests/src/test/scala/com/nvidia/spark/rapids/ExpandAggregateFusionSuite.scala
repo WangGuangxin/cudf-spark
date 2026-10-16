@@ -61,10 +61,8 @@ object ExpandAggregateFusionSuite {
 }
 
 class ExpandAggregateFusionSuite extends SparkQueryCompareTestSuite {
-  private def configuration(enabled: Boolean, filterFusion: Boolean = false,
-      aqe: Boolean = false): SparkConf = new SparkConf()
+  private def configuration(enabled: Boolean, aqe: Boolean = false): SparkConf = new SparkConf()
     .set(RapidsConf.ENABLE_EXPAND_AGGREGATE_FUSION.key, enabled.toString)
-    .set(RapidsConf.ENABLE_FILTER_PROJECT_FUSION.key, filterFusion.toString)
     .set("spark.sql.adaptive.enabled", aqe.toString)
     .set("spark.sql.ansi.enabled", "false")
     .set("spark.sql.shuffle.partitions", "3")
@@ -176,22 +174,21 @@ class ExpandAggregateFusionSuite extends SparkQueryCompareTestSuite {
     }
   }
 
-  for (filterFusion <- Seq(false, true); aqe <- Seq(false, true)) {
-    test(s"fusion flags are independent across adaptive stages: filter=$filterFusion AQE=$aqe") {
+  for (enabled <- Seq(false, true); aqe <- Seq(false, true)) {
+    test(s"fusion with filter/project across adaptive stages: enabled=$enabled AQE=$aqe") {
       def query(spark: SparkSession): DataFrame = {
         data(spark).filter("a > 0").selectExpr("a", "b", "v", "a + 1 AS next")
           .createOrReplaceTempView("fusion_combined")
         spark.sql("SELECT next,b,count(v),sum(v) FROM fusion_combined GROUP BY CUBE(next,b)")
       }
-      val cpu = withCpuSparkSession(s => query(s).collect(), configuration(false, false, aqe))
+      val cpu = withCpuSparkSession(s => query(s).collect(), configuration(false, aqe))
       withGpuSparkSession({ spark =>
         val df = query(spark)
         compareResults(true, 0.0, cpu, df.collect())
         assert(PlanUtils.findOperators(df.queryExecution.executedPlan,
-          _.isInstanceOf[GpuExpandAggregateExec]).nonEmpty, df.queryExecution.executedPlan.toString)
-        assert(PlanUtils.findOperators(df.queryExecution.executedPlan,
-          _.isInstanceOf[GpuFilterProjectExec]).nonEmpty == filterFusion)
-      }, configuration(true, filterFusion, aqe))
+          _.isInstanceOf[GpuExpandAggregateExec]).nonEmpty == enabled,
+          df.queryExecution.executedPlan.toString)
+      }, configuration(enabled, aqe))
     }
   }
 
@@ -328,11 +325,11 @@ class ExpandAggregateFusionSuite extends SparkQueryCompareTestSuite {
     }, configuration(true))
   }
 
-  test("fusion defaults off independently of filter/project fusion") {
+  test("fusion defaults off and can be explicitly enabled") {
+    assert(!new RapidsConf(new SparkConf()).isExpandAggregateFusionEnabled)
     val conf = new RapidsConf(new SparkConf()
-      .set(RapidsConf.ENABLE_FILTER_PROJECT_FUSION.key, "true"))
-    assert(!conf.isExpandAggregateFusionEnabled)
-    assert(conf.isFilterProjectFusionEnabled)
+      .set(RapidsConf.ENABLE_EXPAND_AGGREGATE_FUSION.key, "true"))
+    assert(conf.isExpandAggregateFusionEnabled)
   }
 
   test("reuse requires a live source key in the same expanded output position") {
