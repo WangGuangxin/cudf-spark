@@ -22,6 +22,7 @@ import ai.rapids.cudf.{ColumnVector, Cuda, Rmm, RmmAllocationMode, Scalar}
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.{GpuAdd, GpuGreaterThan}
@@ -29,7 +30,7 @@ import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 /** Manual operator microbenchmark; excludes scan, scheduling, and spill/retry overhead. */
-object FilterProjectFusionBenchmark {
+object FilterProjectFusionBenchmark extends Logging {
   def main(args: Array[String]): Unit = {
     require(args.length == 5,
       "Arguments: enabled passPercent inputColumns arithmeticDepth rmmLogFile")
@@ -82,7 +83,7 @@ object FilterProjectFusionBenchmark {
               run()
               (System.nanoTime() - start) / 1e6
             }.sorted
-            println(s"enabled=$enabled passPercent=$passPercent width=$width depth=$depth " +
+            logInfo(s"enabled=$enabled passPercent=$passPercent width=$width depth=$depth " +
               s"rows=$rows iterations=$iterations medianMs=${times(iterations / 2)} " +
               s"peakExtraBytes=${Rmm.getScopedMaximumBytesAllocated}")
           } finally {
