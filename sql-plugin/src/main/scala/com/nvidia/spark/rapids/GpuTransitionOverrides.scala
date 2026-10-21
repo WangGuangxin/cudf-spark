@@ -955,6 +955,8 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
         if (rapidsConf.isFileScanPrunePartitionEnabled) {
           updatedPlan = prunePartitionForFileSourceScan(updatedPlan)
         }
+        updatedPlan = GpuJoinChainFilterExec.fuse(updatedPlan)
+        updatedPlan = GpuJoinChainPipelineExec.fuse(updatedPlan)
         if (rapidsConf.isFilterProjectFusionEnabled) {
           updatedPlan = GpuFilterProjectExec.fuse(updatedPlan, rapidsConf.shouldExplain)
         }

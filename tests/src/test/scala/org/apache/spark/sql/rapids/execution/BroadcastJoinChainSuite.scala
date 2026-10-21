@@ -27,7 +27,8 @@ import org.apache.spark.SparkConf
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, ExprId}
 import org.apache.spark.sql.functions.{broadcast, col}
-import org.apache.spark.sql.types.{DataType, IntegerType}
+import org.apache.spark.sql.rapids.{GpuAnd, GpuGreaterThan, GpuLessThan, GpuMultiply}
+import org.apache.spark.sql.types.{BooleanType, DataType, IntegerType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
@@ -84,7 +85,11 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
       action: Int => Unit = _ => (), targetSize: Long = options.targetSize,
       inputBatchRows: Int = 120, dimensionRows: Seq[Seq[Row]] = dims,
       retryKeys: Boolean = false, expectedHashBuilds: Option[Long] = None,
-      reuseHash: Boolean = true, retryStats: Boolean = false): Seq[Row] = {
+      reuseHash: Boolean = true, retryStats: Boolean = false,
+      terminal: Option[JoinChainFilter] = None,
+      filterAction: () => Unit = () => (),
+      projectAction: () => Unit = () => (),
+      tailFilters: Seq[JoinChainFilter] = Nil): Seq[Row] = {
     val builds = dimensionRows.zip(dims).take(ss.length).safeMap { case (rows, shape) =>
       val width = rows.headOption.map(_.size).getOrElse(shape.head.size)
       withResource(batch(rows, width))(LazySpillableColumnarBatch(_, "test_dim"))
@@ -103,8 +108,11 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
         val input = fact.grouped(inputBatchRows).map(batch(_, 2))
         val attrs = (0 until 2).map(i => AttributeReference(s"c$i", IntegerType)())
         val result = withResource(new JoinChainIterator(input, attrs, builds, keys, classified,
-            options.copy(targetSize = targetSize, hashReuseEnabled = reuseHash)) {
+            options.copy(targetSize = targetSize, hashReuseEnabled = reuseHash),
+            filter = terminal, tailFilters = tailFilters) {
           override protected def beforeProbe(stage: Int): Unit = action(stage)
+          override protected def beforeFilter(): Unit = filterAction()
+          override protected def beforeProject(): Unit = projectAction()
         }) { iterator =>
           val outputRows = iterator.flatMap { output =>
             withResource(output) { gpu =>
@@ -230,6 +238,288 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
       assert(metrics.head.value == expected(rows, ss.take(1), builds.take(1)).size)
       assert(metrics.last.value == result.size)
     }
+  }
+
+  private def terminalFilter(full: GpuExpression, compact: GpuExpression,
+      ordinals: Seq[Int]): JoinChainFilter = JoinChainFilter(ordinals,
+    GpuTieredProject(Seq(Seq(compact))), GpuTieredProject(Seq(Seq(full))),
+    inputRows = new LocalGpuMetric, avoidedPayloadRows = new LocalGpuMetric)
+
+  for (duplicates <- Seq(false, true); mode <- Seq("partial", "all", "none")) {
+    test(s"deferred filter gathers predicate columns across sources duplicates=$duplicates $mode") {
+      val dimensions = if (duplicates) duplicateDims else dims
+      val rows = fact ++ Seq(Seq[Integer](1, null), Seq[Integer](2, 1000))
+      val full = mode match {
+        case "partial" => GpuLessThan(ref(1), ref(2))
+        case "all" => GpuGreaterThan(ref(2), GpuLiteral(0, IntegerType))
+        case _ => GpuLessThan(ref(2), GpuLiteral(0, IntegerType))
+      }
+      val compact = mode match {
+        case "partial" => GpuLessThan(ref(0), ref(1))
+        case "all" => GpuGreaterThan(ref(0), GpuLiteral(0, IntegerType))
+        case _ => GpuLessThan(ref(0), GpuLiteral(0, IntegerType))
+      }
+      val filter = terminalFilter(full, compact,
+        if (mode == "partial") Seq(1, 2) else Seq(2))
+      val candidates = expected(rows, stages, dimensions)
+      val oracle = candidates.filter { row =>
+        mode match {
+          case "partial" => row(1) != null && row(2) != null && row(1) < row(2)
+          case "all" => row(2) != null && row(2) > 0
+          case _ => row(2) != null && row(2) < 0
+        }
+      }
+      val metrics = stages.map(_ => new LocalGpuMetric)
+      val ss = stages.zip(metrics).map { case (stage, metric) => stage.copy(outputRows = metric) }
+      assert(sorted(run(rows, ss, dimensionRows = dimensions, targetSize = 320,
+        terminal = Some(filter))) == sorted(oracle))
+      assert(filter.inputRows.value == candidates.size)
+      assert(filter.avoidedPayloadRows.value == candidates.size - oracle.size)
+      // The join's output still counts candidates, rather than the filtered result.
+      assert(metrics.last.value == candidates.size)
+    }
+  }
+
+  for (split <- Seq(false, true); spill <- Seq(false, true)) {
+    test(s"deferred filter retries preserve maps, payloads and metrics split=$split spill=$spill") {
+      val rows = (0 until 48).flatMap(_ => fact)
+      val full = GpuAnd(GpuLessThan(ref(1), ref(2)),
+        GpuGreaterThan(ref(1), GpuLiteral(20, IntegerType)))
+      val compact = GpuAnd(GpuLessThan(ref(0), ref(1)),
+        GpuGreaterThan(ref(0), GpuLiteral(20, IntegerType)))
+      val filter = terminalFilter(full, compact, Seq(1, 2))
+      var injected = false
+      val result = run(rows, stages, inputBatchRows = 240, terminal = Some(filter),
+        filterAction = () => {
+          if (spill) {
+            SpillFramework.stores.deviceStore.spill(Long.MaxValue)
+            SpillFramework.stores.hostStore.spill(Long.MaxValue)
+          }
+          if (!injected) {
+            injected = true
+            if (split) throw new GpuSplitAndRetryOOM("deferred predicate test")
+            else throw new GpuRetryOOM("deferred predicate test")
+          }
+        })
+      val candidates = expected(rows, stages)
+      val oracle = candidates.filter(row => row(1) < row(2) && row(1) > 20)
+      assert(injected)
+      assert(sorted(result) == sorted(oracle))
+      assert(filter.inputRows.value == candidates.size)
+      assert(filter.avoidedPayloadRows.value == candidates.size - oracle.size)
+    }
+  }
+
+  test("deferred filter rejects an all-null mask without materializing payloads") {
+    val rows = Seq(Seq[Integer](1, null), Seq[Integer](2, null))
+    val filter = terminalFilter(GpuLessThan(ref(1), ref(2)),
+      GpuLessThan(ref(0), ref(1)), Seq(1, 2))
+    assert(run(rows, stages, terminal = Some(filter)).isEmpty)
+    assert(filter.inputRows.value == 2)
+    assert(filter.avoidedPayloadRows.value == 2)
+  }
+
+  test("deferred predicate allocations recover from an injected RMM retry") {
+    val filter = terminalFilter(GpuLessThan(ref(1), ref(2)),
+      GpuLessThan(ref(0), ref(1)), Seq(1, 2))
+    var injected = false
+    val result = run(fact, stages, terminal = Some(filter), filterAction = () => {
+      if (!injected) {
+        injected = true
+        RmmSpark.forceRetryOOM(RmmSpark.getCurrentThreadId, 1,
+          RmmSpark.OomInjectionType.GPU.ordinal, 0)
+      }
+    })
+    val candidates = expected(fact, stages)
+    assert(sorted(result) == sorted(candidates.filter(row => row(1) < row(2))))
+    assert(filter.inputRows.value == candidates.size)
+    assert(RmmSpark.getAndResetNumRetryThrow(1) > 0)
+  }
+
+  test("deferred predicate failure releases maps and payload owners") {
+    val filter = terminalFilter(GpuLessThan(ref(1), ref(2)),
+      GpuLessThan(ref(0), ref(1)), Seq(1, 2))
+    intercept[IllegalStateException] {
+      run(fact, stages, terminal = Some(filter),
+        filterAction = () => throw new IllegalStateException("predicate failed"))
+    }
+    assert(SpillFramework.stores.deviceStore.numHandles == 0)
+    assert(SpillFramework.stores.hostStore.numHandles == 0)
+  }
+
+  test("deferred filter supports semi source placeholders and an empty build") {
+    val (ss, dimensions) = semiScenario(Set(0, 2), nullsEqual = true)
+    val filter = terminalFilter(GpuGreaterThan(ref(1), GpuLiteral(20, IntegerType)),
+      GpuGreaterThan(ref(0), GpuLiteral(20, IntegerType)), Seq(1))
+    val oracle = expected(fact, ss, dimensions).filter(row => row(1) > 20)
+    assert(sorted(run(fact, ss, dimensionRows = dimensions, terminal = Some(filter))) ==
+      sorted(oracle))
+    assert(run(fact, ss, dimensionRows = dimensions.updated(1, Seq.empty),
+      terminal = Some(filter)).isEmpty)
+  }
+
+  private def projectedTerminal(ordinals: Seq[Int], projects: Seq[GpuExpression],
+      predicate: Option[JoinChainFilter] = None): JoinChainFilter = {
+    val base = predicate.getOrElse(terminalFilter(GpuLiteral(true, BooleanType),
+      GpuLiteral(true, BooleanType), Nil))
+    base.copy(projection = Some(JoinChainProjection(ordinals,
+      GpuTieredProject(Seq(projects)), new LocalGpuMetric)), filterEnabled = predicate.isDefined)
+  }
+
+  for (duplicates <- Seq(false, true); filtering <- Seq(false, true)) {
+    test(s"deferred computed projection preserves NULLs dup=$duplicates filter=$filtering") {
+      val dimensions = if (duplicates) duplicateDims else dims
+      val rows = fact ++ Seq(Seq[Integer](1, null), Seq[Integer](2, 1000))
+      val predicate = if (filtering) Some(terminalFilter(
+        GpuLessThan(ref(1), ref(2)), GpuLessThan(ref(0), ref(1)), Seq(1, 2))) else None
+      val projection = projectedTerminal(Seq(1, 2),
+        Seq(GpuMultiply(ref(0), ref(1), failOnError = false)(), ref(0), ref(0)), predicate)
+      val candidates = expected(rows, stages, dimensions)
+        .filter(row => !filtering || (row(1) != null && row(1) < row(2)))
+      val oracle = candidates.map { row =>
+        Seq[Integer](if (row(1) == null) null else row(1) * row(2), row(1), row(1))
+      }
+      val result = run(rows, stages, dimensionRows = dimensions, terminal = Some(projection),
+        targetSize = 128)
+      assert(sorted(result) == sorted(oracle))
+      assert(projection.projection.get.inputColumnsPruned.value > 0)
+    }
+  }
+
+  for (countOnly <- Seq(false, true); retry <- Seq(false, true)) {
+    test(s"tail filters retain pruned source maps and retry metrics " +
+        s"count=$countOnly retry=$retry") {
+      val first = terminalFilter(GpuGreaterThan(ref(1), GpuLiteral(20, IntegerType)),
+        GpuGreaterThan(ref(0), GpuLiteral(20, IntegerType)), Seq(1))
+        .copy(selectedRows = new LocalGpuMetric)
+      val second = terminalFilter(GpuLessThan(ref(5), GpuLiteral(800, IntegerType)),
+        GpuLessThan(ref(0), GpuLiteral(800, IntegerType)), Seq(5))
+        .copy(selectedRows = new LocalGpuMetric)
+      val projection = if (countOnly) projectedTerminal(Nil, Nil)
+        else projectedTerminal(Seq(1), Seq(ref(0)))
+      val rows = fact :+ Seq[Integer](1, null)
+      var injected = false
+      val result = run(rows, stages, terminal = Some(projection),
+        tailFilters = Seq(first, second), filterAction = () => {
+          if (retry && !injected) {
+            injected = true
+            throw new GpuRetryOOM("pending tail filter test")
+          }
+        })
+      val candidates = expected(rows, stages)
+      val selected = candidates.filter(row => row(1) != null && row(1) > 20)
+      val oracle = selected.filter(_(5) < 800).map { row =>
+        if (countOnly) Seq.empty[Integer] else Seq(row(1))
+      }
+      assert(sorted(result) == sorted(oracle))
+      assert(first.inputRows.value == candidates.size)
+      assert(first.selectedRows.value == selected.size)
+      assert(second.inputRows.value == selected.size)
+      assert(second.selectedRows.value == oracle.size)
+      assert(injected == retry)
+    }
+  }
+
+  for (constant <- Seq(false, true); nullPredicate <- Seq(false, true)) {
+    test(s"count-only maps preserve cardinality constant=$constant null mask=$nullPredicate") {
+      val predicate = if (nullPredicate) Some(terminalFilter(
+        GpuLiteral(null, BooleanType), GpuLiteral(null, BooleanType), Nil)) else None
+      val projection = projectedTerminal(Nil,
+        if (constant) Seq(GpuLiteral(7, IntegerType)) else Nil, predicate)
+      val result = run(fact, stages, terminal = Some(projection))
+      val count = if (nullPredicate) 0 else expected(fact, stages).size
+      val row = if (constant) Seq[Integer](7) else Seq.empty[Integer]
+      assert(result == Seq.fill(count)(row))
+    }
+  }
+
+  for (split <- Seq(false, true)) {
+    test(s"projection OOM restores gather offsets without losing or repeating rows split=$split") {
+      val rows = (0 until 48).flatMap(_ => fact)
+      val projection = projectedTerminal(Seq(1, 2),
+        Seq(GpuMultiply(ref(0), ref(1), failOnError = false)()))
+      var injected = false
+      val result = run(rows, stages, terminal = Some(projection), inputBatchRows = rows.size,
+        targetSize = 128L * 1024 * 1024, projectAction = () => {
+          if (!injected) {
+            injected = true
+            if (split) throw new GpuSplitAndRetryOOM("deferred project test")
+            else throw new GpuRetryOOM("deferred project test")
+          }
+        })
+      val oracle = expected(rows, stages).map(row => Seq[Integer](row(1) * row(2)))
+      assert(injected)
+      assert(sorted(result) == sorted(oracle))
+    }
+  }
+
+  test("projected row maps spill before gathering the final dependency columns") {
+    val projection = projectedTerminal(Seq(1), Seq(ref(0)))
+    var spilled = 0L
+    val result = run(fact, stages, terminal = Some(projection), action = stage => {
+      if (stage == 2) {
+        spilled += SpillFramework.stores.deviceStore.spill(Long.MaxValue)
+        SpillFramework.stores.hostStore.spill(Long.MaxValue)
+      }
+    })
+    assert(spilled > 0)
+    assert(sorted(result) == sorted(expected(fact, stages).map(row => Seq(row(1)))))
+  }
+
+  for (split <- Seq(false, true); spill <- Seq(false, true)) {
+    test(s"source and inter-probe filters preserve computed keys split=$split spill=$spill") {
+      val firstFilter = terminalFilter(GpuGreaterThan(ref(1), GpuLiteral(20, IntegerType)),
+        GpuGreaterThan(ref(0), GpuLiteral(20, IntegerType)), Seq(1))
+      val secondFilter = terminalFilter(GpuLessThan(ref(1), ref(4)),
+        GpuLessThan(ref(0), ref(1)), Seq(1, 4))
+      val key = JoinChainProjection(Seq(3), GpuTieredProject(Seq(Seq(
+        GpuMultiply(ref(0), GpuLiteral(1, IntegerType), failOnError = false)()))))
+      val ss = Seq(
+        stages.head.copy(virtualInput = true, inputFilters = Seq(firstFilter)),
+        JoinChainStage(Seq(ref(0)), key.ordinals, 0 until 5, GpuBuildRight, false,
+          inputFilters = Seq(secondFilter), streamKeyProject = Some(key), virtualInput = true))
+      val rows = fact ++ Seq(Seq[Integer](1, null), Seq[Integer](1, 150))
+      var injected = false
+      val result = run(rows, ss, dimensionRows = duplicateDims.take(2),
+        action = stage => {
+          if (stage == 1 && spill) {
+            SpillFramework.stores.deviceStore.spill(Long.MaxValue)
+            SpillFramework.stores.hostStore.spill(Long.MaxValue)
+          }
+          if (stage == 1 && !injected) {
+            injected = true
+            if (split) throw new GpuSplitAndRetryOOM("pre-probe predicate")
+            else throw new GpuRetryOOM("pre-probe predicate")
+          }
+        })
+      val oracle = rows.filter(row => row(1) != null && row(1) > 20).flatMap { row =>
+        duplicateDims.head.filter(d => row.head != null && row.head == d.head).flatMap { d =>
+          val joined = row ++ d
+          if (joined(1) < joined(4)) {
+            duplicateDims(1).filter(_.head == joined(3)).map(joined ++ _)
+          } else Nil
+        }
+      }
+      assert(injected)
+      assert(sorted(result) == sorted(oracle))
+    }
+  }
+
+  test("an all-null source filter produces no probes or materialized payload") {
+    val predicate = terminalFilter(GpuGreaterThan(ref(1), GpuLiteral(0, IntegerType)),
+      GpuGreaterThan(ref(0), GpuLiteral(0, IntegerType)), Seq(1))
+    val ss = stages.take(1).map(_.copy(virtualInput = true, inputFilters = Seq(predicate)))
+    assert(run(Seq(Seq[Integer](1, null)), ss,
+      action = _ => fail("rejected source rows must not probe")).isEmpty)
+  }
+
+  test("constant source predicates work with a row-count-only sink") {
+    val falseExpr = GpuLiteral(false, BooleanType)
+    val predicate = terminalFilter(falseExpr, falseExpr, Nil)
+    val ss = stages.take(1).map(_.copy(virtualInput = true, inputFilters = Seq(predicate)))
+    val terminal = projectedTerminal(Nil, Nil)
+    assert(run(fact, ss, terminal = Some(terminal),
+      action = _ => fail("a constant false source predicate must not probe")).isEmpty)
   }
 
   private val duplicateDims = Seq(
@@ -583,8 +873,8 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
     assert(RmmSpark.getAndResetNumRetryThrow(1) > 0)
   }
 
-  for (duplicates <- Seq(false, true)) {
-    test(s"early close releases input, payloads and maps duplicates=$duplicates") {
+  for (duplicates <- Seq(false, true); deferred <- Seq(false, true)) {
+    test(s"early close releases input, payloads and maps duplicates=$duplicates filter=$deferred") {
       val dimensions = if (duplicates) duplicateDims else dims
       val builds = dimensions.safeMap { rows =>
         withResource(batch(rows, rows.head.size))(LazySpillableColumnarBatch(_, "test_dim"))
@@ -596,7 +886,10 @@ class BroadcastJoinChainSuite extends RmmSparkRetrySuiteBase {
             val attrs = (0 until 2).map(i => AttributeReference(s"c$i", IntegerType)())
             withResource(new JoinChainIterator(input, attrs, builds, keys,
                 GpuJoinChain.classifyBuildKeys(keys, stages),
-                options.copy(targetSize = if (duplicates) 320 else options.targetSize))) {
+                options.copy(targetSize = if (duplicates) 320 else options.targetSize),
+                filter = if (deferred) Some(terminalFilter(
+                  GpuLessThan(ref(1), ref(2)), GpuLessThan(ref(0), ref(1)), Seq(1, 2)))
+                  else None)) {
               iterator =>
               assert(iterator.hasNext)
             }
@@ -672,8 +965,10 @@ class BroadcastJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       .set("spark.sql.autoBroadcastJoinThreshold", "-1")
       .set(RapidsConf.GPU_BATCH_SIZE_BYTES.key, "1024"), sort = true)(identity)
 
-  test("reference projections and narrow chains participate; computed projections use eager") {
+  test("reference, computed and narrow projection chains participate") {
     val conf = new SparkConf().set("spark.sql.adaptive.enabled", "false")
+      .set("spark.rapids.sql.projectAstEnabled", "false")
+      .set("spark.rapids.sql.projectPartialAstEnabled", "false")
       .set("spark.sql.autoBroadcastJoinThreshold", "-1")
     withGpuSparkSession(spark => {
       val df = query(spark, duplicates = false)
@@ -689,7 +984,7 @@ class BroadcastJoinChainQuerySuite extends SparkQueryCompareTestSuite {
       val outer = PlanUtils.findOperators(computed.queryExecution.executedPlan,
         _.isInstanceOf[GpuBroadcastHashJoinExecBase]).head
         .asInstanceOf[GpuBroadcastHashJoinExecBase]
-      assert(GpuJoinChain.chainLength(outer) == 1)
+      assert(GpuJoinChain.chainLength(outer) >= 2)
 
       val narrow = spark.range(0, 40).selectExpr("id AS k")
         .join(broadcast(spark.range(0, 30).selectExpr("id AS d1")), col("k") === col("d1"))

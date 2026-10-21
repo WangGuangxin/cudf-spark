@@ -16,7 +16,7 @@
 
 package org.apache.spark.sql.rapids.execution
 
-import ai.rapids.cudf.{ColumnVector, ColumnView, DType, GroupByAggregation, GroupByOptions, NullEquality, NullPolicy, OutOfBoundsPolicy, Table}
+import ai.rapids.cudf.{ColumnVector, ColumnView, DType, GroupByAggregation, GroupByOptions, NullEquality, NullPolicy, OutOfBoundsPolicy, Scalar, Table}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
@@ -24,7 +24,8 @@ import com.nvidia.spark.rapids.RmmRapidsRetryIterator.{withRestoreOnRetry, withR
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression,
+  NamedExpression}
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftSemi}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.types.{ArrayType, BinaryType, IntegerType, MapType, StructType}
@@ -96,9 +97,64 @@ private[execution] case class JoinChainStage(
     joinTime: GpuMetric = NoopMetric,
     isLeftSemi: Boolean = false,
     buildKeysUnique: Boolean = true,
-    maxBuildMatches: Long = 1L)
+    maxBuildMatches: Long = 1L,
+    inputFilters: Seq[JoinChainFilter] = Nil,
+    streamKeyProject: Option[JoinChainProjection] = None,
+    virtualInput: Boolean = false)
 
-/** Fuse only a local stream-side chain. Exchanges, filters and computed projections end a chain. */
+/** Projection bound to the distinct source columns needed after filtering, including no columns. */
+case class JoinChainProjection(
+    ordinals: Seq[Int],
+    expressions: GpuTieredProject,
+    inputColumnsPruned: GpuMetric = NoopMetric) {
+  // Include validity bits when budgeting computed output alongside gathered dependencies.
+  val extraBitsPerRow: Int = expressions.outputExprs.map { expr =>
+    expr.dataType.defaultSize * 8 + (if (expr.nullable) 1 else 0)
+  }.sum
+
+  def apply(input: ColumnarBatch): ColumnarBatch = expressions.project(input)
+
+  def eager(input: Iterator[ColumnarBatch]): Iterator[ColumnarBatch] = input.flatMap { batch =>
+    val selected = withResource(batch)(GpuJoinChain.select(_, ordinals))
+    val owned = SpillableColumnarBatch(selected, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+    expressions.projectAndCloseStreamingWithSplitRetry(owned)
+  }
+}
+
+/** A deferred terminal predicate/projection and the equivalent ordinary fallback. */
+case class JoinChainFilter(
+    ordinals: Seq[Int],
+    predicate: GpuTieredProject,
+    fullPredicate: GpuTieredProject,
+    inputRows: GpuMetric = NoopMetric,
+    inputBatches: GpuMetric = NoopMetric,
+    avoidedPayloadRows: GpuMetric = NoopMetric,
+    fusedTasks: GpuMetric = NoopMetric,
+    filterTime: GpuMetric = NoopMetric,
+    joinCondition: Option[Expression] = None,
+    projection: Option[JoinChainProjection] = None,
+    filterEnabled: Boolean = true,
+    filterOnResidualFallback: Boolean = false,
+    fallbackProjection: Option[JoinChainProjection] = None,
+    selectedRows: GpuMetric = NoopMetric,
+    selectedBatches: GpuMetric = NoopMetric) {
+  def finish(input: Iterator[ColumnarBatch]): Iterator[ColumnarBatch] =
+    fallbackProjection.orElse(projection).map(_.eager(input)).getOrElse(input)
+
+  def eager(input: Iterator[ColumnarBatch]): Iterator[ColumnarBatch] = {
+    val selected = if (filterEnabled) input.flatMap { batch =>
+      inputRows += batch.numRows()
+      inputBatches += 1
+      GpuFilter.filterAndClose(batch, fullPredicate, NoopMetric, NoopMetric, filterTime)
+    } else input
+    finish(selected)
+  }
+
+  def residualFallback(input: Iterator[ColumnarBatch]): Iterator[ColumnarBatch] =
+    if (filterOnResidualFallback) eager(input) else finish(input)
+}
+
+/** A local execution pipeline; exchanges and unsupported operators remain stage boundaries. */
 object GpuJoinChain extends Logging {
   /** Prefix for the per-join diagnostic line, so a whole benchmark run can be grepped at once. */
   private val LOG_TAG = "RAPIDS_JOIN_CHAIN"
@@ -119,13 +175,25 @@ object GpuJoinChain extends Logging {
     }
     def broadcast: Boolean = plan.isInstanceOf[GpuBroadcastHashJoinExecBase]
   }
-  private case class Link(node: Node, projection: Seq[Int])
+  private case class VirtualInput(
+      attributes: Seq[Attribute],
+      keys: Seq[Expression],
+      filters: Seq[(GpuFilterExec, Expression)],
+      eagerOperations: Seq[SparkPlan])
+  private case class Link(node: Node, projection: Seq[Int],
+      virtualInput: Option[VirtualInput] = None, eagerCondition: Option[Expression] = None)
   /** `break` records why the chain stopped growing past `input`, for diagnostics. */
-  private case class Chain(input: SparkPlan, links: Seq[Link], break: ChainBreak)
+  private case class Chain(input: SparkPlan, links: Seq[Link], break: ChainBreak,
+      rawOutput: Seq[Attribute] = Nil, outputExpressions: Seq[Expression] = Nil,
+      tailFilters: Seq[(GpuFilterExec, Expression)] = Nil,
+      tailOperations: Seq[SparkPlan] = Nil) {
+    def virtual: Boolean = links.exists(_.virtualInput.isDefined)
+  }
   private case class Inputs(stream: Batches, builds: Seq[Batches])
   private case class Prepared(stage: JoinChainStage,
       load: (Batches, Batches) => (Built, Batches), eager: (Built, Batches) => Batches,
-      statsCache: () => Option[JoinChainBuildKeyStatsCache])
+      statsCache: () => Option[JoinChainBuildKeyStatsCache],
+      eagerInput: Batches => Batches)
 
   /** The result of analyzing one plan node as a potential chain anchor. */
   private sealed trait Outcome
@@ -219,6 +287,147 @@ object GpuJoinChain extends Logging {
     case Left(why) => Chain(join.stream, Seq(Link(join, join.stream.output.indices)), why)
   }
 
+  /** Substitute values, never aliases, while retaining each physical source's ExprId. */
+  private def substitute(expr: Expression, attributes: Seq[Attribute],
+      values: Seq[Expression]): Expression = {
+    val replacements = attributes.map(_.exprId).zip(values).toMap
+    expr.transformUp {
+      case a: AttributeReference if replacements.contains(a.exprId) => replacements(a.exprId)
+    }
+  }
+
+  private def value(expr: Expression): Expression = expr match {
+    case alias: GpuAlias => value(alias.child)
+    case other => other
+  }
+
+  /**
+   * Keep projections as expression lineage over the original fact/build columns. Predicates
+   * retain their position before the next probe; they are never moved past a selective join.
+   * The ordinary operators are also retained as descriptors for out-of-core/fanout fallback.
+   */
+  private case class VirtualPlan(chain: Chain, attributes: Seq[Attribute],
+      values: Seq[Expression], filters: Seq[(GpuFilterExec, Expression)] = Nil,
+      operations: Seq[SparkPlan] = Nil, changed: Boolean = false)
+
+  private def virtualPlan(plan: SparkPlan): VirtualPlan = {
+    def boundary: VirtualPlan = VirtualPlan(
+      Chain(plan, Nil, ChainBreak.notChainableJoin(plan), plan.output, plan.output),
+      plan.output, plan.output)
+    def project(projects: Seq[NamedExpression], child: SparkPlan,
+        output: Seq[Attribute]): VirtualPlan = {
+      val previous = virtualPlan(child)
+      val values = projects.map(p => substitute(value(p), previous.attributes, previous.values))
+      previous.copy(attributes = output, values = values,
+        operations = previous.operations :+ GpuProjectExec(projects.toList, child),
+        changed = previous.changed || values.exists(!_.isInstanceOf[AttributeReference]))
+    }
+    def preserveResidual(previous: VirtualPlan, condition: Option[Expression]): VirtualPlan = {
+      if (condition.isEmpty || previous.chain.links.isEmpty) previous else {
+        val links = previous.chain.links
+        // A nested terminal node may have extracted a native INNER join residual. Restore it
+        // on that exact join during fallback, before its payload could multiply. Replaying
+        // the safe pending filter afterwards also preserves any combined post-filter.
+        previous.copy(chain = previous.chain.copy(links = links.updated(links.size - 1,
+          links.last.copy(eagerCondition = condition))))
+      }
+    }
+    def filtered(filter: GpuFilterExec): VirtualPlan = {
+      val previous = virtualPlan(filter.child)
+      val condition = substitute(filter.condition, previous.attributes, previous.values)
+      previous.copy(attributes = filter.output,
+        filters = previous.filters :+ (filter -> condition),
+        operations = previous.operations :+ filter, changed = true)
+    }
+    plan match {
+      case c: GpuCoalesceBatches if c.goal.isInstanceOf[TargetSize] => virtualPlan(c.child)
+      case p: GpuProjectExec if p.enablePreSplit &&
+          GpuJoinChainPipelineExec.supportsExpressions(None, p.projectList) =>
+        project(p.projectList, p.child, p.output)
+      case f: GpuFilterExec if f.coalesceAfter &&
+          GpuJoinChainPipelineExec.supportsExpressions(Some(f.condition), Nil) => filtered(f)
+      case p: GpuJoinChainPipelineExec =>
+        val child = p.condition.map(GpuFilterExec(_, p.child)()).getOrElse(p.child)
+        preserveResidual(project(p.projectList, child, p.output), p.residualCondition)
+      case f: GpuJoinChainFilterExec =>
+        preserveResidual(filtered(GpuFilterExec(f.condition, f.child)()),
+          if (f.residualJoin) Some(f.condition) else None)
+      case p: GpuFilterProjectExec if !p.useAst =>
+        val child = GpuFilterExec(p.condition, p.child)()
+        project(p.projectList.map(_.asInstanceOf[NamedExpression]), child, p.output)
+      case _ => node(plan) match {
+        case Some(n) if ineligible(n).isEmpty =>
+          val previous = virtualPlan(n.stream)
+          val streamKeys = if (n.side == GpuBuildRight) n.plan.leftKeys else n.plan.rightKeys
+          val keys = streamKeys.map(substitute(_, previous.attributes, previous.values))
+          if (!GpuJoinChainPipelineExec.supportsExpressions(None, keys)) boundary else {
+            val raw = previous.chain.rawOutput
+            val input = VirtualInput(raw, keys, previous.filters, previous.operations)
+            val link = Link(n, raw.indices, Some(input))
+            val build = n.build.output
+            val values = if (n.plan.joinType == LeftSemi) previous.values
+              else if (n.side == GpuBuildRight) previous.values ++ build
+              else build ++ previous.values
+            val chain = previous.chain.copy(links = previous.chain.links :+ link,
+              rawOutput = raw ++ (if (n.plan.joinType == LeftSemi) Nil else build),
+              outputExpressions = values)
+            VirtualPlan(chain, plan.output, values, changed = previous.changed)
+          }
+        case _ => boundary
+      }
+    }
+  }
+
+  /** Driver-only metadata used to bind a terminal project/filter to the physical source columns. */
+  def pipelineInput(plan: SparkPlan): (Seq[Attribute], Seq[Expression]) =
+    analyze(filterAnchor(plan)) match {
+      case Fused(chain) if chain.virtual => (chain.rawOutput, chain.outputExpressions)
+      case _ => (plan.output, plan.output)
+    }
+
+  /** Bind an expression to just its physical source dependencies. */
+  private def dependencyProject(exprs: Seq[Expression], input: Seq[Attribute],
+      plan: GpuExec): JoinChainProjection = {
+    val refs = exprs.flatMap(_.references).map(_.exprId).toSet
+    val ordinals = input.indices.filter(i => refs(input(i).exprId))
+    JoinChainProjection(ordinals, GpuBindReferences.bindGpuReferencesTiered(exprs,
+      ordinals.map(input), plan.conf, plan.allMetrics))
+  }
+
+  private def inputFilter(filter: GpuFilterExec, condition: Expression,
+      attributes: Seq[Attribute]): JoinChainFilter = {
+    val bound = dependencyProject(Seq(condition), attributes, filter)
+    JoinChainFilter(bound.ordinals, bound.expressions, bound.expressions,
+      inputRows = optionalMetric(filter, GpuMetric.NUM_INPUT_ROWS),
+      inputBatches = optionalMetric(filter, GpuMetric.NUM_INPUT_BATCHES),
+      filterTime = filter.gpuLongMetric(GpuMetric.OP_TIME_LEGACY),
+      selectedRows = filter.gpuLongMetric(GpuMetric.NUM_OUTPUT_ROWS),
+      selectedBatches = filter.gpuLongMetric(GpuMetric.NUM_OUTPUT_BATCHES))
+  }
+
+  /** Bind ordinary fallback operations on the driver, before their transient SQLConf is lost. */
+  private def eagerOperations(operations: Seq[SparkPlan]): Batches => Batches = {
+    val bound: Seq[Batches => Batches] = operations.map {
+      case f: GpuFilterExec =>
+        val predicate = GpuBindReferences.bindGpuReferencesTiered(Seq(f.condition),
+          f.child.output, f.conf, f.allMetrics)
+        val rows = f.gpuLongMetric(GpuMetric.NUM_OUTPUT_ROWS)
+        val batches = f.gpuLongMetric(GpuMetric.NUM_OUTPUT_BATCHES)
+        val time = f.gpuLongMetric(GpuMetric.OP_TIME_LEGACY)
+        (input: Batches) => input.flatMap { batch =>
+          GpuFilter.filterAndClose(batch, predicate, rows, batches, time)
+        }
+      case p: GpuProjectExec =>
+        val projection = GpuBindReferences.bindGpuReferencesTiered(p.projectList,
+          p.child.output, p.conf, p.allMetrics)
+        (input: Batches) => input.flatMap { batch =>
+          projection.projectAndCloseStreamingWithSplitRetry(
+            SpillableColumnarBatch(batch, SpillPriorities.ACTIVE_ON_DECK_PRIORITY))
+        }
+    }
+    (input: Batches) => bound.foldLeft(input)((stream, operation) => operation(stream))
+  }
+
   private def worthwhile(chain: Chain): Boolean = {
     // Per-row bytes screen out narrow chains; this does not predict selectivity or elapsed time.
     val savedPayload = chain.links.dropRight(1).flatMap(_.node.plan.output)
@@ -242,7 +451,17 @@ object GpuJoinChain extends Logging {
    * consider `spark.rapids.sql.join.chain.enabled`, so an A/B run with the chain disabled still
    * reports which plans would have fused.
    */
-  private def analyze(plan: SparkPlan): Outcome = node(plan) match {
+  private def analyze(plan: SparkPlan): Outcome = {
+    val virtual = virtualPlan(plan)
+    if (virtual.changed && virtual.chain.links.nonEmpty && worthwhile(virtual.chain)) {
+      // Pending operations after the last probe have no next link to consume them. Keep
+      // their predicates over raw sources, their final lineage, and their ordinary fallback.
+      Fused(virtual.chain.copy(outputExpressions = virtual.values,
+        tailFilters = virtual.filters, tailOperations = virtual.operations))
+    } else analyzeSimple(plan)
+  }
+
+  private def analyzeSimple(plan: SparkPlan): Outcome = node(plan) match {
     case None => NotAnchored(ChainBreak.notChainableJoin(plan))
     case Some(root) => ineligible(root) match {
       case Some(why) => NotAnchored(ChainBreak.ineligible(why))
@@ -267,7 +486,11 @@ object GpuJoinChain extends Logging {
       val root = s"root=${plan.getClass.getSimpleName}"
       val message = outcome match {
         case Fused(chain) if enabled =>
-          s"$LOG_TAG fused=true length=${chain.links.size} stoppedBy=${chain.break} $root"
+          val inputs = chain.links.flatMap(_.virtualInput)
+          val filters = inputs.map(_.filters.size).sum
+          val projects = inputs.flatMap(_.eagerOperations).count(_.isInstanceOf[GpuProjectExec])
+          s"$LOG_TAG fused=true length=${chain.links.size} virtual=${chain.virtual} " +
+            s"inputFilters=$filters inputProjects=$projects stoppedBy=${chain.break} $root"
         case Fused(chain) =>
           s"$LOG_TAG fused=false reason=${ChainBreak.disabled} wouldFuse=true " +
             s"length=${chain.links.size} $root"
@@ -286,7 +509,7 @@ object GpuJoinChain extends Logging {
     case _: NotAnchored => 0
   }
 
-  private def prepare(link: Link): Prepared = {
+  private def prepare(link: Link, eagerCondition: Option[Expression]): Prepared = {
     val n = link.node
     val plan = n.plan
     val options = RapidsConf.getJoinOptions(plan.conf, n.target)
@@ -294,7 +517,7 @@ object GpuJoinChain extends Logging {
     val batches = plan.gpuLongMetric(GpuMetric.NUM_OUTPUT_BATCHES)
     val opTime = plan.gpuLongMetric(GpuMetric.OP_TIME_LEGACY)
     val joinTime = plan.gpuLongMetric(GpuMetric.JOIN_TIME)
-    val stage = JoinChainStage(n.buildKeys,
+    val originalStage = JoinChainStage(n.buildKeys,
       n.streamKeys.map(_.asInstanceOf[GpuBoundReference].ordinal), link.projection,
       n.side, GpuHashJoin.compareNullsEqual(plan.joinType, n.buildKeys), rows, batches, joinTime,
       isLeftSemi = plan.joinType == LeftSemi)
@@ -310,9 +533,20 @@ object GpuJoinChain extends Logging {
               broadcast, schema, stream)
             (Left(projection.map(_(raw)).getOrElse(raw)): Built, buffered)
           }
+          // Restore an extracted residual condition on runtime fallback. Native mixed joins
+          // can reject matches before gathering, unlike an unfiltered join followed by Filter.
+          val eagerJoin = (join, eagerCondition) match {
+            case (concrete: GpuBroadcastHashJoinExec, Some(condition)) =>
+              val restored = concrete.copy(condition = Some(condition))
+              // Binding inside doJoin needs this map on the executor. Its factory uses a
+              // transient SQLConf/SparkContext, so initialize the copied plan on the driver.
+              val _ = restored.allMetrics
+              restored
+            case _ => join
+          }
           val fallback = (built: Built, stream: Batches) => built match {
             case Left(batch) =>
-              join.doJoin(batch, stream, options, rows, batches, opTime, joinTime)
+              eagerJoin.doJoin(batch, stream, options, rows, batches, opTime, joinTime)
             case Right(_) => throw new IllegalStateException("broadcast build must be one batch")
           }
           val stats = () => {
@@ -332,7 +566,18 @@ object GpuJoinChain extends Logging {
         case join: GpuShuffledSymmetricHashJoinExec =>
           (join.joinChainBuildLoader(n.side), join.joinChainEager(n.side), () => None)
       }
-    Prepared(stage, load, eager, statsCache)
+    val stage = link.virtualInput.map { input =>
+      val keyProject = dependencyProject(input.keys, input.attributes, plan)
+      originalStage.copy(streamKeyOrdinals = keyProject.ordinals,
+        // Virtual layouts always append physical sources; Spark's logical left/right order
+        // is represented by the final expression lineage instead of intermediate payloads.
+        buildSide = GpuBuildRight,
+        inputFilters = input.filters.map { case (filter, expr) =>
+          inputFilter(filter, expr, input.attributes)
+        }, streamKeyProject = Some(keyProject), virtualInput = true)
+    }.getOrElse(originalStage)
+    Prepared(stage, load, eager, statsCache,
+      eagerOperations(link.virtualInput.map(_.eagerOperations).getOrElse(Nil)))
   }
 
   /**
@@ -360,6 +605,45 @@ object GpuJoinChain extends Logging {
     }
   }
 
+  // Only size-based coalesces are transparent at this boundary. A SingleBatch consumer must
+  // retain its batching contract; exchanges and computed projections remain boundaries.
+  @scala.annotation.tailrec
+  private def filterAnchor(plan: SparkPlan): SparkPlan = plan match {
+    case c: GpuCoalesceBatches if c.goal.isInstanceOf[TargetSize] => filterAnchor(c.child)
+    case _ => plan
+  }
+
+  def canFilter(plan: SparkPlan): Boolean = analyze(filterAnchor(plan)).isInstanceOf[Fused]
+
+  def executeFiltered(plan: SparkPlan, filter: JoinChainFilter): Option[RDD[ColumnarBatch]] = {
+    val anchor = filterAnchor(plan)
+    def eagerResidual(): Option[RDD[ColumnarBatch]] = filter.joinCondition.flatMap { condition =>
+      anchor match {
+        case join: GpuBroadcastHashJoinExec =>
+          Some(join.copy(condition = Some(condition)).executeColumnar()
+            .mapPartitions(filter.residualFallback))
+        case _ => None
+      }
+    }
+    if (RapidsConf.ENABLE_JOIN_CHAIN.get(plan.conf)) {
+      analyze(anchor) match {
+        case outcome @ Fused(chain) =>
+          val verbose = RapidsConf.JOIN_CHAIN_LOG_DIAGNOSTICS.get(plan.conf)
+          logOutcome(anchor, outcome, enabled = true, verbose)
+          if (verbose) {
+            val terminal = if (filter.projection.isDefined) {
+              if (filter.filterEnabled) "filterProject" else "project"
+            } else "filter"
+            val columns = filter.projection.map(_.ordinals.size)
+            logWarning(s"$LOG_TAG terminal=$terminal predicateColumns=${filter.ordinals.size} " +
+              s"projectInputColumns=$columns")
+          }
+          Some(buildRdd(anchor, chain, Some(filter)))
+        case _ => eagerResidual()
+      }
+    } else eagerResidual()
+  }
+
   /** Keep the first live batch buffered; empty inner/semi streams need no build work. */
   private[execution] def bufferNonemptyStream(input: Iterator[ColumnarBatch]):
       CloseableBufferedIterator[ColumnarBatch] = {
@@ -372,8 +656,22 @@ object GpuJoinChain extends Logging {
     }
   }
 
-  private def buildRdd(plan: SparkPlan, chain: Chain): RDD[ColumnarBatch] = {
-    val prepared = chain.links.map(prepare)
+  private def buildRdd(plan: SparkPlan, chain: Chain,
+      filter: Option[JoinChainFilter] = None): RDD[ColumnarBatch] = {
+    val terminal = filter.orElse {
+      if (chain.virtual) Some(GpuJoinChainPipelineExec(None, plan.output.toList, plan).bind())
+      else None
+    }
+    val prepared = chain.links.zipWithIndex.map { case (link, i) =>
+      val residual = link.eagerCondition.orElse {
+        if (i == chain.links.size - 1) terminal.flatMap(_.joinCondition) else None
+      }
+      prepare(link, residual)
+    }
+    val tailFilters = chain.tailFilters.map { case (filter, condition) =>
+      inputFilter(filter, condition, chain.rawOutput)
+    }
+    val eagerTail = eagerOperations(chain.tailOperations)
     val broadcastOnly = chain.links.forall(_.node.broadcast)
     val root = chain.links.last.node
     val attrs = chain.input.output
@@ -437,12 +735,21 @@ object GpuJoinChain extends Logging {
           }
           def eager(): Batches = {
             prepared.indices.foreach { i =>
-              val refs = prepared(i).stage.streamProjection
-              stream = stream.map(batch => withResource(batch)(select(_, refs)))
+              stream = prepared(i).eagerInput(stream)
+              if (!prepared(i).stage.virtualInput) {
+                val refs = prepared(i).stage.streamProjection
+                stream = stream.map(batch => withResource(batch)(select(_, refs)))
+              }
               val data = built(i).map(identity).left.map(_.releaseBatch())
               stream = prepared(i).eager(data, stream)
             }
-            stream
+            stream = eagerTail(stream)
+            // A residual was already applied by the restored native root join. Candidate and
+            // avoided-row counters describe only the deferred path in this case.
+            terminal.map { terminal =>
+              if (terminal.joinCondition.isDefined) terminal.residualFallback(stream)
+              else terminal.eager(stream)
+            }.getOrElse(stream)
           }
           opTime.ns {
             if (built.exists(_.isRight)) {
@@ -470,7 +777,9 @@ object GpuJoinChain extends Logging {
                     }
                   }
                   fusedTasks += 1
-                  new JoinChainIterator(stream, attrs, builds, keys, classified, options, opTime)
+                  terminal.foreach(_.fusedTasks += 1)
+                  new JoinChainIterator(stream, attrs, builds, keys, classified, options, opTime,
+                    terminal, tailFilters)
                 } else {
                   nonUniqueFallbacks += 1
                   withResource(keys)(_ => withResource(owners)(_ => eager()))
@@ -565,20 +874,21 @@ object GpuJoinChain extends Logging {
     work
   }
 
-  /** Sources needed after each probe, for later keys or the complete chain output. */
+  /** Sources needed after each probe, including the terminal predicate and project inputs. */
   private[execution] def liveSourcesAfterStages(factWidth: Int, buildWidths: Seq[Int],
-      stages: Seq[JoinChainStage]): Seq[Set[Int]] = {
+      stages: Seq[JoinChainStage], outputOrdinals: Option[Seq[Int]] = None): Seq[Set[Int]] = {
     var layout: Seq[Int] = Seq.fill(factWidth)(0)
     val probeSources = stages.zipWithIndex.map { case (stage, i) =>
       layout = stage.streamProjection.map(layout)
-      val needed = stage.streamKeyOrdinals.map(layout).toSet
+      val needed = (stage.streamKeyOrdinals ++ stage.inputFilters.flatMap(_.ordinals))
+        .map(layout).toSet
       if (!stage.isLeftSemi) {
         val build = Seq.fill(buildWidths(i))(i + 1)
         layout = if (stage.buildSide == GpuBuildRight) layout ++ build else build ++ layout
       }
       needed
     }
-    var needed = layout.toSet
+    var needed = outputOrdinals.map(_.map(layout)).getOrElse(layout).toSet
     stages.indices.reverse.map { i =>
       // Keep source slots aligned, but do not mark a future build as already live.
       val live = needed.filter(_ <= i + 1)
@@ -593,7 +903,7 @@ object GpuJoinChain extends Logging {
       val col = batch.column(i).asInstanceOf[GpuColumnVector]
       GpuColumnVector.from(col.getBase.incRefCount(), col.dataType())
     }
-    new ColumnarBatch(columns.toArray, batch.numRows())
+    closeOnExcept(columns)(_ => new ColumnarBatch(columns.toArray, batch.numRows()))
   }
 
   private[execution] def buildKeys(builds: Seq[LazySpillableColumnarBatch],
@@ -656,7 +966,9 @@ private[execution] class JoinChainIterator(
     keys: Seq[LazySpillableColumnarBatch],
     stages: Seq[JoinChainStage],
     options: JoinOptions,
-    opTime: GpuMetric = NoopMetric)
+    opTime: GpuMetric = NoopMetric,
+    filter: Option[JoinChainFilter] = None,
+    tailFilters: Seq[JoinChainFilter] = Nil)
     extends SplittableJoinIterator(NvtxRegistry.JOIN_GATHER,
       input.map { batch =>
         withResource(batch)(LazySpillableColumnarBatch(_, "join_chain_fact"))
@@ -666,8 +978,14 @@ private[execution] class JoinChainIterator(
   private case class Origin(source: Int, column: Int)
   private val hashes = stages.map(stage =>
     new GpuJoinHashCache(stage.buildKeysUnique, stage.nullsEqual, options.hashReuseEnabled))
+  private val terminalOrdinals = filter.flatMap { terminal =>
+    terminal.projection.map { projection =>
+      (projection.ordinals ++ (if (terminal.filterEnabled) terminal.ordinals else Nil) ++
+        tailFilters.flatMap(_.ordinals)).distinct
+    }
+  }
   private val liveSources = GpuJoinChain.liveSourcesAfterStages(
-    attrs.length, builds.map(_.numCols), stages)
+    attrs.length, builds.map(_.numCols), stages, terminalOrdinals)
   private val hasFanout = stages.exists(!_.buildKeysUnique)
   private val mapWork = GpuJoinChain.mapWorkPerRow(stages)
   override protected def splitBeforePending: Boolean = hasFanout
@@ -720,6 +1038,8 @@ private[execution] class JoinChainIterator(
   }
 
   protected def beforeProbe(stage: Int): Unit = ()
+  protected def beforeFilter(): Unit = ()
+  protected def beforeProject(): Unit = ()
 
   override protected def createGatherer(fact: LazySpillableColumnarBatch,
       numJoinRows: Option[Long]): Option[JoinGatherer] = {
@@ -729,15 +1049,30 @@ private[execution] class JoinChainIterator(
       val inputs = Seq(fact) ++ builds ++ keys
       inputs.foreach(_.checkpoint())
       try {
-        val (gatherer, counts) = withRetryNoSplit {
+        val (gatherer, counts, selectedRows, inputCounts) = withRetryNoSplit {
           withRestoreOnRetry(hashes) {
             withRestoreOnRetry(inputs) { buildGatherer(fact) }
           }
         }
         // Commit metrics only after the complete attempt succeeds, avoiding retry double counts.
-        stages.dropRight(1).zip(counts).foreach { case (stage, rows) =>
+        // With a terminal filter, the root join reports logical candidate map batches; it
+        // must not report the filtered payload batches emitted by ProjectedGatherer.
+        val countedStages = if (filter.isDefined) stages else stages.dropRight(1)
+        countedStages.zip(counts).foreach { case (stage, rows) =>
           stage.outputRows += rows
           if (rows > 0) stage.outputBatches += 1
+        }
+        inputCounts.foreach { case (predicate, before, after) =>
+          predicate.inputRows += before
+          if (before > 0) predicate.inputBatches += 1
+          predicate.selectedRows += after
+          if (after > 0) predicate.selectedBatches += 1
+        }
+        filter.foreach { terminal =>
+          val candidates = if (tailFilters.nonEmpty) inputCounts.last._3.toLong else counts.last
+          terminal.inputRows += candidates
+          if (candidates > 0) terminal.inputBatches += 1
+          terminal.avoidedPayloadRows += candidates - selectedRows
         }
         gatherer
       } catch {
@@ -754,39 +1089,71 @@ private[execution] class JoinChainIterator(
   }
 
   private def buildGatherer(fact: LazySpillableColumnarBatch):
-      (Option[JoinGatherer], Seq[Long]) = {
+      (Option[JoinGatherer], Seq[Long], Int, Seq[(JoinChainFilter, Int, Int)]) = {
     val sources = Seq(fact) ++ builds
     var layout: Seq[Origin] = fact.dataTypes.indices.map(Origin(0, _)).toSeq
     var maps = Seq.empty[IndexMap]
     var rows = fact.numRows
     val counts = scala.collection.mutable.ArrayBuffer[Long]()
+    val inputCounts = scala.collection.mutable.ArrayBuffer[(JoinChainFilter, Int, Int)]()
     try {
+      if (stages.head.virtualInput) {
+        // An explicit identity map lets source-side predicates select rows without gathering
+        // any payload. It participates in the same spill/retry lifetime as composed maps.
+        maps = withResource(Scalar.fromInt(0)) { zero =>
+          withResource(ColumnVector.sequence(zero, rows))(column => Seq(index(column)))
+        }
+      }
       stages.zipWithIndex.foreach { case (stage, i) =>
         layout = stage.streamProjection.map(layout)
+        stage.inputFilters.foreach { predicate =>
+          val before = rows
+          if (rows > 0) {
+            predicate.filterTime.ns {
+              beforeFilter()
+              filterMaps(predicate, layout, sources, maps, rows)
+            }.foreach { case (selected, selectedRows) =>
+              withResource(maps) { _ => maps = selected }
+              rows = selectedRows
+              maps.filter(_ != null).foreach(_.allowSpilling())
+            }
+          }
+          inputCounts += ((predicate, before, rows))
+        }
         if (rows > 0) {
           beforeProbe(i)
           val next = stage.joinTime.ns {
-            val origins = stage.streamKeyOrdinals.map(layout)
-            withResource(origins.safeMap { origin =>
-              val source = sources(origin.source)
-              withResource(GpuColumnVector.from(source.getBatch)) { table =>
-                withResource(new Table(table.getColumn(origin.column))) { key =>
-                  val column = if (maps.isEmpty) {
-                    key.getColumn(0).copyToColumnVector()
-                  } else {
-                    withResource(maps(origin.source).toColumnView(0, rows)) { map =>
-                      withResource(key.gather(map, OutOfBoundsPolicy.DONT_CHECK)) {
-                        _.getColumn(0).incRefCount()
+            def streamKeyColumns(): Seq[ColumnVector] = stage.streamKeyProject match {
+              case Some(project) =>
+                withResource(predicateInput(project.ordinals.map(layout), sources, maps, rows)) {
+                  input => withResource(project.expressions.project(input)) { evaluated =>
+                    GpuColumnVector.extractBases(evaluated).toSeq.safeMap(_.incRefCount())
+                  }
+                }
+              case None =>
+                val origins = stage.streamKeyOrdinals.map(layout)
+                origins.safeMap { origin =>
+                  val source = sources(origin.source)
+                  withResource(GpuColumnVector.from(source.getBatch)) { table =>
+                    withResource(new Table(table.getColumn(origin.column))) { key =>
+                      val column = if (maps.isEmpty) {
+                        key.getColumn(0).copyToColumnVector()
+                      } else {
+                        withResource(maps(origin.source).toColumnView(0, rows)) { map =>
+                          withResource(key.gather(map, OutOfBoundsPolicy.DONT_CHECK)) {
+                            _.getColumn(0).incRefCount()
+                          }
+                        }
+                      }
+                      closeOnExcept(column) { owned =>
+                        source.allowSpilling()
+                        owned
                       }
                     }
                   }
-                  closeOnExcept(column) { owned =>
-                    source.allowSpilling()
-                    owned
-                  }
                 }
-              }
-            }) { streamColumns =>
+            }
+            withResource(streamKeyColumns()) { streamColumns =>
               withResource(new Table(streamColumns: _*)) { streamKeys =>
                 withResource(GpuColumnVector.from(keys(i).getBatch)) { buildKeys =>
                   withResource(hashes(i).innerJoin(buildKeys, streamKeys)) { joined =>
@@ -846,11 +1213,41 @@ private[execution] class JoinChainIterator(
             else buildLayout ++ layout
         }
       }
+      // Preserve each predicate's order and retain its source maps even when the final
+      // projection (including COUNT(*)) does not reference those columns.
+      tailFilters.foreach { predicate =>
+        val before = rows
+        if (rows > 0) {
+          predicate.filterTime.ns {
+            beforeFilter()
+            filterMaps(predicate, layout, sources, maps, rows)
+          }.foreach { case (selected, selectedRows) =>
+            withResource(maps) { _ => maps = selected }
+            rows = selectedRows
+            maps.filter(_ != null).foreach(_.allowSpilling())
+          }
+        }
+        inputCounts += ((predicate, before, rows))
+      }
+      filter.filter(_.filterEnabled).foreach { terminal =>
+        if (rows > 0) {
+          terminal.filterTime.ns {
+            beforeFilter()
+            filterMaps(terminal, layout, sources, maps, rows)
+          }.foreach { case (selected, selectedRows) =>
+            withResource(maps) { _ => maps = selected }
+            rows = selectedRows
+            maps.filter(_ != null).foreach(_.allowSpilling())
+          }
+        }
+      }
       if (rows == 0) {
-        (None, counts.toSeq)
+        (None, counts.toSeq, 0, inputCounts.toSeq)
       } else {
         // Gather each surviving source column once, then restore the logical output order by refs.
-        val origins = layout.distinct.sortBy(o => (o.source, o.column))
+        val outputLayout = filter.flatMap(_.projection).map(_.ordinals.map(layout))
+          .getOrElse(layout)
+        val origins = outputLayout.distinct.sortBy(o => (o.source, o.column))
         val groups = origins.groupBy(_.source).toSeq.sortBy(_._1)
         val gatherers = groups.safeMap { case (source, columns) =>
           withResource(GpuJoinChain.select(sources(source).getBatch,
@@ -866,9 +1263,12 @@ private[execution] class JoinChainIterator(
           }
         }
         closeOnExcept(gatherers) { _ =>
-          val combined = gatherers.reduceLeft[JoinGatherer](MultiJoinGather)
-          val projection = layout.map(origins.indexOf)
-          (Some(new ProjectedGatherer(combined, projection)), counts.toSeq)
+          val combined = if (gatherers.isEmpty) new RowCountGatherer(rows)
+            else gatherers.reduceLeft[JoinGatherer](MultiJoinGather)
+          val projection = outputLayout.map(origins.indexOf)
+          val pruned = layout.distinct.length - origins.length
+          (Some(new ProjectedGatherer(combined, projection, pruned)), counts.toSeq, rows,
+            inputCounts.toSeq)
         }
       }
     } finally {
@@ -876,21 +1276,125 @@ private[execution] class JoinChainIterator(
     }
   }
 
-  private class ProjectedGatherer(delegate: JoinGatherer, projection: Seq[Int])
+  /** Read only predicate dependencies; payloads remain in their original spillable sources. */
+  private def predicateInput(origins: Seq[Origin], sources: Seq[LazySpillableColumnarBatch],
+      maps: Seq[IndexMap], rows: Int): ColumnarBatch = {
+    val groups = origins.distinct.groupBy(_.source).toSeq.sortBy(_._1)
+    withResource(groups.safeMap { case (source, columns) =>
+      withResource(GpuJoinChain.select(sources(source).getBatch, columns.map(_.column))) {
+        selected =>
+          withResource(GpuColumnVector.from(selected)) { table =>
+            withResource(maps(source).toColumnView(0, rows)) { map =>
+              withResource(table.gather(map, OutOfBoundsPolicy.DONT_CHECK)) { gathered =>
+                val batch = GpuColumnVector.from(gathered, GpuColumnVector.extractTypes(selected))
+                closeOnExcept(batch) { _ =>
+                  sources(source).allowSpilling()
+                  batch
+                }
+              }
+            }
+          }
+      }
+    }) { batches =>
+      val locations = groups.zipWithIndex.flatMap { case ((_, columns), batch) =>
+        columns.zipWithIndex.map { case (origin, column) => origin -> ((batch, column)) }
+      }.toMap
+      val columns = origins.safeMap { origin =>
+        val (batch, column) = locations(origin)
+        batches(batch).column(column).asInstanceOf[GpuColumnVector].incRefCount()
+      }
+      closeOnExcept(columns)(_ => new ColumnarBatch(columns.toArray, rows))
+    }
+  }
+
+  /** Compact INT32 maps together. Null predicates reject rows just as Table.filter does. */
+  private def filterMaps(terminal: JoinChainFilter, layout: Seq[Origin],
+      sources: Seq[LazySpillableColumnarBatch], maps: Seq[IndexMap], rows: Int):
+      Option[(Seq[IndexMap], Int)] = {
+    withResource(predicateInput(terminal.ordinals.map(layout), sources, maps, rows)) { input =>
+      withResource(terminal.predicate.project(input)) { evaluated =>
+        val mask = evaluated.column(0).asInstanceOf[GpuColumnVector].getBase
+        // Match the ordinary filter's all-true fast path, retaining the existing maps.
+        val allTrue = !mask.hasNulls && withResource(mask.all())(_.getBoolean)
+        val live = maps.indices.filter(maps(_) != null)
+        if (allTrue) None else if (live.isEmpty) {
+          // Constant projections such as COUNT(*) may make every payload map dead.
+          val selectedRows = withResource(mask.sum(DType.INT32)) { count =>
+            if (count.isValid) count.getInt else 0
+          }
+          Some((Seq.fill(maps.length)(null), selectedRows))
+        } else {
+          // Borrowed views remain owned by their maps throughout this attempt.
+          val columns = live.map(i => GpuColumnVector.extractBases(maps(i).data.getBatch)(0))
+          withResource(new Table(columns: _*)) { table =>
+            withResource(table.filter(mask)) { selected =>
+              val selectedRows = selected.getRowCount.toInt
+              val result = if (selectedRows == 0) Seq.fill(maps.length)(null) else {
+                maps.indices.safeMap { i =>
+                  if (maps(i) == null) null else index(selected.getColumn(live.indexOf(i)))
+                }
+              }
+              Some((result, selectedRows))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /** A count-only pipeline carries row cardinality without allocating a payload column. */
+  private class RowCountGatherer(total: Int) extends JoinGatherer {
+    private var offset = 0
+    private var saved = 0
+    override def gatherNext(rows: Int): ColumnarBatch = {
+      require(rows > 0 && rows <= numRowsLeft)
+      val result = new ColumnarBatch(Array.empty, rows)
+      offset += rows
+      result
+    }
+    override def isDone: Boolean = offset == total
+    override def numRowsLeft: Long = total.toLong - offset
+    override def realCheapPerRowSizeEstimate: Double = 1.0
+    override def getFixedWidthBitSize: Option[Int] = Some(8)
+    override def getBitSizeMap(rows: Int): ColumnView =
+      withResource(Scalar.fromLong(8))(ColumnVector.fromScalar(_, rows))
+    override def checkpoint(): Unit = { saved = offset }
+    override def restore(): Unit = { offset = saved }
+    override def allowSpilling(): Unit = ()
+    override def close(): Unit = { offset = total }
+  }
+
+  private class ProjectedGatherer(delegate: JoinGatherer, projection: Seq[Int], pruned: Int)
       extends JoinGatherer {
     override def gatherNext(rows: Int): ColumnarBatch = {
       withResource(delegate.gatherNext(rows)) { gathered =>
-        val result = GpuJoinChain.select(gathered, projection)
-        stages.last.outputRows += rows
-        stages.last.outputBatches += 1
+        val result = withResource(GpuJoinChain.select(gathered, projection)) { inputs =>
+          filter.flatMap(_.projection).map { terminal =>
+            beforeProject()
+            val output = terminal(inputs)
+            terminal.inputColumnsPruned += pruned
+            output
+          }.getOrElse(GpuColumnVector.incRefCounts(inputs))
+        }
+        if (filter.isEmpty) {
+          stages.last.outputRows += rows
+          stages.last.outputBatches += 1
+        }
         result
       }
     }
     override def isDone: Boolean = delegate.isDone
     override def numRowsLeft: Long = delegate.numRowsLeft
-    override def realCheapPerRowSizeEstimate: Double = delegate.realCheapPerRowSizeEstimate
-    override def getFixedWidthBitSize: Option[Int] = delegate.getFixedWidthBitSize
-    override def getBitSizeMap(rows: Int): ColumnView = delegate.getBitSizeMap(rows)
+    private val extraBits = filter.flatMap(_.projection).map(_.extraBitsPerRow).getOrElse(0)
+    override def realCheapPerRowSizeEstimate: Double =
+      delegate.realCheapPerRowSizeEstimate + extraBits / 8.0
+    override def getFixedWidthBitSize: Option[Int] =
+      delegate.getFixedWidthBitSize.map(_ + extraBits)
+    override def getBitSizeMap(rows: Int): ColumnView = {
+      withResource(delegate.getBitSizeMap(rows)) { sizes =>
+        withResource(Scalar.fromLong(extraBits.toLong))(sizes.add(_))
+      }
+    }
     override def checkpoint(): Unit = delegate.checkpoint()
     override def restore(): Unit = delegate.restore()
     override def allowSpilling(): Unit = delegate.allowSpilling()

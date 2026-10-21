@@ -18,12 +18,13 @@ package org.apache.spark.sql.rapids.execution
 
 import java.util.concurrent.{Callable, CyclicBarrier, Executors, TimeUnit}
 
-import com.nvidia.spark.rapids.{GpuBoundReference, GpuBuildLeft, GpuBuildRight}
+import com.nvidia.spark.rapids.{GpuBoundReference, GpuBuildLeft, GpuBuildRight, GpuLiteral,
+  GpuTieredProject}
 import com.nvidia.spark.rapids.Arm.withResource
 import org.scalatest.funsuite.AnyFunSuite
 
 import org.apache.spark.sql.catalyst.expressions.ExprId
-import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.{BooleanType, IntegerType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 class JoinChainPreparationSuite extends AnyFunSuite {
@@ -56,6 +57,28 @@ class JoinChainPreparationSuite extends AnyFunSuite {
       JoinChainStage(Seq(ref(0)), Seq(0), Seq(0, 1), GpuBuildLeft, false))
     assert(GpuJoinChain.liveSourcesAfterStages(2, Seq(3, 2, 2), stages) ==
       Seq(Set(0, 1), Set(0, 1), Set(0, 1, 3)))
+  }
+
+  test("terminal projection retains future keys but can drop every final payload map") {
+    val stages = Seq(
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(0, 1), GpuBuildRight, false),
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(3), GpuBuildLeft, false),
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(1), GpuBuildRight, false))
+    assert(GpuJoinChain.liveSourcesAfterStages(2, Seq(3, 2, 2), stages, Some(Seq(0))) ==
+      Seq(Set(1), Set(2), Set(2)))
+    assert(GpuJoinChain.liveSourcesAfterStages(2, Seq(3, 2, 2), stages, Some(Nil)) ==
+      Seq(Set(1), Set(2), Set.empty[Int]))
+  }
+
+  test("future pre-probe predicates retain sources even when COUNT(*) needs no payload") {
+    val predicate = GpuTieredProject(Seq(Seq(GpuLiteral(true, BooleanType))))
+    val stageFilter = JoinChainFilter(Seq(1), predicate, predicate)
+    val stages = Seq(
+      JoinChainStage(Seq(ref(0)), Seq(0), Seq(0, 1), GpuBuildRight, false),
+      JoinChainStage(Seq(ref(0)), Seq(2), Seq(0, 1, 2), GpuBuildRight, false,
+        inputFilters = Seq(stageFilter)))
+    assert(GpuJoinChain.liveSourcesAfterStages(2, Seq(1, 1), stages, Some(Nil)) ==
+      Seq(Set(0, 1), Set.empty[Int]))
   }
 
   private class TrackedBatch(rows: Int) extends ColumnarBatch(Array.empty, rows) {

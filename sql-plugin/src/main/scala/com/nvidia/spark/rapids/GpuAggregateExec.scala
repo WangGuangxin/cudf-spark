@@ -2013,7 +2013,12 @@ case class GpuHashAggregateExec(
        |""".stripMargin
   }
 
-  override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
+  override def internalDoExecuteColumnar(): RDD[ColumnarBatch] =
+    executeWithInput(child.executeColumnar(), inputAttributes, child.outputOrdering)
+
+  /** Reuse the complete aggregate algorithm with a pipeline's pruned, projected inputs. */
+  private[rapids] def executeWithInput(rdd: RDD[ColumnarBatch], inputAttrs: Seq[Attribute],
+      inputOrdering: Seq[SortOrder]): RDD[ColumnarBatch] = {
     val aggMetrics = GpuHashAggregateMetrics(
       numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS),
       numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES),
@@ -2030,7 +2035,6 @@ case class GpuHashAggregateExec(
       heuristicTime = gpuLongMetric("HEURISTIC_TIME"))
 
     // cache in a local variable to avoid serializing the full child plan
-    val inputAttrs = inputAttributes
     val groupingExprs = groupingExpressions
     val aggregateExprs = aggregateExpressions
     val aggregateAttrs = aggregateAttributes
@@ -2038,28 +2042,31 @@ case class GpuHashAggregateExec(
     val modeInfo = AggregateModeInfo(uniqueModes)
     val targetBatchSize = configuredTargetBatchSize
 
-    val rdd = child.executeColumnar()
-
     val localForcePre = forceSinglePassAgg
     val localAllowPre = allowSinglePassAgg
     val expectedOrdering = expectedChildOrderingIfNeeded
-    val alreadySorted = SortOrder.orderingSatisfies(child.outputOrdering,
+    val alreadySorted = SortOrder.orderingSatisfies(inputOrdering,
       expectedOrdering) && expectedOrdering.nonEmpty
     val localEstimatedPreProcessGrowth = estimatedPreProcessGrowth
 
     val boundGroupExprs = GpuBindReferences.bindGpuReferencesTiered(groupingExprs,
       inputAttrs, conf, allMetrics)
 
+    val metrics = allMetrics
+    val settings = conf.getAllConfs
+    val allowUnmerged = allowNonFullyAggregatedOutput
+    val skipRatio = skipAggPassReductionRatio
     rdd.mapPartitions { cbIter =>
+      val localConf = new SQLConf()
+      settings.foreach { case (key, value) => localConf.setConfString(key, value) }
       val postBoundReferences = GpuAggFinalPassIterator.setupReferences(groupingExprs,
-        aggregateExprs, aggregateAttrs, resultExprs, modeInfo, allMetrics)
+        aggregateExprs, aggregateAttrs, resultExprs, modeInfo, metrics)
 
       new DynamicGpuPartialAggregateIterator(cbIter, inputAttrs, groupingExprs,
         boundGroupExprs, aggregateExprs, aggregateAttrs, resultExprs, modeInfo,
         localEstimatedPreProcessGrowth, alreadySorted, expectedOrdering,
-        postBoundReferences, targetBatchSize, aggMetrics, conf,
-        localForcePre, localAllowPre, allowNonFullyAggregatedOutput, skipAggPassReductionRatio,
-        allMetrics
+        postBoundReferences, targetBatchSize, aggMetrics, localConf,
+        localForcePre, localAllowPre, allowUnmerged, skipRatio, metrics
       )
     }
   }
