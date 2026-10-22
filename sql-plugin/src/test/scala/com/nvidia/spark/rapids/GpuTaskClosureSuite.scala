@@ -27,7 +27,10 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, AttributeReference, NullsFirst, SortOrder}
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, JoinType, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
+import org.apache.spark.sql.execution.exchange.BroadcastExchangeExec
+import org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode
 import org.apache.spark.sql.rapids.GpuGreaterThan
+import org.apache.spark.sql.rapids.execution.{GpuBroadcastExchangeExec, GpuBroadcastHashJoinExec}
 import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -168,4 +171,51 @@ class GpuTaskClosureSuite extends AnyFunSuite with BeforeAndAfterAll {
       new GpuShuffledAsymmetricHashJoinExec.SpillableColumnarBatchAsymmetricJoinSizer(10))
   }
 
+  private def assertBroadcastClosure(
+      joinType: JoinType,
+      side: GpuBuildSide,
+      withCondition: Boolean,
+      nullAware: Boolean = false): Unit = {
+    val leftKey = AttributeReference("leftKey", IntegerType)()
+    val rightKey = AttributeReference("rightKey", IntegerType)()
+    val key = if (side == GpuBuildRight) rightKey else leftKey
+    val child = EmptyInput(Seq(key))
+    val mode = HashedRelationBroadcastMode(Seq(key))
+    // Construct the actual broadcast join RDD without collecting a GPU table. Its tasks are
+    // serialized but never run, so only a serializable placeholder broadcast is needed.
+    val relation = session.sparkContext.broadcast[Any]("closure-only")
+    try {
+      val exchange = new GpuBroadcastExchangeExec(mode, child)(
+          BroadcastExchangeExec(mode, child)) {
+        @transient
+        override lazy val relationFuture:
+            java.util.concurrent.Future[org.apache.spark.broadcast.Broadcast[Any]] =
+          java.util.concurrent.CompletableFuture.completedFuture(relation)
+      }
+      val left = if (side == GpuBuildLeft) exchange else EmptyInput(Seq(leftKey))
+      val right = if (side == GpuBuildRight) exchange else EmptyInput(Seq(rightKey))
+      val condition = if (withCondition) Some(GpuGreaterThan(leftKey, rightKey)) else None
+      val join = GpuBroadcastHashJoinExec(Seq(leftKey), Seq(rightKey), joinType,
+        side, condition, left, right, nullAware)
+      assertNoCapturedPlan(join)
+    } finally {
+      relation.destroy()
+    }
+  }
+
+  for (joinType <- Seq(Inner, LeftOuter, RightOuter, LeftSemi, LeftAnti);
+      withCondition <- Seq(false, true)) {
+    test(s"Broadcast $joinType condition=$withCondition task does not capture a plan") {
+      val side = if (joinType == RightOuter) GpuBuildLeft else GpuBuildRight
+      assertBroadcastClosure(joinType, side, withCondition)
+    }
+  }
+
+  test("Broadcast inner BuildLeft task does not capture a plan") {
+    assertBroadcastClosure(Inner, GpuBuildLeft, withCondition = true)
+  }
+
+  test("Null-aware broadcast anti join task does not capture a plan") {
+    assertBroadcastClosure(LeftAnti, GpuBuildRight, withCondition = false, nullAware = true)
+  }
 }
