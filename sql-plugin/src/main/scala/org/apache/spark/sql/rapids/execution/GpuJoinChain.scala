@@ -16,7 +16,9 @@
 
 package org.apache.spark.sql.rapids.execution
 
-import ai.rapids.cudf.{ColumnVector, ColumnView, DType, GroupByAggregation, GroupByOptions, NullEquality, NullPolicy, OutOfBoundsPolicy, Scalar, Table}
+import java.util.Optional
+
+import ai.rapids.cudf.{ColumnVector, ColumnView, DType, GatherMap, GroupByAggregation, GroupByOptions, NullEquality, NullPolicy, OutOfBoundsPolicy, Scalar, Table}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
@@ -158,6 +160,15 @@ case class JoinChainFilter(
 object GpuJoinChain extends Logging {
   /** Prefix for the per-join diagnostic line, so a whole benchmark run can be grepped at once. */
   private val LOG_TAG = "RAPIDS_JOIN_CHAIN"
+
+  /** Transfer join indices into a spillable column without copying their device buffer. */
+  private[execution] def columnFromGatherMap(map: GatherMap): ColumnVector = {
+    val rows = map.getRowCount
+    closeOnExcept(map.releaseBuffer()) { buffer =>
+      new ColumnVector(DType.INT32, rows, Optional.of(java.lang.Long.valueOf(0L)),
+        buffer, null, null)
+    }
+  }
 
   private type Batches = Iterator[ColumnarBatch]
   private type Built = Either[ColumnarBatch, Batches]
@@ -1182,7 +1193,7 @@ private[execution] class JoinChainIterator(
                         val live = liveSources(i)
                         val prefix = if (maps.isEmpty) {
                           Seq(if (live.contains(0)) {
-                            withResource(selection.copyToColumnVector())(index)
+                            withResource(GpuJoinChain.columnFromGatherMap(joined(0)))(index)
                           } else null)
                         } else {
                           maps.zipWithIndex.safeMap { case (old, source) =>
@@ -1204,8 +1215,8 @@ private[execution] class JoinChainIterator(
                             // key or output uses, without allocating or composing their maps.
                             prefix :+ null
                           } else {
-                            withResource(joined(1).toColumnView(0, joinedRows)) { right =>
-                              prefix :+ withResource(right.copyToColumnVector())(index)
+                            withResource(GpuJoinChain.columnFromGatherMap(joined(1))) { right =>
+                              prefix :+ index(right)
                             }
                           }
                           (result, joinedRows)
