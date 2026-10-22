@@ -60,16 +60,41 @@ object GpuExpandAggregateExec extends Logging {
     case _ => None
   }
 
+  private[rapids] def sumCannotOverflowInBatch(input: DataType, result: DataType): Boolean =
+    (input, result) match {
+      // ColumnarBatch has at most Int.MaxValue rows, fewer than 10^10. Ten extra
+      // decimal digits therefore cover every possible sum within a branch batch.
+      case (in: DecimalType, out: DecimalType) =>
+        in.scale == out.scale && out.precision - in.precision >= 10
+      case (ByteType | ShortType | IntegerType, LongType) => true
+      case _ => false
+    }
+
+  private[rapids] def sumCannotOverflowInBatch(child: Expression, result: DataType): Boolean =
+    child match {
+      // Spark's DecimalAggregates rule sums small decimals as unscaled Long values.
+      // At most Int.MaxValue values of magnitude < 10^9 still fit in a Long.
+      case GpuUnscaledValue(value) if result == LongType => value.dataType match {
+        case decimal: DecimalType => decimal.precision <= 9
+        case _ => false
+      }
+      case _ => sumCannotOverflowInBatch(child.dataType, result)
+    }
+
   private def supportedAggregate(expr: GpuAggregateExpression): Boolean = {
     val fn = expr.aggregateFunction
     expr.mode == Partial && !expr.isDistinct && expr.filter.isEmpty &&
       fn.deterministic && (fn match {
-        case c: GpuCount => c.children.length == 1 && !c.failOnError &&
+        // Each branch counts at most Int.MaxValue input rows. Keep its original
+        // checked aggregate function, including all subsequent merge checks.
+        case c: GpuCount => c.children.length == 1 &&
           keyType(c.children.head.dataType)
-        case s: GpuBasicSum => !s.failOnErrorOverride && integral(s.child.dataType) &&
-          integral(s.resultType)
-        case s: GpuBasicDecimalSum => !s.failOnErrorOverride
-        case s: GpuDecimal128Sum => !s.failOnErrorOverride
+        case s: GpuBasicSum => integral(s.child.dataType) && integral(s.resultType) &&
+          (!s.failOnErrorOverride || sumCannotOverflowInBatch(s.child, s.resultType))
+        case s: GpuBasicDecimalSum => !s.failOnErrorOverride ||
+          sumCannotOverflowInBatch(s.child.dataType, s.dt)
+        case s: GpuDecimal128Sum => !s.failOnErrorOverride ||
+          sumCannotOverflowInBatch(s.child.dataType, s.dt)
         // AVG branches cannot reuse partial buffers, so retain the unfused batching path.
         case _: GpuAverage => false
         case _: GpuMin | _: GpuMax => fn.children.length == 1 &&
@@ -308,13 +333,18 @@ private[rapids] case class ExpandAggregateBranch(
   // Does not own input. The outer retry restarts every allocation from the original rows.
   def apply(input: ColumnarBatch, mergeBuffers: Boolean = false): ColumnarBatch = {
     require(input.numRows() > 0, "Grouped Expand cannot reduce empty input into a row")
-    val (aggregation, projection) = if (mergeBuffers) {
+    val aggregation = if (mergeBuffers) merge.get.helper else helper
+    val projected = if (mergeBuffers) {
       val reuse = merge.get
-      (reuse.helper, reuse.input)
+      // The selected buffers are inputs to preMerge, not directly to cuDF. ANSI
+      // integral sums split each buffer into two chunks before aggregating it.
+      withResource(reuse.input.project(input)) { buffers =>
+        aggregation.preStepBound.project(buffers)
+      }
     } else {
-      (helper, helper.preStepBound)
+      helper.preStepBound.project(input)
     }
-    withResource(projection.project(input)) { pre =>
+    withResource(projected) { pre =>
       withResource(aggregation.aggregate(pre, NoopMetric)) { aggregated =>
         withResource(aggregation.postStepBound.project(aggregated)) { post =>
           restore.project(post)
