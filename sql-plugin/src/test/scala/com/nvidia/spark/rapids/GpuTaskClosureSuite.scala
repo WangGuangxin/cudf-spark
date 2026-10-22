@@ -25,7 +25,9 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, AttributeReference, NullsFirst, SortOrder}
+import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, JoinType, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
+import org.apache.spark.sql.rapids.GpuGreaterThan
 import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -63,6 +65,10 @@ class GpuTaskClosureSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   private def assertNoCapturedPlan(plan: SparkPlan): Unit = {
     // Construct and serialize the real RDD lineage, without running a GPU task.
+    assertNoCapturedPlanValue(plan.executeColumnar())
+  }
+
+  private def assertNoCapturedPlanValue(value: AnyRef): Unit = {
     withResource(new ObjectOutputStream(new ByteArrayOutputStream()) {
       enableReplaceObject(true)
       override protected def replaceObject(value: AnyRef): AnyRef = {
@@ -71,7 +77,7 @@ class GpuTaskClosureSuite extends AnyFunSuite with BeforeAndAfterAll {
         value
       }
     }) { stream =>
-      stream.writeObject(plan.executeColumnar())
+      stream.writeObject(value)
     }
   }
 
@@ -103,4 +109,63 @@ class GpuTaskClosureSuite extends AnyFunSuite with BeforeAndAfterAll {
     assertNoCapturedPlan(GpuGlobalLimitExec(10,
       EmptyInput(Seq(AttributeReference("key", IntegerType)())), offset = 3))
   }
+
+  private def shuffledJoin(
+      joinType: JoinType = Inner,
+      side: GpuBuildSide = GpuBuildRight,
+      withCondition: Boolean = false): GpuShuffledHashJoinExec = {
+    val leftKey = AttributeReference("leftKey", IntegerType)()
+    val rightKey = AttributeReference("rightKey", IntegerType)()
+    val condition = if (withCondition) Some(GpuGreaterThan(leftKey, rightKey)) else None
+    GpuShuffledHashJoinExec(Seq(leftKey), Seq(rightKey), joinType, side, condition,
+      EmptyInput(Seq(leftKey)), EmptyInput(Seq(rightKey)),
+      CoalesceReadOption(session.sessionState.conf), isSkewJoin = false)(
+      Seq(leftKey), Seq(rightKey))
+  }
+
+  private def sizedJoin(): GpuShuffledSymmetricHashJoinExec = {
+    val leftKey = AttributeReference("leftKey", IntegerType)()
+    val rightKey = AttributeReference("rightKey", IntegerType)()
+    GpuShuffledSymmetricHashJoinExec(Inner, Seq(leftKey), Seq(rightKey), None,
+      EmptyInput(Seq(leftKey)), EmptyInput(Seq(rightKey)), isGpuShuffle = true,
+      gpuBatchSizeBytes = 1024 * 1024, partitionNumAmplification = 8.0,
+      readOption = CoalesceReadOption(session.sessionState.conf), isSkewJoin = false)(
+      Seq(leftKey), Seq(rightKey))
+  }
+
+  test("Shuffled hash join task RDD does not capture a plan") {
+    assertNoCapturedPlan(shuffledJoin())
+  }
+
+  test("Sized hash join task RDD does not capture a plan") {
+    assertNoCapturedPlan(sizedJoin())
+  }
+
+  for (joinType <- Seq(Inner, LeftOuter, RightOuter, FullOuter, LeftSemi, LeftAnti);
+      side <- Seq(GpuBuildLeft, GpuBuildRight);
+      withCondition <- Seq(false, true)) {
+    test(s"Hash join $joinType $side condition=$withCondition has no plan in its task") {
+      assertNoCapturedPlan(shuffledJoin(joinType, side, withCondition))
+    }
+  }
+
+  test("Symmetric host and GPU join sizers do not retain an enclosing plan") {
+    val read = CoalesceReadOption(session.sessionState.conf)
+    assertNoCapturedPlanValue(
+      new GpuShuffledSymmetricHashJoinExec.HostHostSymmetricJoinSizer(read))
+    for (startWithLeft <- Seq(false, true)) {
+      assertNoCapturedPlanValue(
+        new GpuShuffledSymmetricHashJoinExec.SpillableColumnarBatchSymmetricJoinSizer(
+          startWithLeft))
+    }
+  }
+
+  test("Asymmetric host and GPU join sizers do not retain an enclosing plan") {
+    val read = CoalesceReadOption(session.sessionState.conf)
+    assertNoCapturedPlanValue(
+      new GpuShuffledAsymmetricHashJoinExec.HostHostAsymmetricJoinSizer(10, read))
+    assertNoCapturedPlanValue(
+      new GpuShuffledAsymmetricHashJoinExec.SpillableColumnarBatchAsymmetricJoinSizer(10))
+  }
+
 }

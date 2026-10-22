@@ -253,6 +253,9 @@ case class GpuShuffledHashJoinExec(
     val subPartConf = RapidsConf.HASH_SUB_PARTITION_TEST_ENABLED.get(conf)
        .map(_ && RapidsConf.TEST_CONF.get(conf))
     val localBuildOutput = buildPlan.output
+    val localBuildGoal = buildGoal
+    val localReadOption = readOption
+    val runtime = GpuHashJoin.bindRuntimeJoin(this)
 
     // Create a map of metrics that can be handed down to shuffle and coalesce
     // iterators, setting as noop certain metrics that the coalesce iterators
@@ -272,7 +275,8 @@ case class GpuShuffledHashJoinExec(
         val (buildData, maybeBufferedStreamIter) =
           GpuShuffledHashJoinExec.prepareBuildBatchesForJoin(buildIter,
             new CollectTimeIterator(NvtxRegistry.SHUFFLED_JOIN_STREAM, streamIter, streamTime),
-            realTarget, localBuildOutput, buildGoal, subPartConf, coalesceMetrics, readOption)
+            realTarget, localBuildOutput, localBuildGoal, subPartConf,
+            coalesceMetrics, localReadOption)
 
         buildData match {
           case Left(singleBatch) =>
@@ -280,7 +284,7 @@ case class GpuShuffledHashJoinExec(
               buildDataSize += GpuColumnVector.getTotalDeviceMemoryUsed(singleBatch)
             }
             // doJoin will close singleBatch
-            doJoin(singleBatch, maybeBufferedStreamIter, joinOptions,
+            runtime.doJoin(singleBatch, maybeBufferedStreamIter, joinOptions,
               numOutputRows, numOutputBatches, opTime, joinTime)
           case Right(builtBatchIter) =>
             // For big joins, when the build data can not fit into a single batch.
@@ -290,7 +294,7 @@ case class GpuShuffledHashJoinExec(
               }
               cb
             }
-            doJoinBySubPartition(sizeBuildIter, maybeBufferedStreamIter, joinOptions,
+            runtime.doJoinBySubPartition(sizeBuildIter, maybeBufferedStreamIter, joinOptions,
               numPartitions, numOutputRows, numOutputBatches, opTime, joinTime)
         }
       }
