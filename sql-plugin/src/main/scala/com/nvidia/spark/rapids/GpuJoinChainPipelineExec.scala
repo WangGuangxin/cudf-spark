@@ -187,6 +187,12 @@ case class GpuJoinChainPipelineExec(
 /** Keep the native partial/merge algorithms and buffer schema at the pipeline's dense boundary. */
 case class GpuJoinChainAggregateExec(aggregate: GpuHashAggregateExec, child: SparkPlan)
     extends GpuPartitioningPreservingUnaryExecNode with GpuExec {
+  override protected def doCanonicalize(): SparkPlan = {
+    val normalized = super.doCanonicalize().asInstanceOf[GpuJoinChainAggregateExec]
+    // The aggregate descriptor is not a child or expression visited by GpuExec.
+    normalized.copy(aggregate = aggregate.canonicalized.asInstanceOf[GpuHashAggregateExec])
+  }
+
   override def output: Seq[Attribute] = aggregate.output
   override def gpuExpressions: Seq[Expression] = aggregate.gpuExpressions
   override def producedAttributes: AttributeSet = aggregate.producedAttributes

@@ -244,6 +244,12 @@ case class GpuExpandAggregateExec(
     projections: Seq[Seq[Expression]],
     expandOutput: Seq[Attribute],
     child: SparkPlan) extends ShimUnaryExecNode with GpuExec {
+  override protected def doCanonicalize(): SparkPlan = {
+    val normalized = super.doCanonicalize().asInstanceOf[GpuExpandAggregateExec]
+    // The aggregate descriptor is not a child or expression visited by GpuExec.
+    normalized.copy(aggregate = aggregate.canonicalized.asInstanceOf[GpuHashAggregateExec])
+  }
+
   override def output: Seq[Attribute] = aggregate.output
   override def outputPartitioning: Partitioning = UnknownPartitioning(0)
   // The unfused plan coalesces Expand's output to the target size before the partial
