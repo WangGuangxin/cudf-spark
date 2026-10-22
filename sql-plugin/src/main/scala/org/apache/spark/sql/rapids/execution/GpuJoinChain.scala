@@ -571,9 +571,10 @@ object GpuJoinChain extends Logging {
               restored
             case _ => join
           }
+          val runtime = GpuHashJoin.bindRuntimeJoin(eagerJoin)
           val fallback = (built: Built, stream: Batches) => built match {
             case Left(batch) =>
-              eagerJoin.doJoin(batch, stream, options, rows, batches, opTime, joinTime)
+              runtime.doJoin(batch, stream, options, rows, batches, opTime, joinTime)
             case Right(_) => throw new IllegalStateException("broadcast build must be one batch")
           }
           val stats = () => {
@@ -712,6 +713,10 @@ object GpuJoinChain extends Logging {
     val nonUniqueFallbacks = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_FALLBACK_NON_UNIQUE)
     val classifications = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_BUILD_KEY_STATS)
     val statsCacheHits = optionalMetric(root.plan, GpuMetric.JOIN_CHAIN_BUILD_KEY_STATS_CACHE_HITS)
+    val buildDataMetrics = chain.links.map { link =>
+      if (link.node.broadcast) None
+      else Some(link.node.plan.gpuLongMetric(GpuMetric.BUILD_DATA_SIZE))
+    }
     val streamNvtx = if (root.broadcast) NvtxRegistry.BROADCAST_JOIN_STREAM
       else NvtxRegistry.SHUFFLED_JOIN_STREAM
     var inputs = chain.input.executeColumnar().mapPartitions { stream =>
@@ -797,11 +802,8 @@ object GpuJoinChain extends Logging {
                 val fits = classified.forall(_.buildKeysUnique) ||
                   mapWorkPerRow(classified) <= maxMapRows(options.targetSize)
                 if (fits) {
-                  chain.links.zip(builds).foreach { case (link, data) =>
-                    if (!link.node.broadcast) {
-                      link.node.plan.gpuLongMetric(GpuMetric.BUILD_DATA_SIZE) +=
-                        data.deviceMemorySize
-                    }
+                  buildDataMetrics.zip(builds).foreach { case (metric, data) =>
+                    metric.foreach(_ += data.deviceMemorySize)
                   }
                   fusedTasks += 1
                   terminal.foreach(_.fusedTasks += 1)

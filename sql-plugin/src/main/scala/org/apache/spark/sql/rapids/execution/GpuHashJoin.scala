@@ -602,6 +602,130 @@ object JoinImpl {
 }
 
 object GpuHashJoin {
+  /** Executor join state bound on the driver, without retaining a physical plan or its children. */
+  case class RuntimeJoin(
+      joinType: JoinType,
+      buildSide: GpuBuildSide,
+      compareNullsEqual: Boolean,
+      filterOutNull: Boolean,
+      boundBuildKeys: Seq[GpuExpression],
+      boundStreamKeys: Seq[GpuExpression],
+      boundConditionLeftRight: Option[GpuExpression],
+      numLeftColumns: Int,
+      numRightColumns: Int,
+      streamOutput: Seq[Attribute],
+      condition: Option[Expression],
+      buildSchema: StructType) extends Serializable {
+    def doJoin(
+        builtBatch: ColumnarBatch,
+        stream: Iterator[ColumnarBatch],
+        joinOptions: JoinOptions,
+        numOutputRows: GpuMetric,
+        numOutputBatches: GpuMetric,
+        opTime: GpuMetric,
+        joinTime: GpuMetric,
+        outputPruning: Option[JoinOutputPruning] = None): Iterator[ColumnarBatch] = {
+
+      // Only the plain hash iterator can emit the advertised pruned schema.
+      require(outputPruning.isEmpty || GpuHashJoin.canPruneOutput(joinType, condition),
+        s"output pruning is not supported for $joinType with condition $condition")
+
+      val nullFiltered = if (filterOutNull) {
+        val sb = closeOnExcept(builtBatch)(
+          SpillableColumnarBatch(_, SpillPriorities.ACTIVE_ON_DECK_PRIORITY))
+        GpuHashJoin.filterNullsWithRetryAndClose(sb, boundBuildKeys)
+      } else {
+        builtBatch
+      }
+
+      val spillableBuiltBatch = withResource(nullFiltered) {
+        LazySpillableColumnarBatch(_, "built")
+      }
+
+      val lazyStream = stream.map { cb =>
+        withResource(cb) { cb =>
+          LazySpillableColumnarBatch(cb, "stream_batch")
+        }
+      }
+
+      // The HashJoinIterator takes ownership of the built keys and built data. It will close
+      // them when it is done
+      val joinIterator = joinType match {
+        case ExistenceJoin(_) =>
+          // Create a new LazyCompiledCondition for this iterator (it takes ownership)
+          val lazyCond = boundConditionLeftRight.map { cond =>
+            LazyCompiledCondition(cond, numLeftColumns, numRightColumns)
+          }
+          new HashedExistenceJoinIterator(
+            spillableBuiltBatch,
+            boundBuildKeys,
+            lazyStream,
+            boundStreamKeys,
+            lazyCond,
+            buildSide,
+            compareNullsEqual,
+            opTime,
+            joinTime)
+        case FullOuter =>
+          // Create a new LazyCompiledCondition for this iterator (it takes ownership)
+          val lazyCond = boundConditionLeftRight.map { cond =>
+            LazyCompiledCondition(cond, numLeftColumns, numRightColumns)
+          }
+          new HashOuterJoinIterator(joinType, spillableBuiltBatch, boundBuildKeys, None, None,
+            lazyStream, boundStreamKeys, streamOutput,
+            lazyCond, joinOptions, buildSide,
+            compareNullsEqual, condition, opTime, joinTime)
+        case _ =>
+          if (boundConditionLeftRight.isDefined) {
+            // ConditionalHashJoinIterator will close the LazyCompiledCondition
+            // Create a new LazyCompiledCondition for this iterator (it takes ownership)
+            val lazyCond = LazyCompiledCondition(
+              boundConditionLeftRight.get,
+              numLeftColumns,
+              numRightColumns)
+            new ConditionalHashJoinIterator(spillableBuiltBatch, boundBuildKeys, None,
+              lazyStream, boundStreamKeys, streamOutput, lazyCond,
+              joinOptions, joinType, buildSide,
+              compareNullsEqual, condition, opTime, joinTime)
+          } else {
+            new HashJoinIterator(spillableBuiltBatch, boundBuildKeys, None,
+              lazyStream, boundStreamKeys, streamOutput, joinOptions,
+              joinType, buildSide, compareNullsEqual, condition, opTime, joinTime,
+              joinOutputPruning = outputPruning)
+          }
+      }
+
+      joinIterator.map { cb =>
+        numOutputRows += cb.numRows()
+        numOutputBatches += 1
+        cb
+      }
+    }
+
+    def doJoinBySubPartition(
+        builtIter: Iterator[ColumnarBatch],
+        streamIter: Iterator[ColumnarBatch],
+        joinOptions: JoinOptions,
+        numPartitions: Int,
+        numOutputRows: GpuMetric,
+        numOutputBatches: GpuMetric,
+        opTime: GpuMetric,
+        joinTime: GpuMetric,
+        outputPruning: Option[JoinOutputPruning] = None): Iterator[ColumnarBatch] = {
+      GpuSubPartitionHashJoin.doJoinBySubPartition(this, builtIter, streamIter, joinOptions,
+        numPartitions, numOutputRows, numOutputBatches, opTime, joinTime, outputPruning)
+    }
+  }
+
+  def bindRuntimeJoin(plan: GpuHashJoin): RuntimeJoin = {
+    RuntimeJoin(plan.joinType, plan.buildSide, plan.compareNullsEqual,
+      buildSideNeedsNullFilter(plan.joinType, plan.compareNullsEqual,
+        plan.buildSide, plan.buildKeys),
+      plan.boundBuildKeys, plan.boundStreamKeys, plan.boundConditionLeftRight,
+      plan.left.output.size, plan.right.output.size, plan.streamedPlan.output, plan.condition,
+      org.apache.spark.sql.rapids.shims.DataTypeUtilsShim.fromAttributes(plan.buildPlan.output))
+  }
+
   /**
    * Captures the normalized join condition and child plans after extracting any non-AST
    * expressions that can be safely computed on one side of the join.
@@ -2706,84 +2830,7 @@ trait GpuHashJoin extends GpuJoinExec {
       opTime: GpuMetric,
       joinTime: GpuMetric,
       outputPruning: Option[JoinOutputPruning] = None): Iterator[ColumnarBatch] = {
-
-    // Only the plain hash path below narrows its gather. Anything else would keep producing the
-    // full schema while the plan already advertises the pruned one.
-    require(outputPruning.isEmpty || GpuHashJoin.canPruneOutput(joinType, condition),
-      s"output pruning is not supported for $joinType with condition $condition")
-
-    val filterOutNull = GpuHashJoin.buildSideNeedsNullFilter(joinType, compareNullsEqual,
-      buildSide, buildKeys)
-
-    val nullFiltered = if (filterOutNull) {
-      val sb = closeOnExcept(builtBatch)(
-        SpillableColumnarBatch(_, SpillPriorities.ACTIVE_ON_DECK_PRIORITY))
-      GpuHashJoin.filterNullsWithRetryAndClose(sb, boundBuildKeys)
-    } else {
-      builtBatch
-    }
-
-    val spillableBuiltBatch = withResource(nullFiltered) {
-      LazySpillableColumnarBatch(_, "built")
-    }
-
-    val lazyStream = stream.map { cb =>
-      withResource(cb) { cb =>
-        LazySpillableColumnarBatch(cb, "stream_batch")
-      }
-    }
-
-    // The HashJoinIterator takes ownership of the built keys and built data. It will close
-    // them when it is done
-    val joinIterator = joinType match {
-      case ExistenceJoin(_) =>
-        // Create a new LazyCompiledCondition for this iterator (it takes ownership)
-        val lazyCond = boundConditionLeftRight.map { cond =>
-          LazyCompiledCondition(cond, left.output.size, right.output.size)
-        }
-        new HashedExistenceJoinIterator(
-          spillableBuiltBatch,
-          boundBuildKeys,
-          lazyStream,
-          boundStreamKeys,
-          lazyCond,
-          buildSide,
-          compareNullsEqual,
-          opTime,
-          joinTime)
-      case FullOuter =>
-        // Create a new LazyCompiledCondition for this iterator (it takes ownership)
-        val lazyCond = boundConditionLeftRight.map { cond =>
-          LazyCompiledCondition(cond, left.output.size, right.output.size)
-        }
-        new HashOuterJoinIterator(joinType, spillableBuiltBatch, boundBuildKeys, None, None,
-          lazyStream, boundStreamKeys, streamedPlan.output,
-          lazyCond, joinOptions, buildSide,
-          compareNullsEqual, condition, opTime, joinTime)
-      case _ =>
-        if (boundConditionLeftRight.isDefined) {
-          // ConditionalHashJoinIterator will close the LazyCompiledCondition
-          // Create a new LazyCompiledCondition for this iterator (it takes ownership)
-          val lazyCond = LazyCompiledCondition(
-            boundConditionLeftRight.get,
-            left.output.size,
-            right.output.size)
-          new ConditionalHashJoinIterator(spillableBuiltBatch, boundBuildKeys, None,
-            lazyStream, boundStreamKeys, streamedPlan.output, lazyCond,
-            joinOptions, joinType, buildSide,
-            compareNullsEqual, condition, opTime, joinTime)
-        } else {
-          new HashJoinIterator(spillableBuiltBatch, boundBuildKeys, None,
-            lazyStream, boundStreamKeys, streamedPlan.output, joinOptions,
-            joinType, buildSide, compareNullsEqual, condition, opTime, joinTime,
-            joinOutputPruning = outputPruning)
-        }
-    }
-
-    joinIterator.map { cb =>
-      numOutputRows += cb.numRows()
-      numOutputBatches += 1
-      cb
-    }
+    GpuHashJoin.bindRuntimeJoin(this).doJoin(builtBatch, stream, joinOptions,
+      numOutputRows, numOutputBatches, opTime, joinTime, outputPruning)
   }
 }

@@ -30,7 +30,63 @@ import org.apache.spark.sql.rapids.shims.DataTypeUtilsShim
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-object GpuSubPartitionHashJoin {
+object GpuSubPartitionHashJoin extends Logging {
+  def doJoinBySubPartition(
+      runtime: GpuHashJoin.RuntimeJoin,
+      builtIter: Iterator[ColumnarBatch],
+      streamIter: Iterator[ColumnarBatch],
+      joinOptions: JoinOptions,
+      numPartitions: Int,
+      numOutputRows: GpuMetric,
+      numOutputBatches: GpuMetric,
+      opTime: GpuMetric,
+      joinTime: GpuMetric,
+      outputPruning: Option[JoinOutputPruning] = None): Iterator[ColumnarBatch] = {
+    import runtime._
+
+    // A log for test to verify that sub-partitioning is used.
+    logInfo(s"$joinType hash join is executed by sub-partitioning " +
+      s"in task ${TaskContext.get().taskAttemptId()}")
+
+    new BaseSubHashJoinIterator(builtIter, boundBuildKeys, streamIter,
+        boundStreamKeys, numPartitions, joinOptions.targetSize, opTime) {
+
+      private[this] def canOptimizeOut(pair: PartitionPair): Boolean = {
+        val (build, stream) = pair.get
+        joinType match {
+          case _: InnerLike =>
+            // For inner join, no need to run if either side is empty
+            build.isEmpty || stream.isEmpty
+          case _ => false
+        }
+      }
+
+      override def setupJoinIterator(pair: PartitionPair): Option[Iterator[ColumnarBatch]] = {
+        if (canOptimizeOut(pair)) {
+          // Skip it due to optimization
+          None
+        } else {
+          val (build, stream) = pair.release
+          val buildCb = closeOnExcept(stream) { _ =>
+            withResource(build) { _ =>
+              build.map(_.getColumnarBatch()).getOrElse(GpuColumnVector.emptyBatch(buildSchema))
+            }
+          }
+          val streamIter = closeOnExcept(buildCb) { _ =>
+            GpuSubPartitionHashJoin.safeIteratorFromSeq(stream).map { spill =>
+              withResource(spill)(_.getColumnarBatch())
+            }
+          }
+          // Leverage the original join iterators
+          val joinIter = doJoin(buildCb, streamIter, joinOptions,
+            numOutputRows, numOutputBatches, opTime, joinTime, outputPruning)
+          Some(joinIter)
+        }
+      }
+
+    } // end of "new BaseSubHashJoinIterator"
+  }
+
   /**
    * Concatenate the input batches into a single one.
    * The caller is responsible for closing the returned batch.
@@ -572,47 +628,7 @@ trait GpuSubPartitionHashJoin extends Logging { self: GpuHashJoin =>
       opTime: GpuMetric,
       joinTime: GpuMetric,
       outputPruning: Option[JoinOutputPruning] = None): Iterator[ColumnarBatch] = {
-
-    // A log for test to verify that sub-partitioning is used.
-    logInfo(s"$joinType hash join is executed by sub-partitioning " +
-      s"in task ${TaskContext.get().taskAttemptId()}")
-
-    new BaseSubHashJoinIterator(builtIter, boundBuildKeys, streamIter,
-        boundStreamKeys, numPartitions, joinOptions.targetSize, opTime) {
-
-      private[this] def canOptimizeOut(pair: PartitionPair): Boolean = {
-        val (build, stream) = pair.get
-        joinType match {
-          case _: InnerLike =>
-            // For inner join, no need to run if either side is empty
-            build.isEmpty || stream.isEmpty
-          case _ => false
-        }
-      }
-
-      override def setupJoinIterator(pair: PartitionPair): Option[Iterator[ColumnarBatch]] = {
-        if (canOptimizeOut(pair)) {
-          // Skip it due to optimization
-          None
-        } else {
-          val (build, stream) = pair.release
-          val buildCb = closeOnExcept(stream) { _ =>
-            withResource(build) { _ =>
-              build.map(_.getColumnarBatch()).getOrElse(GpuColumnVector.emptyBatch(buildSchema))
-            }
-          }
-          val streamIter = closeOnExcept(buildCb) { _ =>
-            GpuSubPartitionHashJoin.safeIteratorFromSeq(stream).map { spill =>
-              withResource(spill)(_.getColumnarBatch())
-            }
-          }
-          // Leverage the original join iterators
-          val joinIter = doJoin(buildCb, streamIter, joinOptions,
-            numOutputRows, numOutputBatches, opTime, joinTime, outputPruning)
-          Some(joinIter)
-        }
-      }
-
-    } // end of "new BaseSubHashJoinIterator"
+    GpuHashJoin.bindRuntimeJoin(this).doJoinBySubPartition(builtIter, streamIter, joinOptions,
+      numPartitions, numOutputRows, numOutputBatches, opTime, joinTime, outputPruning)
   }
 }
