@@ -248,6 +248,7 @@ abstract class GpuBroadcastHashJoinExecBase(
     val buildSchema = getBroadcastPlan(buildPlan).schema
     val postProjectionAndClose = buildSidePostProjection
     val localIsNullAwareAntiJoin = isNullAwareAntiJoin
+    val runtime = GpuHashJoin.bindRuntimeJoin(this)
     rdd.mapPartitions { it =>
       val (broadcastBuiltBatch, streamIter) =
         GpuBroadcastHelper.getBroadcastBuiltBatchAndStreamIter(
@@ -265,7 +266,7 @@ abstract class GpuBroadcastHashJoinExecBase(
         if (builtBatch.numRows() == 0) {
           // Build side is empty, return the stream iterator directly.
           withResource(builtBatch)(_ => streamIter)
-        } else if (closeOnExcept(builtBatch)(GpuHashJoin.anyNullInKey(_, boundBuildKeys))) {
+        } else if (closeOnExcept(builtBatch)(GpuHashJoin.anyNullInKey(_, runtime.boundBuildKeys))) {
           // Spark will return an empty iterator if any nulls in the right table
           withResource(builtBatch)(_ => Iterator.empty)
         } else {
@@ -273,14 +274,14 @@ abstract class GpuBroadcastHashJoinExecBase(
           val nullFilteredStreamIter = streamIter.map { cb =>
             GpuHashJoin.filterNullsWithRetryAndClose(
               SpillableColumnarBatch(cb, SpillPriorities.ACTIVE_ON_DECK_PRIORITY),
-              boundStreamKeys)
+              runtime.boundStreamKeys)
           }
-          doJoin(builtBatch, nullFilteredStreamIter, joinOptions, numOutputRows,
+          runtime.doJoin(builtBatch, nullFilteredStreamIter, joinOptions, numOutputRows,
             numOutputBatches, opTime, joinTime, outputPruning)
         }
       } else {
         // builtBatch will be closed in doJoin
-        doJoin(builtBatch, streamIter, joinOptions, numOutputRows, numOutputBatches, opTime,
+        runtime.doJoin(builtBatch, streamIter, joinOptions, numOutputRows, numOutputBatches, opTime,
           joinTime, outputPruning)
       }
     }
