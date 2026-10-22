@@ -17,7 +17,7 @@
 package com.nvidia.spark.rapids
 
 import ai.rapids.cudf.OutOfBoundsPolicy
-import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.{splitTargetSizeInHalfGpu, withRestoreOnRetry, withRetry}
 import com.nvidia.spark.rapids.ScalableTaskCompletion.onTaskCompletion
@@ -208,6 +208,12 @@ abstract class SplittableJoinIterator(
   /** Process nested splits immediately when row expansion requires repeated splitting. */
   protected def splitBeforePending: Boolean = false
 
+  /**
+   * Output columns a fused parent projection still needs, as strictly increasing ordinals into
+   * each side's own schema. `None` keeps every column, which is what an unfused join does.
+   */
+  protected def outputPruning: Option[JoinOutputPruning] = None
+
   protected def computeNumJoinRows(cb: LazySpillableColumnarBatch): Long
 
   /**
@@ -331,16 +337,25 @@ abstract class SplittableJoinIterator(
   /**
    * Create a join gatherer from gather maps.
    * @param maps gather maps produced from a cudf join
-   * @param leftData batch corresponding to the left table in the join
-   * @param rightData batch corresponding to the right table in the join
+   * @param leftArg batch corresponding to the left table in the join
+   * @param rightArg batch corresponding to the right table in the join
    * @return some gatherer or None if there are no rows to gather in this join batch
    */
   protected def makeGatherer(
       maps: GatherMapsResult,
-      leftData: LazySpillableColumnarBatch,
-      rightData: LazySpillableColumnarBatch,
+      leftArg: LazySpillableColumnarBatch,
+      rightArg: LazySpillableColumnarBatch,
       joinType: JoinType): Option[JoinGatherer] = {
     withResource(maps) { _ =>
+      // Narrow both sides before any gatherer takes ownership, so the gather itself, its size
+      // estimates and its spilling all see only the columns that survive the parent projection.
+      val (leftData, rightData) = outputPruning match {
+        case Some(pruning) =>
+          closeOnExcept(LazySpillableColumnarBatch.project(leftArg, pruning.left)) { left =>
+            (left, LazySpillableColumnarBatch.project(rightArg, pruning.right))
+          }
+        case None => (leftArg, rightArg)
+      }
       val leftGatherer = joinType match {
         case LeftOuter if !maps.hasLeft =>
           // Distinct left outer joins only produce a single gather map since left table rows

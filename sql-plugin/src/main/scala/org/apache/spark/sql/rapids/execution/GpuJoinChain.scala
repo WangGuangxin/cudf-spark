@@ -503,6 +503,22 @@ object GpuJoinChain extends Logging {
     }
   }
 
+  /**
+   * The joins a fused chain anchored here would absorb, including the anchor, or empty when no
+   * chain forms. Another plan rule has to leave all of them alone: a node inserted anywhere in
+   * the chain breaks `childJoin`'s walk and silently costs the whole fusion.
+   */
+  def fusedMembers(plan: SparkPlan): Seq[SparkPlan] = {
+    if (!RapidsConf.ENABLE_JOIN_CHAIN.get(plan.conf)) {
+      Nil
+    } else {
+      analyze(plan) match {
+        case Fused(chain) => chain.links.map(_.node.plan)
+        case _ => Nil
+      }
+    }
+  }
+
   private[execution] def chainLength(plan: SparkPlan): Int = analyze(plan) match {
     case Fused(chain) => chain.links.size
     case _: Unfused => 1

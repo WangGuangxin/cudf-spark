@@ -24,6 +24,7 @@ import com.nvidia.spark.rapids.RmmRapidsRetryIterator.{withRestoreOnRetry, withR
 import com.nvidia.spark.rapids.jni.{GpuOOM, JoinPrimitives}
 import com.nvidia.spark.rapids.shims.ShimBinaryExecNode
 
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, NamedExpression}
 import org.apache.spark.sql.catalyst.plans.{Cross, ExistenceJoin, FullOuter, Inner, InnerLike, JoinType, LeftAnti, LeftExistence, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.execution.SparkPlan
@@ -628,6 +629,17 @@ object GpuHashJoin {
    * This is shared by join exec nodes and by the final projection used after condition
    * extraction so that temporary projection columns do not leak into the user-visible schema.
    */
+  /**
+   * Whether a join can emit a subset of its output columns. Only the plain hash path narrows its
+   * gather; a condition is evaluated against the full schemas, and the existence and full outer
+   * iterators build their output differently.
+   */
+  def canPruneOutput(joinType: JoinType, condition: Option[Expression]): Boolean =
+    condition.isEmpty && (joinType match {
+      case _: InnerLike | LeftOuter | RightOuter | LeftSemi | LeftAnti => true
+      case _ => false
+    })
+
   def output(joinType: JoinType, left: Seq[Attribute], right: Seq[Attribute]): Seq[Attribute] = {
     joinType match {
       case _: InnerLike =>
@@ -1152,7 +1164,8 @@ abstract class BaseHashJoinIterator(
     compareNullsEqual: Boolean,
     conditionForLogging: Option[Expression],
     opTime: GpuMetric,
-    joinTime: GpuMetric)
+    joinTime: GpuMetric,
+    joinOutputPruning: Option[JoinOutputPruning] = None)
     extends SplittableJoinIterator(
       NvtxRegistry.JOIN_GATHER,
       stream,
@@ -1162,6 +1175,8 @@ abstract class BaseHashJoinIterator(
       joinOptions.sizeEstimateThreshold,
       opTime = opTime,
       joinTime = joinTime) {
+  override protected def outputPruning: Option[JoinOutputPruning] = joinOutputPruning
+
   private var cachedBuiltKeys: Option[LazySpillableColumnarBatch] = None
   protected lazy val regularHash =
     new GpuJoinHashCache(false, compareNullsEqual, joinOptions.hashReuseEnabled)
@@ -1570,7 +1585,8 @@ class HashJoinIterator(
     val compareNullsEqual: Boolean, // This is a workaround to how cudf support joins for structs
     conditionForLogging: Option[Expression],
     opTime: GpuMetric,
-    private val joinTime: GpuMetric)
+    private val joinTime: GpuMetric,
+    joinOutputPruning: Option[JoinOutputPruning] = None)
     extends BaseHashJoinIterator(
       built,
       boundBuiltKeys,
@@ -1584,7 +1600,8 @@ class HashJoinIterator(
       compareNullsEqual,
       conditionForLogging,
       opTime = opTime,
-      joinTime = joinTime) {
+      joinTime = joinTime,
+      joinOutputPruning = joinOutputPruning) {
   override protected def joinGathererLeftRight(
       leftKeys: Table,
       leftData: LazySpillableColumnarBatch,
@@ -2555,6 +2572,18 @@ trait GpuJoinExec extends ShimBinaryExecNode with GpuExec {
   def leftKeys: Seq[Expression]
   def rightKeys: Seq[Expression]
   def isSkewJoin: Boolean = false
+
+  /**
+   * Whether this join can emit only a subset of its output columns, letting a fused parent
+   * projection keep the gather from materializing columns it drops right away.
+   */
+  def canPruneOutput: Boolean = false
+
+  /**
+   * Execute this join emitting only the columns named by `pruning`. `None` means this join
+   * declined, and the caller has to narrow the full output itself.
+   */
+  def executeColumnarPruned(pruning: JoinOutputPruning): Option[RDD[ColumnarBatch]] = None
 }
 
 trait GpuHashJoin extends GpuJoinExec {
@@ -2675,7 +2704,13 @@ trait GpuHashJoin extends GpuJoinExec {
       numOutputRows: GpuMetric,
       numOutputBatches: GpuMetric,
       opTime: GpuMetric,
-      joinTime: GpuMetric): Iterator[ColumnarBatch] = {
+      joinTime: GpuMetric,
+      outputPruning: Option[JoinOutputPruning] = None): Iterator[ColumnarBatch] = {
+
+    // Only the plain hash path below narrows its gather. Anything else would keep producing the
+    // full schema while the plan already advertises the pruned one.
+    require(outputPruning.isEmpty || GpuHashJoin.canPruneOutput(joinType, condition),
+      s"output pruning is not supported for $joinType with condition $condition")
 
     val filterOutNull = GpuHashJoin.buildSideNeedsNullFilter(joinType, compareNullsEqual,
       buildSide, buildKeys)
@@ -2740,7 +2775,8 @@ trait GpuHashJoin extends GpuJoinExec {
         } else {
           new HashJoinIterator(spillableBuiltBatch, boundBuildKeys, None,
             lazyStream, boundStreamKeys, streamedPlan.output, joinOptions,
-            joinType, buildSide, compareNullsEqual, condition, opTime, joinTime)
+            joinType, buildSide, compareNullsEqual, condition, opTime, joinTime,
+            joinOutputPruning = outputPruning)
         }
     }
 

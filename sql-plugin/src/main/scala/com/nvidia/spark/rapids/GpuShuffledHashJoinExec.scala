@@ -251,6 +251,14 @@ case class GpuShuffledHashJoinExec(
     GpuJoinChain.execute(this).getOrElse(doColumnarJoinEager())
   }
 
+  override def canPruneOutput: Boolean = GpuHashJoin.canPruneOutput(joinType, condition)
+
+  // A fused parent projection takes over this join's output, so the chain's own absorbed
+  // projections no longer describe the schema the plan advertises. Use the eager path.
+  override def executeColumnarPruned(
+      pruning: JoinOutputPruning): Option[RDD[ColumnarBatch]] =
+    Some(doColumnarJoinEager(Some(pruning)))
+
   def joinChainTarget: Long = realTargetBatchSize()
 
   // A chain may keep the preceding inner join on the streaming side. Bind an internal copy to
@@ -307,7 +315,8 @@ case class GpuShuffledHashJoinExec(
     }
   }
 
-  private def doColumnarJoinEager(): RDD[ColumnarBatch] = {
+  private def doColumnarJoinEager(
+      outputPruning: Option[JoinOutputPruning] = None): RDD[ColumnarBatch] = {
     val buildDataSize = gpuLongMetric(BUILD_DATA_SIZE)
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
@@ -346,7 +355,7 @@ case class GpuShuffledHashJoinExec(
             }
             // doJoin will close singleBatch
             doJoin(singleBatch, maybeBufferedStreamIter, joinOptions,
-              numOutputRows, numOutputBatches, opTime, joinTime)
+              numOutputRows, numOutputBatches, opTime, joinTime, outputPruning)
           case Right(builtBatchIter) =>
             // For big joins, when the build data can not fit into a single batch.
             val sizeBuildIter = builtBatchIter.map { cb =>
@@ -356,7 +365,7 @@ case class GpuShuffledHashJoinExec(
               cb
             }
             doJoinBySubPartition(sizeBuildIter, maybeBufferedStreamIter, joinOptions,
-              numPartitions, numOutputRows, numOutputBatches, opTime, joinTime)
+              numPartitions, numOutputRows, numOutputBatches, opTime, joinTime, outputPruning)
         }
       }
     }

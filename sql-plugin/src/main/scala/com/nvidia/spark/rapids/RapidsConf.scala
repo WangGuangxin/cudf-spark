@@ -1305,6 +1305,25 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(false)
 
+  val ENABLE_GENERATE_FILTER_FUSION = conf("spark.rapids.sql.generateFilterFusion.enabled")
+      .doc("Apply a filter above an explode before the retained child columns are replicated, " +
+        "so rows the filter rejects never have their payload copied.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val GENERATE_FILTER_FUSION_MIN_BYTES =
+    conf("spark.rapids.sql.generateFilterFusion.minReplicatedBytes")
+      .doc("Minimum bytes per row of replicated columns before generate/filter fusion is used. " +
+        "Below this the extra index and gather cost more than the replication they avoid.")
+      .integerConf
+      .createWithDefault(16)
+
+  val ENABLE_JOIN_PROJECT_PRUNING = conf("spark.rapids.sql.joinProjectPruning.enabled")
+      .doc("Let a GPU hash join skip gathering output columns that the projection above it " +
+        "drops, such as the build side copy of an equi-join key.")
+      .booleanConf
+      .createWithDefault(false)
+
   val ENABLE_EXPAND_AGGREGATE_FUSION = conf("spark.rapids.sql.expandAggregateFusion.enabled")
       .doc("Fuse eligible GPU grouping-set expands and partial aggregates to avoid " +
         "materializing expanded input batches.")
@@ -3756,6 +3775,12 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val isFilterProjectFusionEnabled: Boolean = get(ENABLE_FILTER_PROJECT_FUSION)
 
   lazy val isExpandAggregateFusionEnabled: Boolean = get(ENABLE_EXPAND_AGGREGATE_FUSION)
+
+  lazy val isJoinProjectPruningEnabled: Boolean = get(ENABLE_JOIN_PROJECT_PRUNING)
+
+  lazy val isGenerateFilterFusionEnabled: Boolean = get(ENABLE_GENERATE_FILTER_FUSION)
+
+  lazy val generateFilterFusionMinBytes: Long = get(GENERATE_FILTER_FUSION_MIN_BYTES).toLong
 
   lazy val isTieredProjectEnabled: Boolean = get(ENABLE_TIERED_PROJECT)
 

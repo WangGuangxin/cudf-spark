@@ -18,7 +18,7 @@ package org.apache.spark.sql.rapids.execution
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-import com.nvidia.spark.rapids.{GpuBatchUtils, GpuColumnVector, GpuExpression, GpuHashPartitioner, GpuMetric, NvtxRegistry, RmmRapidsRetryIterator, SpillableColumnarBatch, SpillPriorities, TaskAutoCloseableResource}
+import com.nvidia.spark.rapids.{GpuBatchUtils, GpuColumnVector, GpuExpression, GpuHashPartitioner, GpuMetric, JoinOutputPruning, NvtxRegistry, RmmRapidsRetryIterator, SpillableColumnarBatch, SpillPriorities, TaskAutoCloseableResource}
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 
@@ -570,7 +570,8 @@ trait GpuSubPartitionHashJoin extends Logging { self: GpuHashJoin =>
       numOutputRows: GpuMetric,
       numOutputBatches: GpuMetric,
       opTime: GpuMetric,
-      joinTime: GpuMetric): Iterator[ColumnarBatch] = {
+      joinTime: GpuMetric,
+      outputPruning: Option[JoinOutputPruning] = None): Iterator[ColumnarBatch] = {
 
     // A log for test to verify that sub-partitioning is used.
     logInfo(s"$joinType hash join is executed by sub-partitioning " +
@@ -607,7 +608,7 @@ trait GpuSubPartitionHashJoin extends Logging { self: GpuHashJoin =>
           }
           // Leverage the original join iterators
           val joinIter = doJoin(buildCb, streamIter, joinOptions,
-            numOutputRows, numOutputBatches, opTime, joinTime)
+            numOutputRows, numOutputBatches, opTime, joinTime, outputPruning)
           Some(joinIter)
         }
       }

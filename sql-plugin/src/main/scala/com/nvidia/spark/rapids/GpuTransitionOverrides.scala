@@ -963,6 +963,13 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
         if (rapidsConf.isExpandAggregateFusionEnabled) {
           updatedPlan = GpuExpandAggregateExec.fuse(updatedPlan, rapidsConf.shouldExplain)
         }
+        if (rapidsConf.isGenerateFilterFusionEnabled) {
+          updatedPlan = GpuGenerateFilterExec.fuse(updatedPlan,
+            rapidsConf.generateFilterFusionMinBytes, rapidsConf.shouldExplain)
+        }
+        if (rapidsConf.isJoinProjectPruningEnabled) {
+          updatedPlan = GpuJoinProjectExec.fuse(updatedPlan, rapidsConf.shouldExplain)
+        }
         updatedPlan = insertColumnarFromGpu(updatedPlan)
         updatedPlan = insertCoalesce(updatedPlan)
         // only insert shuffle coalesces when using normal shuffle

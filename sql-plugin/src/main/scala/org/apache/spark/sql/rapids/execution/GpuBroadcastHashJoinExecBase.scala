@@ -221,7 +221,18 @@ abstract class GpuBroadcastHashJoinExecBase(
     buildSidePostProjection
   private[execution] def chainBuildSchema: StructType = getBroadcastPlan(buildPlan).schema
 
-  private def doColumnarBroadcastJoinEager(): RDD[ColumnarBatch] = {
+  // The chain absorbs its own projections, so once a parent projection owns this join's schema
+  // the eager path is the one that can honor it. Null-aware anti joins can hand back the stream
+  // iterator untouched, which would bypass the narrowed gather, so they keep the full schema.
+  override def canPruneOutput: Boolean =
+    GpuHashJoin.canPruneOutput(joinType, condition) && !isNullAwareAntiJoin
+
+  override def executeColumnarPruned(
+      pruning: JoinOutputPruning): Option[RDD[ColumnarBatch]] =
+    Some(doColumnarBroadcastJoinEager(Some(pruning)))
+
+  private def doColumnarBroadcastJoinEager(
+      outputPruning: Option[JoinOutputPruning] = None): RDD[ColumnarBatch] = {
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
     val opTime = gpuLongMetric(OP_TIME_LEGACY)
@@ -265,12 +276,12 @@ abstract class GpuBroadcastHashJoinExecBase(
               boundStreamKeys)
           }
           doJoin(builtBatch, nullFilteredStreamIter, joinOptions, numOutputRows,
-            numOutputBatches, opTime, joinTime)
+            numOutputBatches, opTime, joinTime, outputPruning)
         }
       } else {
         // builtBatch will be closed in doJoin
         doJoin(builtBatch, streamIter, joinOptions, numOutputRows, numOutputBatches, opTime,
-          joinTime)
+          joinTime, outputPruning)
       }
     }
   }

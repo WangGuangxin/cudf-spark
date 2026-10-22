@@ -225,6 +225,23 @@ object LazySpillableColumnarBatch {
       name: String): LazySpillableColumnarBatch =
     new LazySpillableColumnarBatchImpl(cb, name)
 
+  /**
+   * Restrict a batch to a subset of its columns without copying any data. Ordinals must be
+   * strictly increasing so the projected batch keeps the original relative column order.
+   */
+  def project(wrapped: LazySpillableColumnarBatch,
+      ordinals: Array[Int]): LazySpillableColumnarBatch = {
+    require(ordinals.sliding(2).forall(p => p.length < 2 || p(0) < p(1)),
+      "projection ordinals must be strictly increasing")
+    require(ordinals.forall(i => i >= 0 && i < wrapped.numCols),
+      s"projection ordinals must address columns of a ${wrapped.numCols} column batch")
+    if (ordinals.length == wrapped.numCols) {
+      wrapped
+    } else {
+      new ProjectedLazySpillableColumnarBatch(wrapped, ordinals)
+    }
+  }
+
   def spillOnly(wrapped: LazySpillableColumnarBatch): LazySpillableColumnarBatch = wrapped match {
     case alreadyGood: AllowSpillOnlyLazySpillableColumnarBatchImpl => alreadyGood
     case anythingElse => AllowSpillOnlyLazySpillableColumnarBatchImpl(anythingElse)
@@ -332,6 +349,80 @@ class LazySpillableColumnarBatchImpl(
     allowSpilling()
 
   override def toString: String = s"SpillableBatch $name $numCols X $numRows"
+}
+
+/**
+ * A column subset of another `LazySpillableColumnarBatch`. The wrapped batch owns the data; this
+ * only hands out reference-counted views of the columns that are still needed. Used to keep a
+ * join from gathering output columns that the consuming projection discards right away.
+ */
+class ProjectedLazySpillableColumnarBatch(
+    private val wrapped: LazySpillableColumnarBatch,
+    private val ordinals: Array[Int]) extends LazySpillableColumnarBatch {
+
+  private var cached: Option[ColumnarBatch] = None
+
+  override val numRows: Int = wrapped.numRows
+  override val dataTypes: Array[DataType] = ordinals.map(wrapped.dataTypes)
+  override val numCols: Int = ordinals.length
+
+  // Proportional, because an exact size would have to unspill the wrapped batch. This only feeds
+  // the gather size estimates, which already tolerate approximation.
+  override lazy val deviceMemorySize: Long =
+    if (wrapped.numCols == 0) 0L
+    else wrapped.deviceMemorySize * ordinals.length / wrapped.numCols
+
+  private def dropCache(): Unit = {
+    cached.foreach(_.close())
+    cached = None
+  }
+
+  override def getBatch: ColumnarBatch = {
+    if (cached.isEmpty) {
+      // An empty projection still has to carry the row count for the join to stay consistent.
+      cached = if (ordinals.isEmpty) {
+        Some(new ColumnarBatch(Array.empty, numRows))
+      } else {
+        val full = wrapped.getBatch
+        val columns = ordinals.safeMap { i =>
+          full.column(i).asInstanceOf[GpuColumnVector].incRefCount()
+        }
+        closeOnExcept(columns) { _ =>
+          Some(new ColumnarBatch(columns.toArray, full.numRows()))
+        }
+      }
+    }
+    cached.get
+  }
+
+  override def releaseBatch(): ColumnarBatch = {
+    closeOnExcept(GpuColumnVector.incRefCounts(getBatch)) { batch =>
+      allowSpilling()
+      batch
+    }
+  }
+
+  override def allowSpilling(): Unit = {
+    dropCache()
+    wrapped.allowSpilling()
+  }
+
+  override def close(): Unit = {
+    dropCache()
+    wrapped.close()
+  }
+
+  override def checkpoint(): Unit = {
+    dropCache()
+    wrapped.checkpoint()
+  }
+
+  override def restore(): Unit = {
+    dropCache()
+    wrapped.restore()
+  }
+
+  override def toString: String = s"PROJECTED[${ordinals.mkString(",")}] $wrapped"
 }
 
 trait LazySpillableGatherMap extends LazySpillable {

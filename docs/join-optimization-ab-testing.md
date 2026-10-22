@@ -76,3 +76,42 @@ A task falls back before probing if even one input row would exceed the map budg
 build is oversized. `joinChainFallbackNonUnique` now counts excessive non-unique fanout,
 rather than every duplicate build. Keep `chain.enabled` fixed when testing hash reuse,
 and compare chain on/off for this extension. Performance still needs workload measurement.
+
+## Join output pruning
+
+`spark.rapids.sql.joinProjectPruning.enabled` (default false) lets a GPU hash join skip
+gathering output columns that the projection directly above it discards. The build side's copy
+of an equi-join key is the systematic case: the gather materializes it and the next projection
+drops it, once per join.
+
+A plan-time rule replaces `GpuProject(join)` with `GpuProject(GpuPrunedJoin(join))`. The pruned
+node advertises the narrowed schema, so the projection binds against it with no rewriting of
+its expressions; computed projections are pruned the same way as reference-only ones. Both
+per-side ordinal lists reach the gatherer, which restricts each side's batch before any gatherer
+takes ownership, so the gather, its size estimates and its spilling all see only the surviving
+columns. A side that contributes nothing takes the gatherer's existing no-right-columns path.
+When every output column is read, the rule leaves the plan alone.
+
+Pruned joins are broadcast hash joins, shuffled hash joins, and the sized symmetric and
+asymmetric joins. The first two narrow inner, left/right outer, semi and anti joins; the sized
+joins narrow inner joins only, because their outer path can take the row-tracking iterator,
+which builds the full schema. Null-aware anti joins and any join with a non-equi condition keep
+their full output, as do existence and full outer joins. A join that declines still gets the
+advertised schema, from a projection that saves nothing.
+
+Pruning and `join.chain.enabled` do not compose yet: a pruned join uses its eager path, because
+the chain absorbs its own intermediate projections and no longer describes the schema the plan
+advertises. Keep the chain setting fixed between pruning variants, and expect a chain's measured
+benefit to drop once pruning lands, since pruning removes some of the same waste. The chain's
+`worthwhile` estimate still sums whole intermediate join outputs, so it overstates its own
+benefit when pruning is on.
+
+Op time for a pruned join is attributed to the `GpuPrunedJoin` node rather than the join, and
+LORE dumps of that join are skipped. Its row and batch metrics are unchanged.
+
+Regression coverage compares CPU against GPU with pruning off and on for broadcast and shuffled
+plans, inner, outer, semi and anti joins, reference-only and computed projections, multiple
+output batches at a small target size, projections that read nothing from the stream side, and
+the rejection paths. A unit test covers the projected spillable batch, including its empty
+projection and its behavior across spilling. These establish correctness and path selection;
+they do not establish workload performance gains.

@@ -341,7 +341,8 @@ object GpuShuffledSizedHashJoinExec {
       joinOptions: JoinOptions,
       conditionForLogging: Option[Expression],
       opTime: GpuMetric,
-      joinTime: GpuMetric): Iterator[ColumnarBatch] = {
+      joinTime: GpuMetric,
+      outputPruning: Option[JoinOutputPruning] = None): Iterator[ColumnarBatch] = {
     info.joinType match {
       case FullOuter =>
         // Create a LazyCompiledCondition for this iterator (it takes ownership)
@@ -373,7 +374,8 @@ object GpuShuffledSizedHashJoinExec {
         new HashJoinIterator(spillableBuiltBatch, info.exprs.boundBuildKeys, info.buildStats,
           lazyStream, info.exprs.boundStreamKeys, info.exprs.streamOutput,
           joinOptions, info.joinType, info.buildSide,
-          info.exprs.compareNullsEqual, conditionForLogging, opTime, joinTime)
+          info.exprs.compareNullsEqual, conditionForLogging, opTime, joinTime,
+          joinOutputPruning = outputPruning)
     }
   }
 }
@@ -486,10 +488,10 @@ abstract class GpuShuffledSizedHashJoinExec[HOST_BATCH_TYPE <: AutoCloseable] ex
         cond, target, metrics)
       val joined = if (info.buildSize <= target) {
         metrics(SMALL_JOIN_COUNT) += 1
-        doSmallBuildJoin(info, options, metrics)
+        doSmallBuildJoin(info, options, metrics, None)
       } else {
         metrics(BIG_JOIN_COUNT) += 1
-        doBigBuildJoin(info, options, amplification, metrics)
+        doBigBuildJoin(info, options, amplification, metrics, None)
       }
       joined.map { batch =>
         metrics(NUM_OUTPUT_ROWS) += batch.numRows()
@@ -499,7 +501,17 @@ abstract class GpuShuffledSizedHashJoinExec[HOST_BATCH_TYPE <: AutoCloseable] ex
     }
   }
 
-  private def doColumnarJoinEager(): RDD[ColumnarBatch] = {
+  // Only inner joins funnel through createJoinIterator on both the small and big build paths.
+  // Outer joins can take the row-tracking iterator, which still builds the full schema.
+  override def canPruneOutput: Boolean =
+    GpuHashJoin.canPruneOutput(joinType, condition) && joinType.isInstanceOf[InnerLike]
+
+  override def executeColumnarPruned(
+      pruning: JoinOutputPruning): Option[RDD[ColumnarBatch]] =
+    Some(doColumnarJoinEager(Some(pruning)))
+
+  private def doColumnarJoinEager(
+      outputPruning: Option[JoinOutputPruning] = None): RDD[ColumnarBatch] = {
     val localJoinType = joinType
     val localLeftKeys = leftKeys
     val leftOutput = left.output
@@ -536,12 +548,12 @@ abstract class GpuShuffledSizedHashJoinExec[HOST_BATCH_TYPE <: AutoCloseable] ex
         if (localJoinType.isInstanceOf[InnerLike] && joinInfo.buildSize == 0) {
           Iterator.empty
         } else {
-          doSmallBuildJoin(joinInfo, localJoinOptions, localMetrics)
+          doSmallBuildJoin(joinInfo, localJoinOptions, localMetrics, outputPruning)
         }
       } else {
         localMetrics(BIG_JOIN_COUNT) += 1
         doBigBuildJoin(joinInfo, localJoinOptions,
-          partitionNumAmplification, localMetrics)
+          partitionNumAmplification, localMetrics, outputPruning)
       }
       val numOutputRows = localMetrics(NUM_OUTPUT_ROWS)
       val numOutputBatches = localMetrics(NUM_OUTPUT_BATCHES)
@@ -564,7 +576,8 @@ abstract class GpuShuffledSizedHashJoinExec[HOST_BATCH_TYPE <: AutoCloseable] ex
   private def doSmallBuildJoin(
       info: JoinInfo,
       joinOptions: JoinOptions,
-      metricsMap: Map[String, GpuMetric]): Iterator[ColumnarBatch] = {
+      metricsMap: Map[String, GpuMetric],
+      outputPruning: Option[JoinOutputPruning]): Iterator[ColumnarBatch] = {
     val opTime = metricsMap(OP_TIME_LEGACY)
     val lazyStream = new Iterator[LazySpillableColumnarBatch]() {
       override def hasNext: Boolean = info.streamIter.hasNext
@@ -597,7 +610,7 @@ abstract class GpuShuffledSizedHashJoinExec[HOST_BATCH_TYPE <: AutoCloseable] ex
       LazySpillableColumnarBatch(batch, "built")
     }
     createJoinIterator(info, spillableBuiltBatch, lazyStream, joinOptions,
-      condition, opTime, metricsMap(JOIN_TIME))
+      condition, opTime, metricsMap(JOIN_TIME), outputPruning)
   }
 
   /**
@@ -613,9 +626,10 @@ abstract class GpuShuffledSizedHashJoinExec[HOST_BATCH_TYPE <: AutoCloseable] ex
       info: JoinInfo,
       joinOptions: JoinOptions,
       partitionNumAmplification: Double,
-      metricsMap: Map[String, GpuMetric]): Iterator[ColumnarBatch] = {
+      metricsMap: Map[String, GpuMetric],
+      outputPruning: Option[JoinOutputPruning]): Iterator[ColumnarBatch] = {
     new BigSizedJoinIterator(info, joinOptions, condition,
-      partitionNumAmplification, metricsMap)
+      partitionNumAmplification, metricsMap, outputPruning)
   }
 
   /**
@@ -1718,7 +1732,8 @@ class BigSizedJoinIterator(
     joinOptions: JoinOptions,
     conditionForLogging: Option[Expression],
     partitionNumAmplification: Double,
-    metrics: Map[String, GpuMetric])
+    metrics: Map[String, GpuMetric],
+    outputPruning: Option[JoinOutputPruning] = None)
   extends Iterator[ColumnarBatch] with TaskAutoCloseableResource {
 
   private val buildPartitioner = {
@@ -1880,7 +1895,7 @@ class BigSizedJoinIterator(
         info.exprs.compareNullsEqual, conditionForLogging, opTime, joinTime)
     } else {
       GpuShuffledSizedHashJoinExec.createJoinIterator(info, builtBatch, lazyStream,
-        joinOptions, conditionForLogging, opTime, joinTime)
+        joinOptions, conditionForLogging, opTime, joinTime, outputPruning)
     }
   }
 }
