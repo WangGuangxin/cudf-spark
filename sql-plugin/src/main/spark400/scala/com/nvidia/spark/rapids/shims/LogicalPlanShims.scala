@@ -29,10 +29,21 @@ spark-rapids-shim-json-lines ***/
 
 package com.nvidia.spark.rapids.shims
 
+import org.apache.spark.sql.catalyst.expressions.{Between, CommonExpressionRef, Expression, With}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.datasources.{FileIndex, HadoopFsRelation, LogicalRelationWithTable}
 
 object LogicalPlanShims {
+  /** Expose analyzed comparisons to the global-aggregate rule's nonthrowing safety checks. */
+  def inlinePredicateExpressions(expression: Expression): Expression = expression.transformUp {
+    case common: With =>
+      val definitions = common.defs.map(value => value.id -> value.child).toMap
+      common.child.transformUp {
+        case reference: CommonExpressionRef => definitions.getOrElse(reference.id, reference)
+      }
+    case between: Between => between.replacement
+  }
+
   def getLocations(plan: LogicalPlan): Seq[FileIndex] = plan.collect {
     case LogicalRelationWithTable(t: HadoopFsRelation, _) => t.location
   }

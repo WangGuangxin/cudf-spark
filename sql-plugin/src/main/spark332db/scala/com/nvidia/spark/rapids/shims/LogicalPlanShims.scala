@@ -35,10 +35,14 @@
 spark-rapids-shim-json-lines ***/
 package com.nvidia.spark.rapids.shims
 
+import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.datasources.{FileIndex, HadoopFsRelation, LogicalRelation}
 
 object LogicalPlanShims {
+  // Spark 3 represents BETWEEN directly as comparisons, without Spark 4's With/Between wrappers.
+  def inlinePredicateExpressions(expression: Expression): Expression = expression
+
   def getLocations(plan: LogicalPlan): Seq[FileIndex] = plan.collect {
     case LogicalRelation(t: HadoopFsRelation, _, _, _) => t.location
   }
