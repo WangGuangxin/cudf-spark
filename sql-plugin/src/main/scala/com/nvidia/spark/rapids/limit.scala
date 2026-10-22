@@ -157,8 +157,9 @@ trait GpuBaseLimitExec extends LimitExec with GpuExec with ShimUnaryExecNode {
     val opTime = gpuLongMetric(OP_TIME_LEGACY)
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val numOutputBatches = gpuLongMetric(NUM_OUTPUT_BATCHES)
+    val outputTypes = output.map(_.dataType).toArray
     rdd.mapPartitions { iter =>
-      new GpuBaseLimitIterator(iter, limit, offset, output.map(_.dataType).toArray,
+      new GpuBaseLimitIterator(iter, limit, offset, outputTypes,
         opTime, numOutputBatches, numOutputRows)
     }
   }
@@ -420,12 +421,13 @@ case class GpuTopN(
     val sortTime = gpuLongMetric(SORT_TIME)
     val concatTime = gpuLongMetric(CONCAT_TIME)
     val localLimit = limit
+    val localOffset = offset
     val localProjectList = projectList
     val childOutput = child.output
 
     child.executeColumnar().mapPartitions { iter =>
       val topN = GpuTopN(localLimit, sorter, iter, opTime, sortTime, concatTime,
-        inputBatches, inputRows, outputBatches, outputRows, offset)
+        inputBatches, inputRows, outputBatches, outputRows, localOffset)
       if (localProjectList != childOutput) {
         topN.map { scb =>
           opTime.ns {

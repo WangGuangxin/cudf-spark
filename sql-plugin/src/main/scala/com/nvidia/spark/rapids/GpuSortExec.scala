@@ -136,13 +136,15 @@ case class GpuSortExec(
     val outputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val outOfCore = sortType == OutOfCoreSort
     val singleBatch = sortType == FullSortSingleBatch
+    val localTargetSize = if (outOfCore) targetSize else 0L
+    val localWriteTrackers = writeTrackers
     child.executeColumnar().mapPartitions { cbIter =>
-      val taskTrackers = writeTrackers.map { tcs =>
+      val taskTrackers = localWriteTrackers.map { tcs =>
         tcs.map(_.newTaskInstance().asInstanceOf[GpuWriteTaskStatsTracker])
       }
       val finalIter = if (outOfCore) {
         val iter = GpuOutOfCoreSortIterator(cbIter, sorter,
-          targetSize, opTime, sortTime, outputBatch, outputRows)
+          localTargetSize, opTime, sortTime, outputBatch, outputRows)
         onTaskCompletion(iter.close())
         iter
       } else {
