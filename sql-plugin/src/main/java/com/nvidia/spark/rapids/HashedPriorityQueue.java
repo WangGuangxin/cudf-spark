@@ -72,16 +72,6 @@ public final class HashedPriorityQueue<T> extends AbstractQueue<T> {
     size = 0;
   }
 
-  private HashedPriorityQueue(T[] heap, int size, HashMap<T, MutableInt> locationMap,
-                              Comparator<? super T> comparator) {
-    this.comparator = comparator;
-    this.heap = Arrays.copyOf(heap, size);
-    this.size = size;
-    locationMap.forEach((T k, MutableInt v) -> {
-      this.locationMap.put(k, new MutableInt(v.intValue()));
-    });
-  }
-
   @Override
   public int size() {
     return size;
@@ -174,16 +164,44 @@ public final class HashedPriorityQueue<T> extends AbstractQueue<T> {
   }
 
   public Iterator<T> priorityIterator() {
-    HashedPriorityQueue<T> copy = new HashedPriorityQueue<>(heap, size, locationMap, comparator);
+    // Ordered traversal only removes the root, so the snapshot needs no location index.
+    // In particular, spill planning can take this snapshot while holding the store lock
+    // without allocating a HashMap entry and MutableInt for every tracked buffer.
+    T[] copy = Arrays.copyOf(heap, size);
     return new Iterator<T>() {
+      private int remaining = copy.length;
+
       @Override
       public boolean hasNext() {
-        return !copy.isEmpty();
+        return remaining != 0;
       }
 
       @Override
       public T next() {
-        return copy.poll();
+        if (remaining == 0) {
+          return null;
+        }
+        T result = copy[0];
+        T replacement = copy[--remaining];
+        copy[remaining] = null;
+        if (remaining != 0) {
+          int index = 0;
+          int parentEnd = remaining >>> 1;
+          while (index < parentEnd) {
+            int child = 2 * index + 1;
+            int right = child + 1;
+            if (right < remaining && comparator.compare(copy[child], copy[right]) > 0) {
+              child = right;
+            }
+            if (comparator.compare(replacement, copy[child]) <= 0) {
+              break;
+            }
+            copy[index] = copy[child];
+            index = child;
+          }
+          copy[index] = replacement;
+        }
+        return result;
       }
     };
   }
