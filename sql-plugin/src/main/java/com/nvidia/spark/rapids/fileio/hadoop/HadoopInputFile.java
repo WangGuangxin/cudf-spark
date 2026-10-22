@@ -24,6 +24,7 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 
 import java.io.IOException;
+import java.lang.ref.SoftReference;
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
@@ -36,6 +37,10 @@ import java.util.OptionalLong;
  */
 public class HadoopInputFile implements RapidsInputFile {
     private static final String PARQUET_READ_ALLOCATION_SIZE = "parquet.read.allocation.size";
+    // Reader threads outlive individual files. Keep at most one default-sized scratch array per
+    // thread, instead of allocating it for every file/range read. Larger configured buffers are
+    // still supported but are not retained. Soft references let heap pressure reclaim idle scratch.
+    private static final ThreadLocal<SoftReference<byte[]>> COPY_BUFFER = new ThreadLocal<>();
 
     private final Path filePath;
     private final FileSystem fs;
@@ -87,7 +92,32 @@ public class HadoopInputFile implements RapidsInputFile {
         if (copyRanges.isEmpty()) {
             return;
         }
-        byte[] copyBuffer = new byte[copyBufferSize];
-        RapidsInputFile.readVectoredUsingCopyBuffer(this, output, copyRanges, copyBuffer);
+        long maxRangeLength = 0;
+        for (RapidsInputFile.CopyRange range : copyRanges) {
+            maxRangeLength = Math.max(maxRangeLength, range.getLength());
+        }
+        int requiredSize = (int) Math.min(copyBufferSize, maxRangeLength);
+        SoftReference<byte[]> cached = COPY_BUFFER.get();
+        byte[] copyBuffer = cached == null ? null : cached.get();
+        // A filesystem may reenter this method on the same thread. Loan the array exclusively
+        // until the complete read/copy has finished, including exceptional exits.
+        COPY_BUFFER.set(null);
+        if (copyBuffer == null || copyBuffer.length < requiredSize ||
+                copyBuffer.length > copyBufferSize) {
+            copyBuffer = new byte[requiredSize];
+            cached = requiredSize <= RapidsInputFile.DEFAULT_READ_VECTORED_COPY_BUFFER_SIZE ?
+                    new SoftReference<>(copyBuffer) : null;
+        }
+        try {
+            RapidsInputFile.readVectoredUsingCopyBuffer(this, output, copyRanges, copyBuffer);
+        } finally {
+            if (copyBuffer.length <= RapidsInputFile.DEFAULT_READ_VECTORED_COPY_BUFFER_SIZE) {
+                SoftReference<byte[]> availableRef = COPY_BUFFER.get();
+                byte[] available = availableRef == null ? null : availableRef.get();
+                if (available == null || available.length < copyBuffer.length) {
+                    COPY_BUFFER.set(cached);
+                }
+            }
+        }
     }
 }
