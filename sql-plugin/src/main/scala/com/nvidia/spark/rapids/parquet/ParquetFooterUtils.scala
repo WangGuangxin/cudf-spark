@@ -21,11 +21,18 @@ import java.util.Arrays
 
 import ai.rapids.cudf.HostMemoryBuffer
 import com.nvidia.spark.rapids.{GpuMetric, NoopMetric, NvtxRegistry, PerfIO, RapidsConf}
-import com.nvidia.spark.rapids.Arm.closeOnExcept
+import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.filecache.FileCache
 import com.nvidia.spark.rapids.jni.fileio.RapidsInputFile
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
+import org.apache.parquet.HadoopReadOptions
+import org.apache.parquet.filter2.compat.FilterCompat
+import org.apache.parquet.format.converter.ParquetMetadataConverter.MetadataFilter
+import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.ParquetFileWriter.MAGIC
+import org.apache.parquet.hadoop.metadata.ParquetMetadata
+import org.apache.parquet.io.InputFile
 
 /**
  * Shared helpers for reading and caching Parquet footer bytes.
@@ -36,6 +43,16 @@ import org.apache.parquet.hadoop.ParquetFileWriter.MAGIC
  */
 object ParquetFooterUtils {
   val FooterLengthSize: Int = java.lang.Integer.BYTES
+
+  /** Avoid constructing and loading a fresh Hadoop configuration for every in-memory footer. */
+  def readFooter(inputFile: InputFile, conf: Configuration,
+      filter: MetadataFilter): ParquetMetadata = {
+    val options = HadoopReadOptions.builder(conf)
+      .withMetadataFilter(filter)
+      .withRecordFilter(FilterCompat.NOOP)
+      .build()
+    withResource(ParquetFileReader.open(inputFile, options))(_.getFooter)
+  }
   private val ParquetMagicEncrypted = "PARE".getBytes(StandardCharsets.US_ASCII)
 
   def verifyParquetMagic(filePath: Path, magic: Array[Byte]): Unit = {

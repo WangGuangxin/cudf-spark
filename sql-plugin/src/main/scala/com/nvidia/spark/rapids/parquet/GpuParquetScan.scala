@@ -575,7 +575,15 @@ protected case class GpuParquetFileFilterHandler(
       if (scheme != null && scheme.startsWith("s3")) {
         GpuTaskMetrics.get.recordPerfioS3BackendOnce()
       }
-      result.getOrElse(readFooterBufUsingHadoop(fileIO, filePath))
+      result.getOrElse {
+        if (scheme == "file") {
+          // Local suffix prefetch usually includes the footer, avoiding separate
+          // stream opens for its length and contents.
+          ParquetFooterUtils.readFooterBufferFromInputFile(fileIO.newInputFile(filePath), filePath)
+        } else {
+          readFooterBufUsingHadoop(fileIO, filePath)
+        }
+      }
     } else {
       readFooterBufUsingHadoop(fileIO, filePath)
     }
@@ -669,7 +677,7 @@ protected case class GpuParquetFileFilterHandler(
       val inputFile = fileIO.newInputFile(filePath)
       withResource(ParquetFooterUtils.getFooterBuffer(inputFile, metrics,
           readFooterBuffer(fileIO, filePath, conf))) { hmb =>
-        ParquetFileReader.readFooter(new HMBInputFile(hmb),
+        ParquetFooterUtils.readFooter(new HMBInputFile(hmb), conf,
           ParquetMetadataConverter.range(file.start, file.start + file.length))
       }
     }
@@ -721,7 +729,7 @@ protected case class GpuParquetFileFilterHandler(
                 val inputFile = new HMBInputFile(serialized)
 
                 // We already filtered the ranges so no need to do more here...
-                ParquetFileReader.readFooter(inputFile, ParquetMetadataConverter.NO_FILTER)
+                ParquetFooterUtils.readFooter(inputFile, conf, ParquetMetadataConverter.NO_FILTER)
               }
             }
             // Fix up row index offsets. ParquetFileReader.readFooter computes row
