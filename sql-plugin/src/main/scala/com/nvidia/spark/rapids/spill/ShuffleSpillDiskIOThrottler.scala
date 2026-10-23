@@ -68,6 +68,11 @@ private[spill] class ShuffleSpillBandwidthLimiter(
   private var nextTotalNanos = nextReadNanos
   private var outstandingReservations = 0L
 
+  // Without any limit there is nothing to reserve. Skip the executor-wide monitor, which every
+  // partial-file read and write would otherwise contend on.
+  private val unlimited =
+    readBytesPerSecond == 0 && writeBytesPerSecond == 0 && totalBytesPerSecond == 0
+
   override def throttleRead(numBytes: Long, ioTimeNanos: Long): ThrottleResult = {
     throttle(numBytes, ioTimeNanos, read = true)
   }
@@ -77,7 +82,7 @@ private[spill] class ShuffleSpillBandwidthLimiter(
   }
 
   private def throttle(numBytes: Long, ioTimeNanos: Long, read: Boolean): ThrottleResult = {
-    if (numBytes <= 0) {
+    if (numBytes <= 0 || unlimited) {
       return ThrottleResult(0L, 0L)
     }
 
