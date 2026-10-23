@@ -583,6 +583,60 @@ class SpillablePartialFileHandle private (
   }
 
   /**
+   * Variant of readAt that fills `dst` (typically a direct buffer) from its current position,
+   * reading up to `dst.remaining()` bytes. Memory-resident data is copied once from the host
+   * buffer; spilled data is read by the file channel straight into `dst`.
+   *
+   * @return number of bytes read, or -1 if position >= totalBytesWritten
+   */
+  def readAt(position: Long, dst: ByteBuffer): Int = {
+    if (!writeFinished) {
+      throw new IllegalStateException("Cannot read before write is finished")
+    }
+
+    if (position < 0 || position >= totalBytesWritten) {
+      return -1
+    }
+
+    val actualLength = SpillablePartialFileHandle.boundedReadLengthAsInt(
+      dst.remaining(), totalBytesWritten - position)
+    if (actualLength <= 0) {
+      return -1
+    }
+
+    def readFromFileChannel(): Int = {
+      ensureFileChannelOpen()
+      val view = dst.duplicate()
+      view.limit(view.position() + actualLength)
+      val start = System.nanoTime()
+      val bytesRead = fileChannel.get.read(view, position)
+      recordPhysicalIO(read = true, math.max(0, bytesRead).toLong, System.nanoTime() - start)
+      if (bytesRead > 0) {
+        dst.position(dst.position() + bytesRead)
+      }
+      bytesRead
+    }
+
+    if (shouldUseFile || spilledToDisk) {
+      return readFromFileChannel()
+    }
+
+    synchronized {
+      if (spilledToDisk) {
+        return readFromFileChannel()
+      }
+      host match {
+        case Some(buffer) =>
+          dst.put(buffer.asByteBuffer(position, actualLength))
+          actualLength
+        case None =>
+          throw new IllegalStateException(
+            "Host buffer is null but spilledToDisk is false")
+      }
+    }
+  }
+
+  /**
    * Ensure FileChannel is open for random access reading.
    * Thread-safe: uses synchronized to prevent duplicate channel creation.
    */

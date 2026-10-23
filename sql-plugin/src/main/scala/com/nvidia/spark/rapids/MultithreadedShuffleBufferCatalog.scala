@@ -27,6 +27,7 @@ import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
 
 import _root_.io.netty.handler.stream.ChunkedStream
+import _root_.io.netty.util.internal.PlatformDependent
 import com.nvidia.spark.rapids.spill.{ClosedPartialFileHandleException, SpillablePartialFileHandle}
 
 import org.apache.spark.internal.Logging
@@ -517,8 +518,8 @@ class MultiSegmentInputStream(
  * A FileRegion implementation that streams data from multiple partition segments.
  *
  * This class enables network transfer of shuffle data by reading from segments
- * via readAt() and writing to the target channel. Data is read in chunks (64KB)
- * to limit memory usage during transfer.
+ * via readAt() into a direct staging buffer (up to 1MB) and writing it to the target
+ * channel, which bounds memory usage during transfer.
  *
  * Spark's MessageWithHeader only accepts ByteBuf or FileRegion. By implementing
  * FileRegion, we can provide streaming transfer while remaining compatible with
@@ -533,15 +534,16 @@ class MultiSegmentFileRegion(
   private val totalSize: Long = segments.map(_.length).sum
   private var totalTransferred: Long = 0
 
-  // Buffer size for each transferTo call (64KB chunks)
-  private val CHUNK_SIZE = 64 * 1024
+  // Staging size per transfer step. Large chunks amortize Netty write calls and segment reads.
+  private val CHUNK_SIZE = 1024 * 1024
 
-  // Reusable buffer for reading data (avoids allocation per transferTo call)
-  private val readBuffer = new Array[Byte](CHUNK_SIZE)
+  // Lazily allocated direct buffer holding bytes read from segments but not yet written.
+  // Being direct, the channel writes it without another copy into a temporary native buffer.
+  private var staging: ByteBuffer = _
 
-  // Track current position within the logical data stream
+  // Read cursor: bytes of the current segment already copied into the staging buffer
   private var currentSegmentIndex: Int = 0
-  private var bytesTransferredInCurrentSegment: Long = 0
+  private var bytesStagedInCurrentSegment: Long = 0
   // Keeps the partial shuffle file handles open until this file region is deallocated.
   private val lease = ShuffleHandleLease.acquire(handles)
 
@@ -551,11 +553,38 @@ class MultiSegmentFileRegion(
 
   override def transferred(): Long = totalTransferred
 
+  /** Refill the (cleared) staging buffer from the segments, crossing segment boundaries. */
+  private def fillStaging(): Unit = {
+    while (staging.hasRemaining && currentSegmentIndex < segments.size) {
+      val segment = segments(currentSegmentIndex)
+      val remainingInSegment = segment.length - bytesStagedInCurrentSegment
+      if (remainingInSegment <= 0) {
+        currentSegmentIndex += 1
+        bytesStagedInCurrentSegment = 0
+      } else {
+        val handlePosition = segment.offset + bytesStagedInCurrentSegment
+        val limit = staging.limit()
+        staging.limit(staging.position() + math.min(remainingInSegment, staging.remaining()).toInt)
+        val bytesRead = try {
+          segment.handle.readAt(handlePosition, staging)
+        } finally {
+          staging.limit(limit)
+        }
+        if (bytesRead < 0) {
+          throw new IOException(
+            s"Unexpected EOF reading segment at position $handlePosition")
+        }
+        bytesStagedInCurrentSegment += bytesRead
+      }
+    }
+  }
+
   /**
-   * Transfer data to the target channel in chunks.
+   * Transfer data to the target channel.
    *
-   * This method reads data from segments using readAt() and writes to the channel.
-   * Each call transfers up to CHUNK_SIZE bytes.
+   * Reads segments into a direct staging buffer and writes it until the channel stops
+   * accepting bytes. Bytes the channel did not accept stay staged for the next call, so
+   * nothing is re-read after a partial write.
    *
    * @param target the channel to write data to
    * @param position the current transfer position (should equal totalTransferred)
@@ -566,48 +595,41 @@ class MultiSegmentFileRegion(
       throw new IllegalArgumentException(
         s"Invalid position: expected $totalTransferred but got $position")
     }
-
-    if (totalTransferred >= totalSize) {
-      return 0 // All data transferred
+    if (staging == null && totalTransferred < totalSize) {
+      staging = ByteBuffer.allocateDirect(math.min(CHUNK_SIZE.toLong, totalSize).toInt)
+      staging.flip()
     }
-
-    // Find the current segment and read data
-    while (currentSegmentIndex < segments.size) {
-      val segment = segments(currentSegmentIndex)
-      val remainingInSegment = segment.length - bytesTransferredInCurrentSegment
-
-      if (remainingInSegment <= 0) {
-        // Move to next segment
-        currentSegmentIndex += 1
-        bytesTransferredInCurrentSegment = 0
-      } else {
-        // Read from current segment using readAt
-        val toRead = math.min(remainingInSegment, CHUNK_SIZE).toInt
-        val handlePosition = segment.offset + bytesTransferredInCurrentSegment
-        val bytesRead = segment.handle.readAt(handlePosition, readBuffer, 0, toRead)
-
-        if (bytesRead > 0) {
-          // Write once and let Netty retry this FileRegion when the channel is not writable.
-          val writeBuffer = ByteBuffer.wrap(readBuffer, 0, bytesRead)
-          val written = target.write(writeBuffer)
-          if (written < 0) {
-            throw new IOException("Failed to write to target channel")
-          }
-
-          bytesTransferredInCurrentSegment += written
-          totalTransferred += written
-          return written
-        } else if (bytesRead < 0) {
+    var writtenThisCall = 0L
+    var channelFull = false
+    while (!channelFull && totalTransferred < totalSize) {
+      if (!staging.hasRemaining) {
+        staging.clear()
+        fillStaging()
+        staging.flip()
+        if (!staging.hasRemaining) {
           throw new IOException(
-            s"Unexpected EOF reading segment at position $handlePosition")
+            s"Segments exhausted after $totalTransferred of $totalSize bytes")
         }
       }
+      val written = target.write(staging)
+      if (written < 0) {
+        throw new IOException("Failed to write to target channel")
+      } else if (written == 0) {
+        // Let Netty retry this FileRegion when the channel becomes writable.
+        channelFull = true
+      } else {
+        totalTransferred += written
+        writtenThisCall += written
+      }
     }
-
-    0 // All segments exhausted
+    writtenThisCall
   }
 
   override protected def deallocate(): Unit = {
+    if (staging != null) {
+      PlatformDependent.freeDirectBuffer(staging)
+      staging = null
+    }
     lease.close()
   }
 }
