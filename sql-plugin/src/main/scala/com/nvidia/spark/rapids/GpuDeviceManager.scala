@@ -25,6 +25,7 @@ import ai.rapids.cudf._
 import com.nvidia.spark.rapids.jni.DeviceAttr
 import com.nvidia.spark.rapids.jni.RmmSpark
 import com.nvidia.spark.rapids.spill.SpillFramework
+import com.nvidia.spark.rapids.tuning.StartupTuning
 
 import org.apache.spark.{SparkConf, SparkEnv, TaskContext}
 import org.apache.spark.internal.Logging
@@ -617,12 +618,12 @@ object GpuDeviceManager extends Logging {
       MemoryCheckerImpl): (Long, Long) = {
     val perTaskOverhead = conf.perTaskOverhead
     val totalOverhead = perTaskOverhead * GpuDeviceManager.numCores
-    val confPinnedSize = conf.pinnedPoolSize
+    lazy val memoryLimit = computeEffectiveOffHeapLimit(conf, sparkConf, deviceCount, memCheck)
+    val confPinnedSize = StartupTuning.executorPinnedPoolBytes(conf, sparkConf,
+      memoryLimit - totalOverhead)
     val confLimitEnabled = conf.offHeapLimitEnabled
 
     if (confLimitEnabled) {
-      val memoryLimit = computeEffectiveOffHeapLimit(conf, sparkConf, deviceCount, memCheck)
-
       // Now we need to know the pinned vs non-pinned limits
       val pinnedLimit = if (confPinnedSize + totalOverhead <= memoryLimit) {
         confPinnedSize

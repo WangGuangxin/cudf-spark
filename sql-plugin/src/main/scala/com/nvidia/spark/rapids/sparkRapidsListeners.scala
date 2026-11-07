@@ -16,6 +16,8 @@
 
 package com.nvidia.spark.rapids
 
+import com.nvidia.spark.rapids.tuning.StageRuntimeStats
+
 import org.apache.spark.scheduler.SparkListenerEvent
 
 case class SparkRapidsBuildInfoEvent(
@@ -44,4 +46,32 @@ case class SparkRapidsShuffleDiskSavingsEvent(
   numExpansions: Int = 0,
   numSpills: Int = 0,
   numForcedFileOnly: Int = 0
+) extends SparkListenerEvent
+
+/**
+ * Event posted by adaptive tuning when a stage attempt completes, carrying the aggregated
+ * runtime signals for that stage. Written to the event log so that tuning decisions can be
+ * analyzed and the tuning controller can be replayed offline.
+ */
+case class SparkRapidsStageRuntimeStatsEvent(
+  stats: StageRuntimeStats
+) extends SparkListenerEvent
+
+/**
+ * Event posted whenever adaptive tuning changes a setting.
+ *
+ * @param executionId SQL execution the decision applies to, or -1 for application scope
+ * @param stageId stage whose signals triggered the decision, or -1 when not stage driven
+ * @param knob name of the setting that was changed
+ * @param oldValue value before the change
+ * @param newValue value after the change
+ * @param reason human readable explanation, including the signals that drove the change
+ */
+case class SparkRapidsTuningDecisionEvent(
+  executionId: Long,
+  stageId: Int,
+  knob: String,
+  oldValue: String,
+  newValue: String,
+  reason: String
 ) extends SparkListenerEvent

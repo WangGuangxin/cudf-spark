@@ -37,6 +37,7 @@ import com.nvidia.spark.rapids.io.async.TrafficController
 import com.nvidia.spark.rapids.jni.{GpuTimeZoneDB, Hash, JSONUtils, RmmSpark, TaskPriority}
 import com.nvidia.spark.rapids.python.PythonWorkerSemaphore
 import com.nvidia.spark.rapids.shims.ShuffleManagerShimUtils
+import com.nvidia.spark.rapids.tuning.{AdaptiveTuningListener, StartupTuning}
 import org.apache.commons.lang3.exception.ExceptionUtils
 
 import org.apache.spark.{ExceptionFailure, SparkConf, SparkContext, TaskContext, TaskFailedReason}
@@ -528,6 +529,7 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
     sc: SparkContext, pluginContext: PluginContext): java.util.Map[String, String] = {
     val sparkConf = pluginContext.conf
     RapidsPluginUtils.fixupConfigsOnDriver(sparkConf)
+    StartupTuning.applyOnDriver(sc, sparkConf)
     val conf = new RapidsConf(sparkConf)
     RapidsPluginUtils.detectMultipleJars(conf)
     RapidsPluginUtils.logPluginMode(conf)
@@ -576,6 +578,10 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
     }
 
     FileCacheLocalityManager.init(sc)
+
+    if (conf.adaptiveTuningEnabled) {
+      AdaptiveTuningListener.install(sc)
+    }
 
     logDebug("Loading extra driver plugins: " +
       s"${extraDriverPlugins.map(_.getClass.getName).mkString(",")}")
