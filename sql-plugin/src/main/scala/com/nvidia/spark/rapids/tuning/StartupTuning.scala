@@ -31,13 +31,21 @@ object StartupTuning extends Logging {
   private val GiB = 1024L * MiB
 
   val MaxPartitionBytesKey = "spark.sql.files.maxPartitionBytes"
+  val ParallelismFirstKey = "spark.sql.adaptive.coalescePartitions.parallelismFirst"
+  val MinPartitionSizeKey = "spark.sql.adaptive.coalescePartitions.minPartitionSize"
+  val AdvisoryPartitionSizeKey = "spark.sql.adaptive.advisoryPartitionSizeInBytes"
+  // Spark's default for spark.sql.adaptive.advisoryPartitionSizeInBytes.
+  private val DefaultAdvisoryPartitionBytes = 64 * MiB
+  // Partitions smaller than this fraction of the advisory size are merged with neighbors.
+  private val MinPartitionSizeFraction = 16
 
-  // A scan split is compressed on disk and typically expands several times when decoded, so
-  // half of the target batch size keeps decoded scan batches near that target. The bounds
-  // keep tasks from becoming too small to amortize their fixed cost on the GPU, or too large
-  // to balance across executors.
+  // A scan split as large as the target batch size keeps the number of scan tasks, and so
+  // their fixed cost on the GPU, low. Splits that decode to more than fits are handled by
+  // the chunked reader and the retry framework; on NDS and NDS-H, splits up to 2 GiB ran
+  // without failures with only 8 GiB of GPU memory. The bounds keep tasks from becoming
+  // too small to amortize their fixed cost, or too large to balance across executors.
   private val MinScanSplitBytes = 128 * MiB
-  private val MaxScanSplitBytes = 1 * GiB
+  private val MaxScanSplitBytes = 2 * GiB
 
   // Pinned memory makes host to device copies of scan and shuffle data much faster than
   // pageable memory. One eighth of the off-heap budget leaves most of it for the
@@ -47,7 +55,7 @@ object StartupTuning extends Logging {
   private val MaxPinnedPoolBytes = 16 * GiB
 
   def scanSplitBytes(batchSizeBytes: Long): Long =
-    math.min(math.max(batchSizeBytes / 2, MinScanSplitBytes), MaxScanSplitBytes)
+    math.min(math.max(batchSizeBytes, MinScanSplitBytes), MaxScanSplitBytes)
 
   def pinnedPoolBytes(offHeapBudgetBytes: Long): Long =
     math.min(math.max(offHeapBudgetBytes, 0L) / PinnedPoolBudgetFraction, MaxPinnedPoolBytes)
@@ -64,6 +72,7 @@ object StartupTuning extends Logging {
     if (conf.adaptiveTuningEnabled) {
       deriveScanSplit(sc, sparkConf, conf)
       deriveShuffleSkipMerge(sc, sparkConf, conf)
+      deriveCoalescing(sc, sparkConf)
     }
   }
 
@@ -74,7 +83,7 @@ object StartupTuning extends Logging {
       TuningDecisionLog.record(sc, SparkRapidsTuningDecisionEvent(
         AdaptiveTuningListener.NoExecutionId, -1, MaxPartitionBytesKey, "unset",
         split.toString,
-        s"half of ${RapidsConf.GPU_BATCH_SIZE_BYTES.key}=${conf.gpuTargetBatchSizeBytes}, " +
+        s"${RapidsConf.GPU_BATCH_SIZE_BYTES.key}=${conf.gpuTargetBatchSizeBytes}, " +
           s"bounded to [$MinScanSplitBytes, $MaxScanSplitBytes]"))
     }
   }
@@ -103,6 +112,34 @@ object StartupTuning extends Logging {
           "limit enabled"))
     }
   }
+
+  /**
+   * By default AQE coalesces shuffle partitions so that there are at least as many as there
+   * are CPU cores, with partitions as small as 1 MiB. On the GPU the number of tasks running
+   * at once is bounded by the GPU concurrency rather than by the cores, so that only makes
+   * tasks too small to amortize their fixed cost. Coalescing toward the advisory partition
+   * size instead, and merging partitions much smaller than it, keeps tasks large enough.
+   */
+  private def deriveCoalescing(sc: SparkContext, sparkConf: SparkConf): Unit = {
+    if (!sparkConf.contains(ParallelismFirstKey)) {
+      sparkConf.set(ParallelismFirstKey, "false")
+      TuningDecisionLog.record(sc, SparkRapidsTuningDecisionEvent(
+        AdaptiveTuningListener.NoExecutionId, -1, ParallelismFirstKey, "unset", "false",
+        "GPU task concurrency, not the number of cores, bounds the useful parallelism"))
+    }
+    if (!sparkConf.contains(MinPartitionSizeKey)) {
+      val advisory = sparkConf.getSizeAsBytes(AdvisoryPartitionSizeKey,
+        DefaultAdvisoryPartitionBytes.toString)
+      val minSize = minPartitionSize(advisory)
+      sparkConf.set(MinPartitionSizeKey, minSize.toString)
+      TuningDecisionLog.record(sc, SparkRapidsTuningDecisionEvent(
+        AdaptiveTuningListener.NoExecutionId, -1, MinPartitionSizeKey, "unset",
+        minSize.toString, s"1/$MinPartitionSizeFraction of $AdvisoryPartitionSizeKey=$advisory"))
+    }
+  }
+
+  def minPartitionSize(advisoryPartitionBytes: Long): Long =
+    math.max(advisoryPartitionBytes / MinPartitionSizeFraction, 1L)
 
   /**
    * The pinned pool size an executor should use: the configured size if the user set one,

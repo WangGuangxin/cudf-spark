@@ -25,10 +25,16 @@ class StartupTuningSuite extends AnyFunSuite {
   private val MiB = 1024L * 1024
   private val GiB = 1024L * MiB
 
-  test("scan split is half the batch size within bounds") {
-    assert(StartupTuning.scanSplitBytes(1 * GiB) == 512 * MiB)
+  test("scan split is the batch size within bounds") {
+    assert(StartupTuning.scanSplitBytes(1 * GiB) == 1 * GiB)
     assert(StartupTuning.scanSplitBytes(64 * MiB) == 128 * MiB)
-    assert(StartupTuning.scanSplitBytes(8 * GiB) == 1 * GiB)
+    assert(StartupTuning.scanSplitBytes(8 * GiB) == 2 * GiB)
+  }
+
+  test("min partition size is a fraction of the advisory size") {
+    assert(StartupTuning.minPartitionSize(64 * MiB) == 4 * MiB)
+    assert(StartupTuning.minPartitionSize(256 * MiB) == 16 * MiB)
+    assert(StartupTuning.minPartitionSize(0L) == 1L)
   }
 
   test("pinned pool is a capped fraction of the off-heap budget") {

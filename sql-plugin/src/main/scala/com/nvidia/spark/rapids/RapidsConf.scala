@@ -2242,8 +2242,8 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
   val ADAPTIVE_TUNING_ENABLED = conf("spark.rapids.sql.adaptiveTuning.enabled")
     .doc("Enable adaptive tuning. It collects per-stage runtime statistics on the " +
       "driver, logs them and records them in the event log, and derives the scan split " +
-      "size, the pinned memory pool size and whether MULTITHREADED shuffle skips merging " +
-      "from the available resources when they are not set explicitly.")
+      "size, the pinned memory pool size, whether MULTITHREADED shuffle skips merging and " +
+      "how AQE coalesces shuffle partitions when they are not set explicitly.")
     .internal()
     .startupOnly()
     .booleanConf
