@@ -161,8 +161,11 @@ object AdaptiveTuningListener extends Logging {
 
 /** Records adaptive tuning decisions in the driver log and the event log. */
 object TuningDecisionLog extends Logging {
+  val RuleSource = "rule"
+  val MigrationSource = "migration"
+
   def record(sc: SparkContext, decision: SparkRapidsTuningDecisionEvent): Unit = {
-    logInfo(s"Adaptive tuning decision: execution ${decision.executionId} " +
+    logInfo(s"Adaptive tuning ${decision.source} decision: execution ${decision.executionId} " +
       s"stage ${decision.stageId} ${decision.knob}: ${decision.oldValue} -> " +
       s"${decision.newValue} (${decision.reason})")
     TrampolineUtil.postEvent(sc, decision)

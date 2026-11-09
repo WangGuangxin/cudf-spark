@@ -2249,6 +2249,17 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(false)
 
+  val ADAPTIVE_TUNING_CPU_MIGRATION_ENABLED =
+    conf("spark.rapids.sql.adaptiveTuning.cpuMigration.enabled")
+      .doc("Treat the explicitly set Spark settings as tuned for running on the CPU and " +
+        "translate the ones that do not suit the GPU: the scan split is raised to at least " +
+        "the size adaptive tuning would derive, the broadcast join threshold is capped, " +
+        "and with AQE the initial number of shuffle partitions is capped.")
+      .internal()
+      .startupOnly()
+      .booleanConf
+      .createWithDefault(false)
+
   object HybridFilterPushdownType extends Enumeration {
     val CPU, GPU, OFF = Value
   }
@@ -3735,6 +3746,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val loadHybridBackend: Boolean = get(LOAD_HYBRID_BACKEND)
 
   lazy val adaptiveTuningEnabled: Boolean = get(ADAPTIVE_TUNING_ENABLED)
+
+  lazy val cpuMigrationEnabled: Boolean = get(ADAPTIVE_TUNING_CPU_MIGRATION_ENABLED)
 
   lazy val pushDownFiltersToHybrid: String = get(PUSH_DOWN_FILTERS_TO_HYBRID)
 

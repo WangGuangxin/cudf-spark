@@ -66,6 +66,8 @@ case class SparkRapidsStageRuntimeStatsEvent(
  * @param oldValue value before the change
  * @param newValue value after the change
  * @param reason human readable explanation, including the signals that drove the change
+ * @param source strategy that made the decision, "rule" for settings derived from the
+ *               resources or "migration" for settings translated from a CPU configuration
  */
 case class SparkRapidsTuningDecisionEvent(
   executionId: Long,
@@ -73,5 +75,6 @@ case class SparkRapidsTuningDecisionEvent(
   knob: String,
   oldValue: String,
   newValue: String,
-  reason: String
+  reason: String,
+  source: String
 ) extends SparkListenerEvent

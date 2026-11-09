@@ -45,7 +45,7 @@ object StartupTuning extends Logging {
   // without failures with only 8 GiB of GPU memory. The bounds keep tasks from becoming
   // too small to amortize their fixed cost, or too large to balance across executors.
   private val MinScanSplitBytes = 128 * MiB
-  private val MaxScanSplitBytes = 2 * GiB
+  private[tuning] val MaxScanSplitBytes = 2 * GiB
 
   // Pinned memory makes host to device copies of scan and shuffle data much faster than
   // pageable memory. One eighth of the off-heap budget leaves most of it for the
@@ -61,7 +61,8 @@ object StartupTuning extends Logging {
     math.min(math.max(offHeapBudgetBytes, 0L) / PinnedPoolBudgetFraction, MaxPinnedPoolBytes)
 
   /**
-   * Sets the application level settings that are derived on the driver, when adaptive
+   * Sets the application level settings that are translated from a CPU configuration, when
+   * CPU migration is enabled, and then those that are derived on the driver, when adaptive
    * tuning is enabled. This must run before the driver plugin reads its configuration, so
    * that driver side components see the derived settings, and before any SparkSession is
    * created, so that SQL settings are picked up as session defaults. Executors receive the
@@ -69,6 +70,10 @@ object StartupTuning extends Logging {
    */
   def applyOnDriver(sc: SparkContext, sparkConf: SparkConf): Unit = {
     val conf = new RapidsConf(sparkConf)
+    // Translated settings count as explicitly set, so the rules below do not override them.
+    if (conf.cpuMigrationEnabled) {
+      CpuMigration.apply(sc, sparkConf, conf)
+    }
     if (conf.adaptiveTuningEnabled) {
       deriveScanSplit(sc, sparkConf, conf)
       deriveShuffleSkipMerge(sc, sparkConf, conf)
@@ -84,7 +89,8 @@ object StartupTuning extends Logging {
         AdaptiveTuningListener.NoExecutionId, -1, MaxPartitionBytesKey, "unset",
         split.toString,
         s"${RapidsConf.GPU_BATCH_SIZE_BYTES.key}=${conf.gpuTargetBatchSizeBytes}, " +
-          s"bounded to [$MinScanSplitBytes, $MaxScanSplitBytes]"))
+          s"bounded to [$MinScanSplitBytes, $MaxScanSplitBytes]",
+        TuningDecisionLog.RuleSource))
     }
   }
 
@@ -109,7 +115,7 @@ object StartupTuning extends Logging {
       TuningDecisionLog.record(sc, SparkRapidsTuningDecisionEvent(
         AdaptiveTuningListener.NoExecutionId, -1, key, "unset", "true",
         "MULTITHREADED shuffle with the external shuffle service disabled and the off-heap " +
-          "limit enabled"))
+          "limit enabled", TuningDecisionLog.RuleSource))
     }
   }
 
@@ -125,7 +131,8 @@ object StartupTuning extends Logging {
       sparkConf.set(ParallelismFirstKey, "false")
       TuningDecisionLog.record(sc, SparkRapidsTuningDecisionEvent(
         AdaptiveTuningListener.NoExecutionId, -1, ParallelismFirstKey, "unset", "false",
-        "GPU task concurrency, not the number of cores, bounds the useful parallelism"))
+        "GPU task concurrency, not the number of cores, bounds the useful parallelism",
+        TuningDecisionLog.RuleSource))
     }
     if (!sparkConf.contains(MinPartitionSizeKey)) {
       val advisory = sparkConf.getSizeAsBytes(AdvisoryPartitionSizeKey,
@@ -134,7 +141,8 @@ object StartupTuning extends Logging {
       sparkConf.set(MinPartitionSizeKey, minSize.toString)
       TuningDecisionLog.record(sc, SparkRapidsTuningDecisionEvent(
         AdaptiveTuningListener.NoExecutionId, -1, MinPartitionSizeKey, "unset",
-        minSize.toString, s"1/$MinPartitionSizeFraction of $AdvisoryPartitionSizeKey=$advisory"))
+        minSize.toString, s"1/$MinPartitionSizeFraction of $AdvisoryPartitionSizeKey=$advisory",
+        TuningDecisionLog.RuleSource))
     }
   }
 
