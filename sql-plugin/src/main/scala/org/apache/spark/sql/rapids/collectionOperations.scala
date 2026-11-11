@@ -1205,21 +1205,52 @@ case class GpuArraysZip(children: Seq[Expression]) extends GpuExpression with Sh
         expr.columnarEval(batch).getBase
       }
 
-      val cleanedInputs = withResource(inputs) { inputs =>
-        normalizeNulls(inputs)
-      }
+      if (alreadyAligned(inputs)) {
+        // e.g. arrays_zip(arr.f1, arr.f2): nothing to normalize or pad
+        withResource(inputs) { _ =>
+          closeOnExcept(zipArrays(inputs)) { ret =>
+            GpuColumnVector.from(ret, dataType)
+          }
+        }
+      } else {
+        val cleanedInputs = withResource(inputs) { inputs =>
+          normalizeNulls(inputs)
+        }
 
-      val padded = withResource(cleanedInputs) { cleanedInputs =>
-        padArraysToMaxLength(cleanedInputs)
-      }
+        val padded = withResource(cleanedInputs) { cleanedInputs =>
+          padArraysToMaxLength(cleanedInputs)
+        }
 
-      withResource(padded) { _ =>
-        closeOnExcept(zipArrays(padded)) { ret =>
-          GpuColumnVector.from(ret, dataType)
+        withResource(padded) { _ =>
+          closeOnExcept(zipArrays(padded)) { ret =>
+            GpuColumnVector.from(ret, dataType)
+          }
         }
       }
     }
     GpuExpressionsUtils.resolveColumnVector(res, batch.numRows())
+  }
+
+  /**
+   * True when no input has a null row and all inputs have identical list offsets, as is the case
+   * when they are fields projected from one array of structs. Then every row already has the
+   * same number of elements in every input, and the inputs can be zipped as they are, skipping
+   * the null normalization and the padding gather.
+   */
+  private def alreadyAligned(inputs: Seq[cudf.ColumnVector]): Boolean = {
+    inputs.head.getRowCount > 0 && !inputs.exists(_.hasNulls) && {
+      withResource(inputs.head.getListOffsetsView) { firstOffsets =>
+        inputs.tail.forall { cv =>
+          withResource(cv.getListOffsetsView) { offsets =>
+            withResource(offsets.equalTo(firstOffsets)) { eq =>
+              withResource(eq.all()) { all =>
+                all.isValid && all.getBoolean
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
   /**

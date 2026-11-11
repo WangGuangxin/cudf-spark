@@ -30,6 +30,10 @@ class SQLExecPlugin extends (SparkSessionExtensions => Unit) {
     extensions.injectColumnar(columnarOverrides)
     extensions.injectQueryStagePrepRule(queryStagePrepOverrides)
     extensions.injectPlannerStrategy(_ => strategyRules)
+    // Once after analysis, so that EXISTS subqueries (optimized on their own before the outer
+    // plan) are pruned as well, and again during operator optimization.
+    extensions.injectPostHocResolutionRule(_ => GeneratorNestedFieldPruning)
+    extensions.injectOptimizerRule(_ => GeneratorNestedFieldPruning)
   }
 
   private def columnarOverrides(sparkSession: SparkSession): ColumnarRule = {
