@@ -611,43 +611,65 @@ case class GpuArrayExists(
     }
   }
 
-  private def existsReduce(columnView: cudf.ColumnView, nullPolicy: cudf.NullPolicy) = {
-    columnView.listReduce(
-      cudf.SegmentedReductionAggregation.any(),
-      nullPolicy,
-      DType.BOOL8)
+  // `exists` is computed with list searches (lists::contains / contains_nulls) rather than a
+  // segmented ANY reduction: the segmented reduction is very slow for the common case of many
+  // short lists (it was ~15x slower than the lambda itself for 1-element arrays). List rows that
+  // are null produce null, which is applied explicitly at the end.
+
+  /** True where some element is true, false otherwise (also for null list rows). */
+  private def containsTrue(cv: cudf.ColumnView): cudf.ColumnVector = {
+    withResource(cudf.Scalar.fromBool(true)) { trueScalar =>
+      withResource(cv.listContains(trueScalar)) { found =>
+        withResource(cudf.Scalar.fromBool(false)) { falseScalar =>
+          found.replaceNulls(falseScalar)
+        }
+      }
+    }
   }
 
-  /*
-   * The difference between legacyExists and EXCLUDE nulls reduction
-   * is that the list without valid values (all nulls) should produce false
-   * which is equivalent to replacing nulls with false after lambda prior
-   * to aggregation
-   */
-  private def legacyExists(cv: cudf.ColumnView): cudf.ColumnView = {
-    withResource(cudf.Scalar.fromBool(false)) { falseScalar =>
-      withResource(cv.getChildColumnView(0)) { childView =>
-        withResource(childView.replaceNulls(falseScalar)) { noNullsChildView =>
-          withResource(cv.replaceListChild(noNullsChildView)) { reduceInput =>
-            existsReduce(reduceInput, cudf.NullPolicy.EXCLUDE)
-          }
+  private def nullForNullRows(cv: cudf.ColumnView, result: cudf.ColumnView): cudf.ColumnVector = {
+    if (cv.getNullCount == 0) {
+      result.copyToColumnVector()
+    } else {
+      withResource(cv.isNull) { isNull =>
+        withResource(cudf.Scalar.fromNull(DType.BOOL8)) { nullScalar =>
+          isNull.ifElse(nullScalar, result)
         }
       }
     }
   }
 
   /*
-   * 3VL is true if EXCLUDE nulls reduce is true
-   * 3VL is false if INCLUDE nulls reduce is false
-   * 3VL is null if
-   *    EXCLUDE null reduce is false and
-   *    INCLUDE nulls reduce is null
+   * Legacy: null lambda results count as false, so the result is whether any element is true.
+   */
+  private def legacyExists(cv: cudf.ColumnView): cudf.ColumnView = {
+    withResource(containsTrue(cv)) { anyTrue =>
+      nullForNullRows(cv, anyTrue)
+    }
+  }
+
+  /*
+   * 3VL: true if any element is true, otherwise null if any element is null, otherwise false.
    */
   private def threeValueExists(cv: cudf.ColumnView): cudf.ColumnView = {
-    withResource(existsReduce(cv, cudf.NullPolicy.EXCLUDE)) { existsNullsExcludedCV =>
-      withResource(existsReduce(cv, cudf.NullPolicy.INCLUDE)) { existsNullsIncludedCV =>
-        existsNullsExcludedCV.ifElse(existsNullsExcludedCV, existsNullsIncludedCV)
+    val result = withResource(containsTrue(cv)) { anyTrue =>
+      val noTrue = withResource(cv.listContainsNulls()) { hasNullsOrNullRow =>
+        withResource(cudf.Scalar.fromBool(false)) { falseScalar =>
+          withResource(hasNullsOrNullRow.replaceNulls(falseScalar)) { hasNulls =>
+            withResource(cudf.Scalar.fromNull(DType.BOOL8)) { nullScalar =>
+              hasNulls.ifElse(nullScalar, falseScalar)
+            }
+          }
+        }
       }
+      withResource(noTrue) { _ =>
+        withResource(cudf.Scalar.fromBool(true)) { trueScalar =>
+          anyTrue.ifElse(trueScalar, noTrue)
+        }
+      }
+    }
+    withResource(result) { _ =>
+      nullForNullRows(cv, result)
     }
   }
 

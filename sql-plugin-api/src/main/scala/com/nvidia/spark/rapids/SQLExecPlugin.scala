@@ -34,6 +34,7 @@ class SQLExecPlugin extends (SparkSessionExtensions => Unit) {
     // plan) are pruned as well, and again during operator optimization.
     extensions.injectPostHocResolutionRule(_ => GeneratorNestedFieldPruning)
     extensions.injectOptimizerRule(_ => GeneratorNestedFieldPruning)
+    extensions.injectOptimizerRule(_ => GeneratorArrayPrefilter)
   }
 
   private def columnarOverrides(sparkSession: SparkSession): ColumnarRule = {
