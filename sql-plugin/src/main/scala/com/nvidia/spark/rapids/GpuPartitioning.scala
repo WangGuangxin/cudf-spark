@@ -206,6 +206,120 @@ trait GpuPartitioning extends Partitioning {
     }
   }
 
+  /**
+   * GPU kudo serialization into GpuShuffleFrame frames. The body of every partition slice is
+   * compressed here with nvcomp when GpuShuffleFrame decides to place this batch's compression on
+   * the GPU; otherwise the slices are framed RAW and the shuffle writer threads compress them.
+   */
+  private def sliceSerializeFramedOnGpu(numRows: Int, partitionIndexes: Array[Int],
+      partitionColumns: Array[GpuColumnVector]): Array[(ColumnarBatch, Int)] = {
+    import GpuShuffleFrame._
+    partitionColumns.foreach(_.getBase.getNullCount)
+    val rows = Array.tabulate(numPartitions) { p =>
+      val end = if (p == numPartitions - 1) numRows else partitionIndexes(p + 1)
+      end - partitionIndexes(p)
+    }
+    val parts = (0 until numPartitions).filter(rows(_) > 0).toArray
+    val n = parts.length
+    val onGpu = compressOnGpu()
+    val (hostBuf, frames) = withResource(partitionColumns) { _ =>
+      withResource(new Table(partitionColumns.map(_.getBase).toArray: _*)) { table =>
+        withResource(gpuSplitAndSerialize(table, partitionIndexes.tail: _*)) { dmbs =>
+          val data = dmbs(0)
+          val offsets = dmbs(1)
+          require(data.getLength <= maxGpuSerializedSliceBytes,
+            s"GPU-serialized shuffle batch is ${data.getLength} bytes, exceeding the " +
+            s"$maxGpuSerializedSliceBytes-byte (2GB) limit addressable by the Int " +
+            s"serialized-slice offsets; reduce spark.rapids.sql.batchSizeBytes")
+          val starts = withResource(HostMemoryBuffer.allocate(offsets.getLength)) { oh =>
+            oh.copyFromDeviceBuffer(offsets, Cuda.DEFAULT_STREAM)
+            val elemSize = oh.getLength / (numPartitions + 1)
+            Array.tabulate(numPartitions)(i => if (i == 0) 0L else oh.getLong(i * elemSize))
+          }
+          val ends = Array.tabulate(numPartitions) { i =>
+            if (i == numPartitions - 1) data.getLength else starts(i + 1)
+          }
+          // The kudo headers of all slices of a batch have the same size (it only depends on
+          // the number of columns), so the first slice tells where every body starts.
+          val hdrLen = if (n == 0) 0 else {
+            val p = parts(0)
+            val len = math.min(HEADER_PROBE_BYTES.toLong, ends(p) - starts(p))
+            withResource(HostMemoryBuffer.allocate(len)) { probe =>
+              withResource(data.slice(starts(p), len)) { src =>
+                probe.copyFromDeviceBuffer(src, Cuda.DEFAULT_STREAM)
+              }
+              val b = new Array[Byte](len.toInt)
+              probe.getBytes(b, 0, 0, len)
+              com.nvidia.spark.rapids.jni.kudo.KudoTableHeader.readFrom(
+                new java.io.DataInputStream(new java.io.ByteArrayInputStream(b)))
+                .get().getSerializedSize
+            }
+          }
+          val bodyStart = parts.map(p => starts(p) + hdrLen)
+          val bodyLen = parts.indices.map(j => ends(parts(j)) - bodyStart(j)).toArray
+          val toCompress = if (onGpu) {
+            parts.indices.filter(j => bodyLen(j) >= MIN_COMPRESS_BYTES).toArray
+          } else {
+            Array.empty[Int]
+          }
+          // compress() closes the input slices
+          val slices: Array[ai.rapids.cudf.BaseDeviceMemoryBuffer] =
+            toCompress.map(j => data.slice(bodyStart(j), bodyLen(j)))
+          withResource(if (toCompress.isEmpty) Array.empty[DeviceMemoryBuffer] else {
+            compressor().compress(slices, Cuda.DEFAULT_STREAM)
+          }) { comp =>
+            val compOf = Array.fill(n)(-1)
+            toCompress.indices.foreach(k => compOf(toCompress(k)) = k)
+            val useComp = Array.tabulate(n) { j =>
+              compOf(j) >= 0 && comp(compOf(j)).getLength < bodyLen(j)
+            }
+            val payloadLen = Array.tabulate(n) { j =>
+              if (useComp(j)) comp(compOf(j)).getLength else bodyLen(j)
+            }
+            val total = (0 until n).map { j =>
+              FRAME_HEADER_BYTES.toLong + hdrLen + payloadLen(j)
+            }.sum
+            val created = System.nanoTime()
+            closeOnExcept(HostMemoryBuffer.allocate(math.max(1L, total))) { hb =>
+              var pos = 0L
+              val fr = (0 until n).map { j =>
+                val start = pos
+                writeFrameHeader(hb, pos, if (useComp(j)) CODEC_LZ4 else CODEC_RAW, bodyLen(j),
+                  payloadLen(j), created)
+                pos += FRAME_HEADER_BYTES
+                // kudo header + raw body, or kudo header + compressed body
+                val rawLen = if (useComp(j)) hdrLen.toLong else hdrLen + bodyLen(j)
+                withResource(hb.slice(pos, rawLen)) { dst =>
+                  withResource(data.slice(starts(parts(j)), rawLen)) { src =>
+                    dst.copyFromDeviceBufferAsync(src, Cuda.DEFAULT_STREAM)
+                  }
+                }
+                pos += rawLen
+                if (useComp(j)) {
+                  withResource(hb.slice(pos, payloadLen(j))) { dst =>
+                    dst.copyFromDeviceBufferAsync(comp(compOf(j)), Cuda.DEFAULT_STREAM)
+                  }
+                  pos += payloadLen(j)
+                }
+                (parts(j), start, pos)
+              }
+              Cuda.DEFAULT_STREAM.sync()
+              (hb, fr)
+            }
+          }
+        }
+      }
+    }
+    GpuSemaphore.releaseIfNecessary(TaskContext.get())
+    withResource(hostBuf) { hb =>
+      frames.map { case (p, s, e) =>
+        val cb = new ColumnarBatch(Array(new SlicedSerializedColumnVector(hb, s.toInt, e.toInt)))
+        cb.setNumRows(rows(p))
+        (cb, p)
+      }.toArray
+    }
+  }
+
   private def sliceAndSerializeOnGpu(numRows: Int, partitionIndexes: Array[Int],
       partitionColumns: Array[GpuColumnVector]): Array[(ColumnarBatch, Int)] = {
     partitionColumns.foreach(_.getBase.getNullCount)
@@ -274,7 +388,9 @@ trait GpuPartitioning extends Partitioning {
     // Both GPU slicers build a cuDF Table, which cannot hold a rows-only batch. The CPU
     // slicer cuts one by row count, and every shuffle writer accepts its zero-column slices.
     val rowsOnly = partitionColumns.isEmpty
-    if (usesKudoGPUSlicing && !rowsOnly) {
+    if (usesKudoGPUSlicing && !rowsOnly && GpuShuffleFrame.enabled) {
+      sliceSerializeFramedOnGpu(numRows, partitionIndexes, partitionColumns)
+    } else if (usesKudoGPUSlicing && !rowsOnly) {
       sliceAndSerializeOnGpu(numRows, partitionIndexes, partitionColumns)
     } else {
       val sliceOnGpu = usesGPUShuffle && !rowsOnly

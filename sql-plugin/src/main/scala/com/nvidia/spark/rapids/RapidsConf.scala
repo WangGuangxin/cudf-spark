@@ -46,6 +46,10 @@ object RapidsConf extends Logging with RapidsConfEntries {
     val CPU, GPU = Value
   }
 
+  object ShuffleKudoCompressionPlacement extends Enumeration {
+    val NONE, GPU, CPU, ADAPTIVE = Value
+  }
+
   object AllowMultipleJars extends Enumeration {
     val ALWAYS, SAME_REVISION, NEVER = Value
   }
@@ -918,6 +922,14 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val shuffleKudoReadMode: ShuffleKudoMode.Value =
     ShuffleKudoMode.withName(get(SHUFFLE_KUDO_READ_MODE))
+
+  lazy val shuffleKudoCompressionPlacement: ShuffleKudoCompressionPlacement.Value =
+    ShuffleKudoCompressionPlacement.withName(get(SHUFFLE_KUDO_COMPRESSION_PLACEMENT))
+
+  lazy val shuffleKudoCompressionChunkSize: Long = get(SHUFFLE_KUDO_COMPRESSION_CHUNK_SIZE)
+
+  lazy val shuffleKudoCompressionAdaptiveMaxQueueDelayMs: Int =
+    get(SHUFFLE_KUDO_COMPRESSION_ADAPTIVE_MAX_QUEUE_DELAY_MS)
 
   lazy val shuffleKudoMeasureBufferCopyEnabled: Boolean =
     get(SHUFFLE_KUDO_SERIALIZER_MEASURE_BUFFER_COPY_ENABLED)

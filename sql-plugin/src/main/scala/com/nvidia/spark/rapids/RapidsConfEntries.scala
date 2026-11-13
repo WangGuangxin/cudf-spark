@@ -438,6 +438,47 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
     .stringConf
     .createWithDefault("GPU")
 
+  val SHUFFLE_KUDO_COMPRESSION_PLACEMENT =
+    conf("spark.rapids.shuffle.kudo.compression.placement")
+      .doc("Where the shuffle data written by the GPU kudo serializer " +
+        "(spark.rapids.shuffle.kudo.serializer.write.mode=GPU) is compressed. " +
+        "\"NONE\": the kudo serializer does not compress, Spark compresses the shuffle stream " +
+        "(spark.shuffle.compress). " +
+        "\"GPU\": every batch is LZ4-compressed with nvcomp on the GPU before it is copied to " +
+        "the host. \"CPU\": the shuffle writer threads LZ4-compress the batches. " +
+        "\"ADAPTIVE\": per batch, GPU while the CPU compression queue delay exceeds " +
+        "spark.rapids.shuffle.kudo.compression.adaptive.maxQueueDelayMs, CPU otherwise. " +
+        "With any placement other than NONE the data is decompressed on the GPU when the shuffle " +
+        "is read (spark.rapids.shuffle.kudo.serializer.read.mode=GPU), and " +
+        "spark.shuffle.compress must be false; otherwise NONE is used.")
+      .internal()
+      .startupOnly()
+      .stringConf
+      .transform(_.toUpperCase(java.util.Locale.ROOT))
+      .checkValues(Set("NONE", "GPU", "CPU", "ADAPTIVE"))
+      .createWithDefault("NONE")
+
+  val SHUFFLE_KUDO_COMPRESSION_CHUNK_SIZE =
+    conf("spark.rapids.shuffle.kudo.compression.chunkSize")
+      .doc("Uncompressed size of the independently compressed LZ4 chunks of a shuffle batch " +
+        "when spark.rapids.shuffle.kudo.compression.placement is not NONE.")
+      .internal()
+      .startupOnly()
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v > 0 && v <= 16L * 1024 * 1024, "must be in (0, 16MiB]")
+      .createWithDefault(64L * 1024)
+
+  val SHUFFLE_KUDO_COMPRESSION_ADAPTIVE_MAX_QUEUE_DELAY_MS =
+    conf("spark.rapids.shuffle.kudo.compression.adaptive.maxQueueDelayMs")
+      .doc("With spark.rapids.shuffle.kudo.compression.placement=ADAPTIVE, a batch is " +
+        "compressed on the GPU while the smoothed time shuffle data waits for a writer thread " +
+        "to compress it on the CPU exceeds this many milliseconds.")
+      .internal()
+      .startupOnly()
+      .integerConf
+      .checkValue(v => v >= 0, "must not be negative")
+      .createWithDefault(100)
+
   val SHUFFLE_KUDO_SERIALIZER_MEASURE_BUFFER_COPY_ENABLED =
     conf("spark.rapids.shuffle.kudo.serializer.measure.buffer.copy.enabled")
     .doc("Enable or disable measuring buffer copy time when using Kudo serializer for the shuffle.")
