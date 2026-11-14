@@ -85,6 +85,10 @@ object RapidsPluginUtils extends Logging {
   val JNI_PROPS_FILENAME = "cudf-spark-jni-version-info.properties"
   val PLUGIN_PROPS_FILENAME = "rapids4spark-version-info.properties"
   private val PRIVATE_PROPS_FILENAME = "cudf-spark-private-version-info.properties"
+  val NUM_CONNECTIONS_PER_PEER_KEY = "spark.shuffle.io.numConnectionsPerPeer"
+  // Connections per peer used for MULTITHREADED shuffle with skipMerge when the user did not set
+  // one. On a 2-executor host, SSB SF3000 same-host shuffle reads stopped improving beyond 4.
+  val MT_SHUFFLE_CONNECTIONS_PER_PEER = 4
 
   private val SQL_PLUGIN_NAME = classOf[SQLExecPlugin].getName
   private val UDF_PLUGIN_NAME = "com.nvidia.spark.udf.Plugin"
@@ -546,6 +550,17 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
       ShuffleCleanupManager.init(sc)
       shuffleCleanupListener = new ShuffleCleanupListener()
       sc.addSparkListener(shuffleCleanupListener)
+      // With the multithreaded catalog, blocks of other executors on the same host are not read
+      // from local disk but fetched over the network (see RapidsShuffleBlockFetcherIterator).
+      // Spark opens a single connection per peer by default, which caps that traffic at what one
+      // netty channel can move. Unless the user chose a value, open several connections per peer.
+      if (!sparkConf.contains(RapidsPluginUtils.NUM_CONNECTIONS_PER_PEER_KEY)) {
+        sparkConf.set(RapidsPluginUtils.NUM_CONNECTIONS_PER_PEER_KEY,
+          RapidsPluginUtils.MT_SHUFFLE_CONNECTIONS_PER_PEER.toString)
+        logInfo(s"Set ${RapidsPluginUtils.NUM_CONNECTIONS_PER_PEER_KEY} to " +
+          s"${RapidsPluginUtils.MT_SHUFFLE_CONNECTIONS_PER_PEER} for MULTITHREADED shuffle " +
+          "with skipMerge, where same-host shuffle blocks are fetched over the network")
+      }
       logInfo("ShuffleCleanupManager and listener initialized for MULTITHREADED shuffle mode " +
         "(skipMerge enabled, ESS disabled, off-heap limits on)")
     } else if (conf.isMultiThreadedShuffleManagerMode &&
