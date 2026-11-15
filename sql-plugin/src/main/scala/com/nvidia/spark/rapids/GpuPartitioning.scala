@@ -220,103 +220,153 @@ trait GpuPartitioning extends Partitioning {
       end - partitionIndexes(p)
     }
     val parts = (0 until numPartitions).filter(rows(_) > 0).toArray
-    val n = parts.length
     val onGpu = compressOnGpu()
-    val (hostBuf, frames) = withResource(partitionColumns) { _ =>
-      withResource(new Table(partitionColumns.map(_.getBase).toArray: _*)) { table =>
-        withResource(gpuSplitAndSerialize(table, partitionIndexes.tail: _*)) { dmbs =>
-          val data = dmbs(0)
-          val offsets = dmbs(1)
-          require(data.getLength <= maxGpuSerializedSliceBytes,
-            s"GPU-serialized shuffle batch is ${data.getLength} bytes, exceeding the " +
-            s"$maxGpuSerializedSliceBytes-byte (2GB) limit addressable by the Int " +
-            s"serialized-slice offsets; reduce spark.rapids.sql.batchSizeBytes")
-          val starts = withResource(HostMemoryBuffer.allocate(offsets.getLength)) { oh =>
-            oh.copyFromDeviceBuffer(offsets, Cuda.DEFAULT_STREAM)
-            val elemSize = oh.getLength / (numPartitions + 1)
-            Array.tabulate(numPartitions)(i => if (i == 0) 0L else oh.getLong(i * elemSize))
-          }
-          val ends = Array.tabulate(numPartitions) { i =>
-            if (i == numPartitions - 1) data.getLength else starts(i + 1)
-          }
-          // The kudo headers of all slices of a batch have the same size (it only depends on
-          // the number of columns), so the first slice tells where every body starts.
-          val hdrLen = if (n == 0) 0 else {
-            val p = parts(0)
-            val len = math.min(HEADER_PROBE_BYTES.toLong, ends(p) - starts(p))
-            withResource(HostMemoryBuffer.allocate(len)) { probe =>
-              withResource(data.slice(starts(p), len)) { src =>
-                probe.copyFromDeviceBuffer(src, Cuda.DEFAULT_STREAM)
-              }
-              val b = new Array[Byte](len.toInt)
-              probe.getBytes(b, 0, 0, len)
-              com.nvidia.spark.rapids.jni.kudo.KudoTableHeader.readFrom(
-                new java.io.DataInputStream(new java.io.ByteArrayInputStream(b)))
-                .get().getSerializedSize
-            }
-          }
-          val bodyStart = parts.map(p => starts(p) + hdrLen)
-          val bodyLen = parts.indices.map(j => ends(parts(j)) - bodyStart(j)).toArray
-          val toCompress = if (onGpu) {
-            parts.indices.filter(j => bodyLen(j) >= MIN_COMPRESS_BYTES).toArray
-          } else {
-            Array.empty[Int]
-          }
-          // compress() closes the input slices
-          val slices: Array[ai.rapids.cudf.BaseDeviceMemoryBuffer] =
-            toCompress.map(j => data.slice(bodyStart(j), bodyLen(j)))
-          withResource(if (toCompress.isEmpty) Array.empty[DeviceMemoryBuffer] else {
-            compressor().compress(slices, Cuda.DEFAULT_STREAM)
-          }) { comp =>
-            val compOf = Array.fill(n)(-1)
-            toCompress.indices.foreach(k => compOf(toCompress(k)) = k)
-            val useComp = Array.tabulate(n) { j =>
-              compOf(j) >= 0 && comp(compOf(j)).getLength < bodyLen(j)
-            }
-            val payloadLen = Array.tabulate(n) { j =>
-              if (useComp(j)) comp(compOf(j)).getLength else bodyLen(j)
-            }
-            val total = (0 until n).map { j =>
-              FRAME_HEADER_BYTES.toLong + hdrLen + payloadLen(j)
-            }.sum
-            val created = System.nanoTime()
-            closeOnExcept(HostMemoryBuffer.allocate(math.max(1L, total))) { hb =>
-              var pos = 0L
-              val fr = (0 until n).map { j =>
-                val start = pos
-                writeFrameHeader(hb, pos, if (useComp(j)) CODEC_LZ4 else CODEC_RAW, bodyLen(j),
-                  payloadLen(j), created)
-                pos += FRAME_HEADER_BYTES
-                // kudo header + raw body, or kudo header + compressed body
-                val rawLen = if (useComp(j)) hdrLen.toLong else hdrLen + bodyLen(j)
-                withResource(hb.slice(pos, rawLen)) { dst =>
-                  withResource(data.slice(starts(parts(j)), rawLen)) { src =>
-                    dst.copyFromDeviceBufferAsync(src, Cuda.DEFAULT_STREAM)
-                  }
-                }
-                pos += rawLen
-                if (useComp(j)) {
-                  withResource(hb.slice(pos, payloadLen(j))) { dst =>
-                    dst.copyFromDeviceBufferAsync(comp(compOf(j)), Cuda.DEFAULT_STREAM)
-                  }
-                  pos += payloadLen(j)
-                }
-                (parts(j), start, pos)
-              }
-              Cuda.DEFAULT_STREAM.sync()
-              (hb, fr)
-            }
+    // The serialized buffers own their data. Complete the serializer's reads, then release
+    // both owners of the input columns before any compression group allocates its workspace.
+    val serialized = closeOnExcept(new ArrayBuffer[DeviceMemoryBuffer](2)) { buffers =>
+      withResource(partitionColumns) { _ =>
+        withResource(new Table(partitionColumns.map(_.getBase).toArray: _*)) { table =>
+          buffers ++= gpuSplitAndSerialize(table, partitionIndexes.tail: _*)
+          Cuda.DEFAULT_STREAM.sync()
+        }
+      }
+      buffers.toArray
+    }
+    val batches = withResource(serialized) { dmbs =>
+      val data = dmbs(0)
+      val offsets = dmbs(1)
+      require(data.getLength <= maxGpuSerializedSliceBytes,
+        s"GPU-serialized shuffle batch is ${data.getLength} bytes, exceeding the " +
+        s"$maxGpuSerializedSliceBytes-byte (2GB) limit addressable by the Int " +
+        s"serialized-slice offsets; reduce spark.rapids.sql.batchSizeBytes")
+      val starts = withResource(HostMemoryBuffer.allocate(offsets.getLength)) { oh =>
+        oh.copyFromDeviceBuffer(offsets, Cuda.DEFAULT_STREAM)
+        val elemSize = oh.getLength / (numPartitions + 1)
+        Array.tabulate(numPartitions)(i => if (i == 0) 0L else oh.getLong(i * elemSize))
+      }
+      val ends = Array.tabulate(numPartitions) { i =>
+        if (i == numPartitions - 1) data.getLength else starts(i + 1)
+      }
+      val hdrLen = framedHeaderSize(data, starts, ends, parts)
+      frameSerializedGroups(data, starts, ends, parts, rows, hdrLen, onGpu)
+    }
+    GpuSemaphore.releaseIfNecessary(TaskContext.get())
+    batches
+  }
+
+  private def framedHeaderSize(data: DeviceMemoryBuffer, starts: Array[Long],
+      ends: Array[Long], parts: Array[Int]): Int = {
+    import GpuShuffleFrame._
+    if (parts.isEmpty) {
+      0
+    } else {
+      val p = parts(0)
+      val len = math.min(HEADER_PROBE_BYTES.toLong, ends(p) - starts(p))
+      withResource(HostMemoryBuffer.allocate(len)) { probe =>
+        withResource(data.slice(starts(p), len)) { src =>
+          probe.copyFromDeviceBuffer(src, Cuda.DEFAULT_STREAM)
+        }
+        val bytes = new Array[Byte](len.toInt)
+        probe.getBytes(bytes, 0, 0, len)
+        com.nvidia.spark.rapids.jni.kudo.KudoTableHeader.readFrom(
+          new java.io.DataInputStream(new java.io.ByteArrayInputStream(bytes)))
+          .get().getSerializedSize
+      }
+    }
+  }
+
+  private def frameSerializedGroups(data: DeviceMemoryBuffer, starts: Array[Long],
+      ends: Array[Long], parts: Array[Int], rows: Array[Int], hdrLen: Int,
+      onGpu: Boolean): Array[(ColumnarBatch, Int)] = {
+    import GpuShuffleFrame._
+    val bodyLengths = parts.map(p => ends(p) - starts(p) - hdrLen)
+    val groups = if (onGpu) compressionGroups(bodyLengths, chunkSize)
+      else Iterator(parts.indices)
+    // Each group owns an exactly sized host allocation. Retain only host-backed output batches
+    // across groups; exceptions must also close outputs already built for earlier groups.
+    closeOnExcept(new ArrayBuffer[ColumnarBatch](parts.length)) { batches =>
+      val partitionIds = new ArrayBuffer[Int](parts.length)
+      groups.foreach { group =>
+        val selected = parts.slice(group.start, group.end)
+        val (hostBuf, frames) = frameSerializedGroup(data, starts, ends, selected, hdrLen, onGpu)
+        withResource(hostBuf) { hb =>
+          frames.foreach { case (p, s, e) =>
+            val cb = new ColumnarBatch(Array(new SlicedSerializedColumnVector(hb,
+              s.toInt, e.toInt)))
+            batches += cb
+            cb.setNumRows(rows(p))
+            partitionIds += p
           }
         }
       }
+      batches.zip(partitionIds).toArray
     }
-    GpuSemaphore.releaseIfNecessary(TaskContext.get())
-    withResource(hostBuf) { hb =>
-      frames.map { case (p, s, e) =>
-        val cb = new ColumnarBatch(Array(new SlicedSerializedColumnVector(hb, s.toInt, e.toInt)))
-        cb.setNumRows(rows(p))
-        (cb, p)
-      }.toArray
+  }
+
+  private def copyFramedSliceToHost(data: DeviceMemoryBuffer, sourceOffset: Long,
+      length: Long, host: HostMemoryBuffer, destinationOffset: Long): Unit = {
+    withResource(host.slice(destinationOffset, length)) { dst =>
+      withResource(data.slice(sourceOffset, length)) { src =>
+        dst.copyFromDeviceBufferAsync(src, Cuda.DEFAULT_STREAM)
+      }
+    }
+  }
+
+  private def frameSerializedGroup(data: DeviceMemoryBuffer, starts: Array[Long],
+      ends: Array[Long], parts: Array[Int], hdrLen: Int,
+      onGpu: Boolean): (HostMemoryBuffer, Array[(Int, Long, Long)]) = {
+    import GpuShuffleFrame._
+    val n = parts.length
+    val bodyStart = parts.map(p => starts(p) + hdrLen)
+    val bodyLen = parts.indices.map(j => ends(parts(j)) - bodyStart(j)).toArray
+    val toCompress = if (onGpu) {
+      parts.indices.filter(j => bodyLen(j) >= MIN_COMPRESS_BYTES).toArray
+    } else {
+      Array.empty[Int]
+    }
+    // compress() takes ownership of the input views, but the parent serialized data stays live.
+    val slices: Array[ai.rapids.cudf.BaseDeviceMemoryBuffer] =
+      toCompress.safeMap(j => data.slice(bodyStart(j), bodyLen(j)))
+    withResource(if (toCompress.isEmpty) Array.empty[DeviceMemoryBuffer] else {
+      compressor().compress(slices, Cuda.DEFAULT_STREAM)
+    }) { comp =>
+      val compOf = Array.fill(n)(-1)
+      toCompress.indices.foreach(k => compOf(toCompress(k)) = k)
+      val useComp = Array.tabulate(n) { j =>
+        compOf(j) >= 0 && comp(compOf(j)).getLength < bodyLen(j)
+      }
+      val payloadLen = Array.tabulate(n) { j =>
+        if (useComp(j)) comp(compOf(j)).getLength else bodyLen(j)
+      }
+      val total = (0 until n).map { j =>
+        FRAME_HEADER_BYTES.toLong + hdrLen + payloadLen(j)
+      }.sum
+      val created = System.nanoTime()
+      closeOnExcept(HostMemoryBuffer.allocate(math.max(1L, total))) { hb =>
+        var pos = 0L
+        val frames = try {
+          (0 until n).map { j =>
+            val start = pos
+            writeFrameHeader(hb, pos, if (useComp(j)) CODEC_LZ4 else CODEC_RAW, bodyLen(j),
+              payloadLen(j), created)
+            pos += FRAME_HEADER_BYTES
+            val rawLen = if (useComp(j)) hdrLen.toLong else hdrLen + bodyLen(j)
+            copyFramedSliceToHost(data, starts(parts(j)), rawLen, hb, pos)
+            pos += rawLen
+            if (useComp(j)) {
+              withResource(hb.slice(pos, payloadLen(j))) { dst =>
+                dst.copyFromDeviceBufferAsync(comp(compOf(j)), Cuda.DEFAULT_STREAM)
+              }
+              pos += payloadLen(j)
+            }
+            (parts(j), start, pos)
+          }.toArray
+        } finally {
+          // Host and compressed buffers must outlive every queued copy, including on failure.
+          Cuda.DEFAULT_STREAM.sync()
+        }
+        (hb, frames)
+      }
     }
   }
 

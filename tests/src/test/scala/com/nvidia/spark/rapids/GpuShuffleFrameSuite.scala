@@ -19,8 +19,8 @@ package com.nvidia.spark.rapids
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream}
 
 import ai.rapids.cudf.{BaseDeviceMemoryBuffer, Cuda, DeviceMemoryBuffer, HostMemoryBuffer, Rmm, RmmAllocationMode, Table}
-import com.nvidia.spark.rapids.Arm.withResource
-import com.nvidia.spark.rapids.jni.kudo.{KudoSerializer, KudoTableHeader}
+import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
+import com.nvidia.spark.rapids.jni.kudo.{KudoGpuSerializer, KudoSerializer, KudoTableHeader}
 import com.nvidia.spark.rapids.spill.SpillFramework
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
@@ -87,6 +87,23 @@ class GpuShuffleFrameSuite extends AnyFunSuite with BeforeAndAfterAll {
     val it = new FramedKudoBatchIterator(
       new DataInputStream(new ByteArrayInputStream(bytes)), NoopMetric)
     it.map(_._2.column(0).asInstanceOf[KudoSerializedTableColumn]).toList
+  }
+
+  test("serialized device buffers survive releasing the input table before assembly") {
+    val buffers = withResource(buildTable()) { table =>
+      closeOnExcept(KudoGpuSerializer.splitAndSerializeToDevice(table, numRows / 2)) { out =>
+        Cuda.DEFAULT_STREAM.sync()
+        out
+      }
+    }
+    withResource(buffers) { out =>
+      withResource(KudoGpuSerializer.assembleFromDeviceRaw(
+          GpuColumnVector.from(dataTypes), out(0), out(1))) { actual =>
+        withResource(buildTable()) { expected =>
+          TestUtils.compareTables(expected, actual)
+        }
+      }
+    }
   }
 
   test("CPU-compressed frame is read back on the CPU and concatenated on the GPU") {

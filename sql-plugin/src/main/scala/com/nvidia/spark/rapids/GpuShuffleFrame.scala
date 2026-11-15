@@ -64,6 +64,8 @@ object GpuShuffleFrame extends Logging {
   val HEADER_PROBE_BYTES: Int = 1024
   /** bodies smaller than this are not compressed */
   val MIN_COMPRESS_BYTES: Int = 4096
+  /** Target padded input bytes per nvcomp call; an oversized partition runs alone. */
+  private[rapids] val GPU_COMPRESS_GROUP_BYTES: Long = 64L << 20
   /** bodies larger than this are not compressed on the CPU (bounds writer-thread memory) */
   val MAX_CPU_COMPRESS_BYTES: Long = 256L << 20
   val PROBE_INTERVAL: Int = 8
@@ -122,6 +124,42 @@ object GpuShuffleFrame extends Logging {
   }
 
   def compressor(): BatchedCompressor = new BatchedLZ4Compressor(chunkSize, 64L << 20)
+
+  /**
+   * Bound the number of worst-case output chunks allocated together by nvcomp. Closing each
+   * group's outputs after copying them to the host keeps those allocations out of the next call.
+   * Count padding separately for every partition: even a short final chunk reserves a full
+   * max-output chunk. A partition cannot be split without changing the frame representation.
+   */
+  private[rapids] def compressionGroups(bodyLengths: Array[Long], chunkBytes: Int,
+      targetBytes: Long = GPU_COMPRESS_GROUP_BYTES): Iterator[Range] = {
+    require(chunkBytes > 0 && targetBytes > 0)
+    require(bodyLengths.forall(_ >= 0))
+    new Iterator[Range] {
+      private var at = 0
+      override def hasNext: Boolean = at < bodyLengths.length
+
+      override def next(): Range = {
+        if (!hasNext) throw new NoSuchElementException("no more compression groups")
+        val start = at
+        var bytes = 0L
+        var full = false
+        while (at < bodyLengths.length && !full) {
+          val len = bodyLengths(at)
+          val padded = if (len < MIN_COMPRESS_BYTES) 0L else {
+            ((len - 1) / chunkBytes + 1) * chunkBytes
+          }
+          if (at > start && padded > targetBytes - bytes) {
+            full = true
+          } else {
+            bytes += padded
+            at += 1
+          }
+        }
+        start until at
+      }
+    }
+  }
 
   def decompressor(): BatchedDecompressor = new BatchedLZ4Decompressor(chunkSize)
 
