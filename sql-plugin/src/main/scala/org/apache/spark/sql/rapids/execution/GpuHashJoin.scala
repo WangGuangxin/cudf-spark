@@ -15,7 +15,7 @@
  */
 package org.apache.spark.sql.rapids.execution
 
-import ai.rapids.cudf.{ColumnView, DistinctHashJoin => CudfDistinctHashJoin, DType, GatherMap, HashJoin => CudfHashJoin, NullEquality, OutOfBoundsPolicy, Scalar, Table}
+import ai.rapids.cudf.{ColumnView, DistinctHashJoin => CudfDistinctHashJoin, DType, GatherMap, HashJoin => CudfHashJoin, MixedSemiJoinHashTable, NullEquality, OutOfBoundsPolicy, Scalar, Table}
 import ai.rapids.cudf.ast.CompiledExpression
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
@@ -2103,6 +2103,9 @@ class ConditionalHashJoinIterator(
       case RightOuter =>
         JoinImpl.rightOuterHashJoinBuildLeft(leftKeys, rightKeys, leftTable, rightTable,
           lazyCompiledCondition.getForBuildLeft, nullEquality)
+      case LeftSemi | LeftAnti if buildSide == GpuBuildRight =>
+        reusableMixedSemiJoin(leftKeys, rightKeys, leftTable, rightTable, nullEquality,
+          joinType == LeftSemi)
       case LeftSemi =>
         JoinImpl.leftSemiHashJoinBuildRight(leftKeys, rightKeys, leftTable, rightTable,
           lazyCompiledCondition.getForBuildRight, nullEquality)
@@ -2116,8 +2119,59 @@ class ConditionalHashJoinIterator(
     result
   }
 
+  // Mixed left semi/anti joins probe the same build side for every stream batch, so the cudf hash
+  // table over the build side is built once and reused instead of being rebuilt per batch. The
+  // table references the build columns' device memory, so it is keyed by their addresses and
+  // rebuilt if the build batch was spilled and re-materialized at a different location.
+  private[this] var mixedSemiTable: MixedSemiJoinHashTable = null
+  private[this] var mixedSemiKey: IndexedSeq[Long] = IndexedSeq.empty
+
+  private def bufAddr(b: ai.rapids.cudf.BaseDeviceMemoryBuffer): Long = {
+    if (b == null) 0L else withResource(b)(_.getAddress)
+  }
+
+  private def deviceKey(t: Table): IndexedSeq[Long] = {
+    (0 until t.getNumberOfColumns).flatMap { i =>
+      val c = t.getColumn(i)
+      IndexedSeq(c.getRowCount, c.getNullCount, c.getType.getTypeId.getNativeId.toLong,
+        bufAddr(c.getData), bufAddr(c.getValid), bufAddr(c.getOffsets))
+    }
+  }
+
+  private def closeMixedSemiTable(): Unit = {
+    if (mixedSemiTable != null) {
+      mixedSemiTable.close()
+      mixedSemiTable = null
+      mixedSemiKey = IndexedSeq.empty
+    }
+  }
+
+  private def reusableMixedSemiJoin(
+      leftKeys: Table,
+      rightKeys: Table,
+      leftTable: Table,
+      rightTable: Table,
+      nullEquality: NullEquality,
+      semi: Boolean): GatherMapsResult = {
+    val key = (deviceKey(rightKeys) ++ deviceKey(rightTable)) :+
+      (if (nullEquality == NullEquality.EQUAL) 1L else 0L)
+    if (mixedSemiTable == null || key != mixedSemiKey) {
+      closeMixedSemiTable()
+      mixedSemiTable = new MixedSemiJoinHashTable(rightKeys, rightTable, nullEquality)
+      mixedSemiKey = key
+    }
+    val condition = lazyCompiledCondition.getForBuildRight
+    val map = if (semi) {
+      mixedSemiTable.leftSemiJoinGatherMap(leftKeys, leftTable, condition)
+    } else {
+      mixedSemiTable.leftAntiJoinGatherMap(leftKeys, leftTable, condition)
+    }
+    GatherMapsResult.makeFromLeft(map)
+  }
+
   override def close(): Unit = {
     if (!closed) {
+      closeMixedSemiTable()
       super.close()
       lazyCompiledCondition.close()
     }
