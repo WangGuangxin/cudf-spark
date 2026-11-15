@@ -1924,6 +1924,20 @@ class HashJoinIterator(
   }
 }
 
+object ConditionalHashJoinIterator {
+  private def conf(key: String, default: String): String = {
+    Option(org.apache.spark.SparkEnv.get).map(_.conf.get(key, default)).getOrElse(default)
+  }
+
+  /** Reuse one hash build of the build side for conditional left semi/anti joins. */
+  lazy val reuseBuildForExistenceJoins: Boolean =
+    conf("spark.rapids.sql.join.existence.reuseBuild.enabled", "true").toBoolean
+
+  /** Fall back to the mixed join for a stream batch with more inner pairs per row than this. */
+  lazy val existenceJoinMaxPairsPerRow: Long =
+    conf("spark.rapids.sql.join.existence.reuseBuild.maxPairsPerRow", "16").toLong
+}
+
 /**
  * An iterator that does a hash join against a stream of batches with an inequality condition.
  * The LazyCompiledCondition will be closed when this iterator is closed.
@@ -2103,12 +2117,13 @@ class ConditionalHashJoinIterator(
       case RightOuter =>
         JoinImpl.rightOuterHashJoinBuildLeft(leftKeys, rightKeys, leftTable, rightTable,
           lazyCompiledCondition.getForBuildLeft, nullEquality)
-      case LeftSemi =>
-        JoinImpl.leftSemiHashJoinBuildRight(leftKeys, rightKeys, leftTable, rightTable,
-          lazyCompiledCondition.getForBuildRight, nullEquality)
-      case LeftAnti =>
-        JoinImpl.leftAntiHashJoinBuildRight(leftKeys, rightKeys, leftTable, rightTable,
-          lazyCompiledCondition.getForBuildRight, nullEquality)
+      case LeftSemi | LeftAnti if buildSide == GpuBuildRight &&
+          ConditionalHashJoinIterator.reuseBuildForExistenceJoins =>
+        reusableExistenceJoin(leftKeys, rightKeys, leftTable, rightTable, nullEquality)
+          .getOrElse(mixedExistenceJoin(leftKeys, rightKeys, leftTable, rightTable,
+            nullEquality))
+      case LeftSemi | LeftAnti =>
+        mixedExistenceJoin(leftKeys, rightKeys, leftTable, rightTable, nullEquality)
       case _ =>
         throw new NotImplementedError(s"Join $joinType $buildSide is not currently supported")
     }
@@ -2116,8 +2131,83 @@ class ConditionalHashJoinIterator(
     result
   }
 
+  private def mixedExistenceJoin(
+      leftKeys: Table,
+      rightKeys: Table,
+      leftTable: Table,
+      rightTable: Table,
+      nullEquality: NullEquality): GatherMapsResult = joinType match {
+    case LeftSemi =>
+      JoinImpl.leftSemiHashJoinBuildRight(leftKeys, rightKeys, leftTable, rightTable,
+        lazyCompiledCondition.getForBuildRight, nullEquality)
+    case LeftAnti =>
+      JoinImpl.leftAntiHashJoinBuildRight(leftKeys, rightKeys, leftTable, rightTable,
+        lazyCompiledCondition.getForBuildRight, nullEquality)
+    case other =>
+      throw new IllegalStateException(s"not an existence join: $other")
+  }
+
+  // cuDF's mixed semi/anti join builds its hash table over the build side on every call, i.e.
+  // once per stream batch. For a large build side probed by many stream batches that rebuild
+  // dominates the join. Instead the build-side keys are hashed once per iterator into a reusable
+  // cuDF hash table; each stream batch is then an inner hash join, the AST condition is applied
+  // to the matched pairs and the pairs are reduced to the semi/anti result. The inner join can
+  // produce more pairs than the stream batch has rows, so its exact size is counted first and
+  // the batch falls back to the mixed join when the pairs would exceed
+  // `existenceJoinMaxPairsPerRow` times the stream rows.
+  private[this] var reusableBuild: CudfHashJoin = null
+  private[this] var reusableBuildDisabled = false
+
+  private def closeReusableBuild(): Unit = {
+    if (reusableBuild != null) {
+      reusableBuild.close()
+      reusableBuild = null
+    }
+  }
+
+  private def reusableExistenceJoin(
+      leftKeys: Table,
+      rightKeys: Table,
+      leftTable: Table,
+      rightTable: Table,
+      nullEquality: NullEquality): Option[GatherMapsResult] = {
+    if (reusableBuildDisabled) {
+      return None
+    }
+    val leftRows = leftKeys.getRowCount
+    val rightRows = rightKeys.getRowCount
+    if (leftRows == 0 || rightRows == 0) {
+      return None
+    }
+    try {
+      if (reusableBuild == null) {
+        reusableBuild = new CudfHashJoin(rightKeys, nullEquality == NullEquality.EQUAL)
+      }
+      val pairs = leftKeys.innerJoinRowCount(reusableBuild)
+      val maxPairs = math.min(Int.MaxValue.toLong,
+        math.max(leftRows, 1L) * ConditionalHashJoinIterator.existenceJoinMaxPairsPerRow)
+      if (pairs > maxPairs) {
+        None
+      } else {
+        val inner = JoinImpl.innerHashJoinBuildRight(leftKeys, reusableBuild, Some(pairs))
+        val filtered = withResource(inner) { _ =>
+          JoinImpl.filterInnerJoinWithAST(inner, leftTable, rightTable,
+            lazyCompiledCondition.getForBuildRight)
+        }
+        Some(convertInnerJoinMapsToTargetType(filtered, leftRows, rightRows, joinType,
+          "reusable existence join"))
+      }
+    } catch {
+      case oom @ (_: OutOfMemoryError | _: GpuOOM) =>
+        // Give the memory of the reusable table back before the retry framework retries.
+        closeReusableBuild()
+        throw oom
+    }
+  }
+
   override def close(): Unit = {
     if (!closed) {
+      closeReusableBuild()
       super.close()
       lazyCompiledCondition.close()
     }
