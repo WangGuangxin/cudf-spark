@@ -402,12 +402,41 @@ class KudoGpuTableOperator(dataTypes: Array[DataType])
     column.spillableKudoTable.header
       .getNumRows
 
+  /**
+   * Concatenate tables some of whose bodies GpuShuffleFrame compressed: only the stored bytes go
+   * to the GPU, where the bodies are decompressed into place (GpuShuffleFrame.assembleOnGpu).
+   */
+  private def concatCompressed(spillables: Array[SpillableKudoTable]): ColumnarBatch = {
+    val (dataDevBuf, offsets) = GpuShuffleFrame.assembleOnGpu(
+      spillables.map(_.header.getSerializedSize.toLong), spillables.map(_.length),
+      spillables.map(_.header.getTotalDataLen.toLong), { (i, staged, off) =>
+        val skt = spillables(i)
+        skt.header.writeTo(staged, off)
+        skt.materializeInto(staged, off + skt.header.getSerializedSize)
+      })
+    withResource(dataDevBuf) { dataDev =>
+      withResource(DeviceMemoryBuffer.allocate(8L * offsets.length)) { offsetsDev =>
+        withResource(HostMemoryBuffer.allocate(8L * offsets.length)) { offsetsHost =>
+          offsets.indices.foreach(i => offsetsHost.setLong(i * 8L, offsets(i)))
+          offsetsDev.copyFromHostBuffer(offsetsHost)
+        }
+        val schema = GpuColumnVector.from(dataTypes)
+        withResource(KudoGpuSerializer.assembleFromDeviceRaw(
+            schema, dataDev, offsetsDev)) { table =>
+          GpuColumnVector.from(table, dataTypes)
+        }
+      }
+    }
+  }
+
   override def concat(columns: Array[KudoSerializedTableColumn]): ColumnarBatch = {
     require(columns.nonEmpty, "no tables to be concatenated")
     val numCols = columns.head.spillableKudoTable.header.getNumColumns
     if (numCols == 0) {
       val totalRowsNum = columns.map(getNumRows).sum
       new ColumnarBatch(Array.empty, totalRowsNum)
+    } else if (columns.exists(_.spillableKudoTable.isCompressed)) {
+      concatCompressed(columns.map(_.spillableKudoTable))
     } else {
       // Each spilled table is copied straight into the staging buffer rather
       // than being materialized into a host buffer of its own first. That is
