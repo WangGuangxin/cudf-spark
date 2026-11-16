@@ -2244,7 +2244,10 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       "driver, logs them and records them in the event log, and derives the scan split " +
       "size, the pinned memory pool size, whether MULTITHREADED shuffle skips merging, " +
       "the number of shuffle connections per peer when it does, and how AQE coalesces " +
-      "shuffle partitions when they are not set explicitly.")
+      "shuffle partitions when they are not set explicitly. It also raises the initial " +
+      "number of AQE shuffle partitions to at least the number of GPU task slots, the " +
+      "number of GPUs times spark.rapids.sql.concurrentGpuTasks, even when it was set " +
+      "explicitly.")
     .internal()
     .startupOnly()
     .booleanConf

@@ -86,4 +86,33 @@ class StartupTuningSuite extends AnyFunSuite {
     assert(!StartupTuning.shouldDeriveConnectionsPerPeer(
       new SparkConf(false).setAll(Seq(mt, skipMerge, offHeap)), rapidsShuffleConfigured = false))
   }
+
+  test("initial partitions are raised to the GPU task slots") {
+    def floor(settings: (String, String)*): Option[Int] = {
+      val sparkConf = new SparkConf(false).setAll(settings)
+      StartupTuning.initialPartitionFloor(sparkConf, new RapidsConf(sparkConf))
+    }
+    val standalone = Seq("spark.master" -> "spark://h:7077", "spark.executor.instances" -> "8",
+      RapidsConf.CONCURRENT_GPU_TASKS.key -> "4")
+    val initial = CpuMigration.InitialPartitionNumKey
+    assert(floor(standalone :+ (initial -> "10"): _*).contains(32))
+    assert(floor(standalone :+ (initial -> "64"): _*).isEmpty)
+    // Without an initial number the number of shuffle partitions is the initial number.
+    assert(floor(standalone :+ (CpuMigration.ShufflePartitionsKey -> "16"): _*).contains(32))
+    assert(floor(standalone: _*).isEmpty)
+    // Not used without AQE coalescing.
+    assert(floor(standalone ++ Seq(initial -> "10",
+      CpuMigration.CoalescePartitionsEnabledKey -> "false"): _*).isEmpty)
+    // Standalone without an executor count, two tasks per GPU by default.
+    assert(floor("spark.master" -> "spark://h:7077", "spark.cores.max" -> "128",
+      "spark.executor.cores" -> "16", initial -> "10").contains(16))
+    // Two GPUs per executor; dynamic allocation uses the most executors.
+    assert(floor("spark.master" -> "yarn", "spark.dynamicAllocation.enabled" -> "true",
+      "spark.dynamicAllocation.maxExecutors" -> "5", "spark.executor.resource.gpu.amount" -> "2",
+      RapidsConf.CONCURRENT_GPU_TASKS.key -> "3", initial -> "10").contains(30))
+    assert(floor("spark.master" -> "local[8]", RapidsConf.CONCURRENT_GPU_TASKS.key -> "4",
+      initial -> "1").contains(4))
+    // Unknown number of executors.
+    assert(floor("spark.master" -> "yarn", initial -> "10").isEmpty)
+  }
 }

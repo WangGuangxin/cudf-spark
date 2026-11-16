@@ -16,6 +16,8 @@
 
 package com.nvidia.spark.rapids.tuning
 
+import scala.util.Try
+
 import com.nvidia.spark.rapids.{RapidsConf, SparkRapidsTuningDecisionEvent}
 
 import org.apache.spark.{SparkConf, SparkContext}
@@ -61,6 +63,12 @@ object StartupTuning extends Logging {
   // beyond 4 connections.
   private[tuning] val SkipMergeConnectionsPerPeer = 4
 
+  // Spark's default for spark.sql.shuffle.partitions.
+  private val DefaultShufflePartitions = 200
+  // Tasks per GPU assumed when spark.rapids.sql.concurrentGpuTasks is not set, in which case
+  // executors pick their concurrency from the GPU memory at runtime.
+  private val DefaultTasksPerGpu = 2
+
   def scanSplitBytes(batchSizeBytes: Long): Long =
     math.min(math.max(batchSizeBytes, MinScanSplitBytes), MaxScanSplitBytes)
 
@@ -87,6 +95,7 @@ object StartupTuning extends Logging {
       // after skip merge, which it depends on
       deriveShuffleConnectionsPerPeer(sc, sparkConf)
       deriveCoalescing(sc, sparkConf)
+      deriveInitialPartitionFloor(sc, sparkConf, conf)
     }
   }
 
@@ -188,6 +197,85 @@ object StartupTuning extends Logging {
         AdaptiveTuningListener.NoExecutionId, -1, MinPartitionSizeKey, "unset",
         minSize.toString, s"1/$MinPartitionSizeFraction of $AdvisoryPartitionSizeKey=$advisory",
         TuningDecisionLog.RuleSource))
+    }
+  }
+
+  /**
+   * Number of executors the application runs with, or None if the driver cannot know it
+   * before the executors register. With dynamic allocation this is the most it may use.
+   */
+  private[tuning] def numExecutors(sparkConf: SparkConf): Option[Int] = {
+    def positive(key: String): Option[Int] =
+      sparkConf.getOption(key).flatMap(v => Try(v.trim.toInt).toOption).filter(_ > 0)
+    if (sparkConf.get("spark.master", "").startsWith("local")) {
+      Some(1)
+    } else if (sparkConf.getBoolean("spark.dynamicAllocation.enabled", false)) {
+      positive("spark.dynamicAllocation.maxExecutors").filter(_ < Int.MaxValue)
+    } else {
+      positive("spark.executor.instances").orElse {
+        // Standalone mode without an executor count.
+        for {
+          coresMax <- positive("spark.cores.max")
+          execCores <- positive("spark.executor.cores")
+        } yield math.max(1, coresMax / execCores)
+      }
+    }
+  }
+
+  /**
+   * Number of tasks the application's GPUs run at once: GPUs times concurrent GPU tasks,
+   * or None if the number of executors is unknown on the driver.
+   */
+  private[tuning] def gpuTaskSlots(sparkConf: SparkConf, conf: RapidsConf): Option[Int] = {
+    val gpusPerExecutor = sparkConf.getOption("spark.executor.resource.gpu.amount")
+      .flatMap(v => Try(v.trim.toDouble).toOption).filter(_ > 0).getOrElse(1.0)
+    val tasksPerGpu = conf.concurrentGpuTasks.map(_.intValue()).filter(_ > 0)
+      .getOrElse(DefaultTasksPerGpu)
+    numExecutors(sparkConf).map { e =>
+      math.max(1, math.ceil(e * gpusPerExecutor).toInt) * tasksPerGpu
+    }
+  }
+
+  /**
+   * The initial number of AQE shuffle partitions to use instead of the current one, when the
+   * current one is smaller than the number of GPU task slots, or None to keep it.
+   */
+  private[tuning] def initialPartitionFloor(sparkConf: SparkConf,
+      conf: RapidsConf): Option[Int] = {
+    val coalescing = sparkConf.getBoolean(CpuMigration.AdaptiveEnabledKey, true) &&
+      sparkConf.getBoolean(CpuMigration.CoalescePartitionsEnabledKey, true)
+    if (!coalescing) {
+      None
+    } else {
+      val current = sparkConf.getOption(CpuMigration.InitialPartitionNumKey)
+        .orElse(sparkConf.getOption(CpuMigration.ShufflePartitionsKey))
+        .flatMap(v => Try(v.trim.toInt).toOption)
+        .getOrElse(DefaultShufflePartitions)
+      gpuTaskSlots(sparkConf, conf).filter(_ > current)
+    }
+  }
+
+  /**
+   * With AQE coalescing the initial number of shuffle partitions bounds the number of tasks
+   * of every stage that reads a shuffle. A value tuned for fewer GPUs leaves GPUs idle: on
+   * NDS at 3 TB on 8 GPUs running 4 tasks each, 10 initial partitions took 1.38 times as
+   * long as 32, because the stages after the large shuffles ran 10 tasks of up to 12 GiB.
+   * The value is raised, even when it was set explicitly, to at least one partition per GPU
+   * task slot. Larger values are kept: AQE coalesces them toward the advisory size.
+   */
+  private def deriveInitialPartitionFloor(sc: SparkContext, sparkConf: SparkConf,
+      conf: RapidsConf): Unit = {
+    initialPartitionFloor(sparkConf, conf).foreach { slots =>
+      val key = CpuMigration.InitialPartitionNumKey
+      val old = sparkConf.getOption(key).getOrElse("unset")
+      val current = sparkConf.getOption(key).map(k => s"$key=$k").getOrElse(
+        s"${CpuMigration.ShufflePartitionsKey}=" +
+          sparkConf.get(CpuMigration.ShufflePartitionsKey, DefaultShufflePartitions.toString))
+      sparkConf.set(key, slots.toString)
+      TuningDecisionLog.record(sc, SparkRapidsTuningDecisionEvent(
+        AdaptiveTuningListener.NoExecutionId, -1, key, old, slots.toString,
+        s"$current is below the $slots GPU task slots (GPUs x " +
+          s"${RapidsConf.CONCURRENT_GPU_TASKS.key})", TuningDecisionLog.RuleSource))
     }
   }
 
