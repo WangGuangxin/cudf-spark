@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -149,6 +149,45 @@ class JoinsSuite extends SparkQueryCompareTestSuite {
           }
         }
       }
+    }
+  }
+  // Conditional left semi/anti shuffled hash joins: one reused build-side hash table + inner join
+  // + AST filter, the per-batch fallback to the mixed join, and the mixed join only.
+  private def existenceJoinDf(rows: Int, keyMod: Int)(spark: SparkSession): DataFrame = {
+    spark.range(rows).selectExpr(
+      s"CASE WHEN id % 13 = 0 THEN NULL ELSE id % $keyMod END AS k",
+      "CASE WHEN id % 11 = 0 THEN NULL ELSE id % 5 END AS v")
+  }
+
+  private def existenceJoinConf(extra: (String, String)*): SparkConf = {
+    val conf = new SparkConf()
+      .set("spark.sql.autoBroadcastJoinThreshold", "-1")
+      .set("spark.sql.shuffle.partitions", "2")
+      .set("spark.sql.adaptive.enabled", "false")
+      // many small stream batches, so the build side is probed more than once
+      .set(RapidsConf.GPU_BATCH_SIZE_BYTES.key, "4096")
+    extra.foreach { case (k, v) => conf.set(k, v) }
+    conf
+  }
+
+  private val existenceJoinModes = Seq(
+    "reused build" -> existenceJoinConf(),
+    "pair limit fallback" -> existenceJoinConf(
+      RapidsConf.EXISTENCE_JOIN_MAX_PAIRS_PER_ROW.key -> "1"),
+    "mixed join" -> existenceJoinConf(
+      RapidsConf.EXISTENCE_JOIN_REUSE_BUILD.key -> "false"))
+
+  for ((mode, conf) <- existenceJoinModes; joinType <- Seq("LeftSemi", "LeftAnti")) {
+    IGNORE_ORDER_testSparkResultsAreEqual2(
+      s"Test conditional $joinType shuffled hash join ($mode)",
+      existenceJoinDf(5000, 97), existenceJoinDf(3000, 89), conf = conf) {
+      (A, B) => A.join(B, A("k") === B("k") && A("v") =!= B("v"), joinType)
+    }
+
+    IGNORE_ORDER_testSparkResultsAreEqual2(
+      s"Test conditional $joinType shuffled hash join null-safe keys ($mode)",
+      existenceJoinDf(5000, 97), existenceJoinDf(3000, 89), conf = conf) {
+      (A, B) => A.join(B, A("k") <=> B("k") && A("v") > B("v"), joinType)
     }
   }
 }
