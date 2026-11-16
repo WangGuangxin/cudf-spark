@@ -624,6 +624,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val parquetDebugDumpAlways: Boolean = get(PARQUET_DEBUG_DUMP_ALWAYS)
 
+  lazy val isParquetSerializeColumnChunkReads: Boolean = get(PARQUET_SERIALIZE_COLUMN_CHUNK_READS)
+
   lazy val orcDebugDumpPrefix: Option[String] = get(ORC_DEBUG_DUMP_PREFIX)
 
   lazy val orcDebugDumpAlways: Boolean = get(ORC_DEBUG_DUMP_ALWAYS)

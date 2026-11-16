@@ -164,6 +164,15 @@ case class GpuParquetScan(
 }
 
 object GpuParquetScan {
+  /**
+   * Whether Parquet reads serialize their column chunk copies until completion across concurrent
+   * readers on a GPU. libcudf serializes these reads with a process-wide lock per GPU, so the
+   * setting is applied to every reader on the executor. Set once on executor startup from
+   * `spark.rapids.sql.format.parquet.serializeColumnChunkReads`.
+   */
+  @volatile private[rapids] var serializeColumnChunkReads: Boolean =
+    RapidsConf.PARQUET_SERIALIZE_COLUMN_CHUNK_READS.defaultValue
+
   private def hasPotentiallyShreddedVariant(
       dataTypes: Iterable[DataType], sqlConf: SQLConf): Boolean = {
     dataTypes.exists { dataType =>
@@ -2541,6 +2550,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     ParquetOptions.builder()
         .withTimeUnit(DType.TIMESTAMP_MICROSECONDS)
         .includeColumn(includeColumns : _*)
+        .withSerializeColumnChunkReads(GpuParquetScan.serializeColumnChunkReads)
         .build()
   }
 

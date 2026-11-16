@@ -454,7 +454,9 @@ class ParquetCachedBatchSerializer extends GpuCachedBatchSerializer {
       case parquetCB: ParquetCachedBatch =>
         GpuSemaphore.acquireIfNecessary(TaskContext.get())
         val parquetOptions = ParquetOptions.builder()
-            .includeColumn(selectedAttributes.map(_.name).asJavaCollection).build()
+            .includeColumn(selectedAttributes.map(_.name).asJavaCollection)
+            .withSerializeColumnChunkReads(GpuParquetScan.serializeColumnChunkReads)
+            .build()
         withRetryNoSplit {
           val table = try {
             Table.readParquet(parquetOptions, parquetCB.buffer, 0, parquetCB.sizeInBytes)

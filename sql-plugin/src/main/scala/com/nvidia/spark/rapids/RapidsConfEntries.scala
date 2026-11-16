@@ -146,6 +146,18 @@ private[rapids] trait RapidsConfEntries extends RapidsConfSqlEntries {
     .booleanConf
     .createWithDefault(false)
 
+  val PARQUET_SERIALIZE_COLUMN_CHUNK_READS =
+    conf("spark.rapids.sql.format.parquet.serializeColumnChunkReads")
+      .doc("When true, each Parquet read on a GPU copies its column chunk data to the GPU and " +
+        "waits for the copy to complete before another Parquet read on that GPU starts its own " +
+        "copy. With many concurrent tasks this lets earlier tasks start decoding while later " +
+        "tasks are still copying, instead of all tasks' copies completing together. When " +
+        "false, the copies from concurrent tasks are interleaved.")
+      .internal()
+      .startupOnly()
+      .booleanConf
+      .createWithDefault(true)
+
   val ORC_DEBUG_DUMP_PREFIX = conf("spark.rapids.sql.orc.debug.dumpPrefix")
     .doc("A path prefix where ORC split file data is dumped for debugging.")
     .internal()
