@@ -293,13 +293,20 @@ object JoinBuildSideSelection extends Enumeration {
  * @param logCardinalityEnabled whether to log cardinality statistics for debugging
  * @param sizeEstimateThreshold the threshold used to decide when to skip the expensive join
  *                              output size estimation (defaults to 0.75)
+ * @param existenceJoinReuseBuild whether conditional left semi/anti joins with the build on the
+ *                                right reuse one hash table of the build-side keys for all
+ *                                stream batches
+ * @param existenceJoinMaxPairsPerRow the maximum average number of equality matches per stream
+ *                                    row for which that reused hash table is used
  */
 case class JoinOptions(
     strategy: JoinStrategy.JoinStrategy,
     buildSideSelection: JoinBuildSideSelection.JoinBuildSideSelection,
     targetSize: Long,
     logCardinalityEnabled: Boolean,
-    sizeEstimateThreshold: Double)
+    sizeEstimateThreshold: Double,
+    existenceJoinReuseBuild: Boolean = true,
+    existenceJoinMaxPairsPerRow: Long = 16L)
 
 /**
  * Statistics for join cardinality logging to help diagnose performance issues.
