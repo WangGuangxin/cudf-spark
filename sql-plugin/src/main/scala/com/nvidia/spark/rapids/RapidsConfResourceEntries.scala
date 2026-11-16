@@ -554,6 +554,29 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .checkValue(v => v >= 0.0 && v <= 2.0, "The threshold must be between 0.0 and 2.0.")
     .createWithDefault(0.75)
 
+  val EXISTENCE_JOIN_REUSE_BUILD =
+    conf("spark.rapids.sql.join.existence.reuseBuild.enabled")
+    .doc("For left semi and left anti hash joins with a non-equality (AST) condition and the " +
+      "build on the right, build the hash table of the build-side keys once and reuse it for " +
+      "every stream batch (inner hash join + AST filter + semi/anti reduction), instead of a " +
+      "mixed join that rebuilds the hash table for each stream batch. Batches whose inner " +
+      "join would exceed spark.rapids.sql.join.existence.reuseBuild.maxPairsPerRow pairs per " +
+      "stream row still use the mixed join.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val EXISTENCE_JOIN_MAX_PAIRS_PER_ROW =
+    conf("spark.rapids.sql.join.existence.reuseBuild.maxPairsPerRow")
+    .doc("Upper bound on the average number of equality-key matches per stream row for which " +
+      "a conditional left semi or left anti join uses the reused build-side hash table. The " +
+      "exact count is computed per stream batch; above this bound the batch falls back to the " +
+      "mixed join, which does not materialize the inner join pairs.")
+    .internal()
+    .longConf
+    .checkValue(v => v > 0, "The value must be positive.")
+    .createWithDefault(16L)
+
   val SHUFFLED_HASH_JOIN_OPTIMIZE_SHUFFLE =
     conf("spark.rapids.sql.shuffledHashJoin.optimizeShuffle")
       .doc("Enable or disable an optimization where shuffled build side batches are kept " +

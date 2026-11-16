@@ -1202,7 +1202,9 @@ case class JoinOptions(
     buildSideSelection: JoinBuildSideSelection.JoinBuildSideSelection,
     targetSize: Long,
     logCardinalityEnabled: Boolean,
-    sizeEstimateThreshold: Double)
+    sizeEstimateThreshold: Double,
+    existenceJoinReuseBuild: Boolean = true,
+    existenceJoinMaxPairsPerRow: Long = 16L)
 
 /**
  * Statistics for join cardinality logging to help diagnose performance issues.
@@ -1924,20 +1926,6 @@ class HashJoinIterator(
   }
 }
 
-object ConditionalHashJoinIterator {
-  private def conf(key: String, default: String): String = {
-    Option(org.apache.spark.SparkEnv.get).map(_.conf.get(key, default)).getOrElse(default)
-  }
-
-  /** Reuse one hash build of the build side for conditional left semi/anti joins. */
-  lazy val reuseBuildForExistenceJoins: Boolean =
-    conf("spark.rapids.sql.join.existence.reuseBuild.enabled", "true").toBoolean
-
-  /** Fall back to the mixed join for a stream batch with more inner pairs per row than this. */
-  lazy val existenceJoinMaxPairsPerRow: Long =
-    conf("spark.rapids.sql.join.existence.reuseBuild.maxPairsPerRow", "16").toLong
-}
-
 /**
  * An iterator that does a hash join against a stream of batches with an inequality condition.
  * The LazyCompiledCondition will be closed when this iterator is closed.
@@ -2118,7 +2106,7 @@ class ConditionalHashJoinIterator(
         JoinImpl.rightOuterHashJoinBuildLeft(leftKeys, rightKeys, leftTable, rightTable,
           lazyCompiledCondition.getForBuildLeft, nullEquality)
       case LeftSemi | LeftAnti if buildSide == GpuBuildRight &&
-          ConditionalHashJoinIterator.reuseBuildForExistenceJoins =>
+          joinOptions.existenceJoinReuseBuild =>
         reusableExistenceJoin(leftKeys, rightKeys, leftTable, rightTable, nullEquality)
           .getOrElse(mixedExistenceJoin(leftKeys, rightKeys, leftTable, rightTable,
             nullEquality))
@@ -2156,12 +2144,13 @@ class ConditionalHashJoinIterator(
   // the batch falls back to the mixed join when the pairs would exceed
   // `existenceJoinMaxPairsPerRow` times the stream rows.
   private[this] var reusableBuild: CudfHashJoin = null
-  private[this] var reusableBuildDisabled = false
+  private[this] var reusableBuildRows = -1L
 
   private def closeReusableBuild(): Unit = {
     if (reusableBuild != null) {
       reusableBuild.close()
       reusableBuild = null
+      reusableBuildRows = -1L
     }
   }
 
@@ -2171,21 +2160,23 @@ class ConditionalHashJoinIterator(
       leftTable: Table,
       rightTable: Table,
       nullEquality: NullEquality): Option[GatherMapsResult] = {
-    if (reusableBuildDisabled) {
-      return None
-    }
     val leftRows = leftKeys.getRowCount
     val rightRows = rightKeys.getRowCount
     if (leftRows == 0 || rightRows == 0) {
       return None
     }
     try {
+      if (reusableBuild != null && reusableBuildRows != rightRows) {
+        // The build side of this iterator is fixed, so this is only a safety net.
+        closeReusableBuild()
+      }
       if (reusableBuild == null) {
         reusableBuild = new CudfHashJoin(rightKeys, nullEquality == NullEquality.EQUAL)
+        reusableBuildRows = rightRows
       }
       val pairs = leftKeys.innerJoinRowCount(reusableBuild)
       val maxPairs = math.min(Int.MaxValue.toLong,
-        math.max(leftRows, 1L) * ConditionalHashJoinIterator.existenceJoinMaxPairsPerRow)
+        math.max(leftRows, 1L) * joinOptions.existenceJoinMaxPairsPerRow)
       if (pairs > maxPairs) {
         None
       } else {
