@@ -17,14 +17,16 @@
 package com.nvidia.spark.rapids
 
 import java.util
-import java.util.concurrent.{Future, TimeUnit}
+import java.util.concurrent.{Callable, ExecutionException, Executors, ExecutorService, Future,
+  TimeUnit}
 
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
-import ai.rapids.cudf.{DeviceMemoryBuffer, HostMemoryBuffer, JCudfSerialization,
+import ai.rapids.cudf.{Cuda, DeviceMemoryBuffer, HostMemoryBuffer, JCudfSerialization,
   MemoryBuffer, NvtxColor, NvtxRange}
 import ai.rapids.cudf.JCudfSerialization.HostConcatResult
+import com.google.common.util.concurrent.Uninterruptibles
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.FileUtils.createTempFile
 import com.nvidia.spark.rapids.GpuMetric.{ASYNC_READ_TIME, SYNC_READ_TIME}
@@ -423,22 +425,65 @@ class KudoGpuTableOperator(dataTypes: Array[DataType])
         KudoBuffers(dataHostBuf, HostMemoryBuffer.allocate(offsetsBufSize))
       }
       withResource(hostBuffers) { case KudoBuffers(dataHost, offsetsHost) =>
-        var currentOffset = 0L
-        spillables.zipWithIndex.foreach { case (skt, i) =>
-          offsetsHost.setLong(i * 8L, currentOffset)
-          skt.header.writeTo(dataHost, currentOffset)
-          currentOffset += skt.header.getSerializedSize
-          skt.materializeInto(dataHost, currentOffset)
-          currentOffset += skt.header.getTotalDataLen
-        }
-        offsetsHost.setLong(spillables.length * 8L, currentOffset)
         val dataDevBuf = DeviceMemoryBuffer.allocate(dataHost.getLength)
         val devBuffers = closeOnExcept(dataDevBuf) { _ =>
           KudoBuffers(dataDevBuf, DeviceMemoryBuffer.allocate(offsetsHost.getLength))
         }
         withResource(devBuffers) { case KudoBuffers(dataDev, offsetsDev) =>
-          dataDev.copyFromHostBuffer(dataHost)
-          offsetsDev.copyFromHostBuffer(offsetsHost)
+          // The tables are copied into the staging buffer in a few contiguous ranges, all but
+          // the first by a shared pool while this thread fills the first. Each range is
+          // copied to the GPU as soon as it is filled, in order, so that those copies overlap
+          // filling the later ranges. Before the staging buffer can be freed, even on error,
+          // every range copy has finished and the stream is synchronized.
+          val starts = new Array[Long](spillables.length + 1)
+          spillables.indices.foreach { i =>
+            val h = spillables(i).header
+            starts(i + 1) = starts(i) + h.getSerializedSize + h.getTotalDataLen
+            offsetsHost.setLong(i * 8L, starts(i))
+          }
+          offsetsHost.setLong(spillables.length * 8L, starts(spillables.length))
+          val ranges = KudoGpuTableOperator.splitRanges(starts)
+          def fill(range: (Int, Int)): Unit = {
+            (range._1 until range._2).foreach { i =>
+              val skt = spillables(i)
+              skt.header.writeTo(dataHost, starts(i))
+              skt.materializeInto(dataHost, starts(i) + skt.header.getSerializedSize)
+            }
+          }
+          val stream = Cuda.DEFAULT_STREAM
+          val pending = ranges.drop(1).map { r =>
+            KudoGpuTableOperator.copyPool.submit(new Callable[Unit] {
+              override def call(): Unit = fill(r)
+            })
+          }
+          try {
+            fill(ranges.head)
+            ranges.zipWithIndex.foreach { case ((from, until), i) =>
+              if (i > 0) {
+                try {
+                  pending(i - 1).get()
+                } catch {
+                  case e: ExecutionException => throw e.getCause
+                }
+              }
+              val len = starts(until) - starts(from)
+              if (len > 0) {
+                dataDev.copyFromHostBufferAsync(starts(from), dataHost, starts(from), len,
+                  stream)
+              }
+            }
+            offsetsDev.copyFromHostBufferAsync(offsetsHost, stream)
+          } finally {
+            // Wait even when interrupted: the pool may still be writing to the staging buffer.
+            pending.foreach { f =>
+              try {
+                Uninterruptibles.getUninterruptibly(f)
+              } catch {
+                case _: ExecutionException => // reported above, or superseded by the first error
+              }
+            }
+            stream.sync()
+          }
 
           val schema = GpuColumnVector.from(dataTypes)
           withResource(KudoGpuSerializer.assembleFromDeviceRaw(
@@ -448,6 +493,56 @@ class KudoGpuTableOperator(dataTypes: Array[DataType])
         }
       }
     }
+  }
+}
+
+object KudoGpuTableOperator {
+  /**
+   * Bytes of the staging buffer to fill before starting their copy to the GPU. Large enough
+   * that the per-copy overhead stays small, small enough that the copies to the GPU overlap
+   * most of the filling.
+   */
+  val H2D_CHUNK_BYTES: Long = 32L * 1024 * 1024
+
+  /** Most ranges one concatenation is split into, the calling thread filling one of them. */
+  private val MAX_RANGES = 4
+
+  /**
+   * Threads filling staging buffers for all tasks of the executor. Filling is a memory
+   * bandwidth bound copy, so a few threads are enough to keep it well above the GPU copy rate.
+   */
+  private[rapids] lazy val copyPool: ExecutorService = Executors.newFixedThreadPool(8,
+    new ThreadFactoryBuilder().setNameFormat("rapids-kudo-concat-copy-%d").setDaemon(true)
+      .build())
+
+  /**
+   * Splits tables into at most MAX_RANGES contiguous ranges [from, until) of about equal
+   * bytes, each of at least H2D_CHUNK_BYTES, given the start offset of every table and the
+   * total size as the last element.
+   */
+  private[rapids] def splitRanges(starts: Array[Long]): Seq[(Int, Int)] = {
+    val numTables = starts.length - 1
+    val total = starts(numTables)
+    val numRanges = math.max(1L, math.min(MAX_RANGES.toLong, total / H2D_CHUNK_BYTES)).toInt
+    val ranges = ArrayBuffer[(Int, Int)]()
+    var from = 0
+    (1 to numRanges).foreach { r =>
+      val until = if (r == numRanges) {
+        numTables
+      } else {
+        val target = total * r / numRanges
+        var u = from
+        while (u < numTables && starts(u) < target) {
+          u += 1
+        }
+        u
+      }
+      if (until > from) {
+        ranges += ((from, until))
+        from = until
+      }
+    }
+    if (ranges.isEmpty) Seq((0, numTables)) else ranges.toSeq
   }
 }
 
