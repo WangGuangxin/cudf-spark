@@ -20,6 +20,7 @@ import com.nvidia.spark.rapids.{RapidsConf, SparkRapidsTuningDecisionEvent}
 
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.rapids.GpuShuffleEnv
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 
 /**
@@ -34,6 +35,7 @@ object StartupTuning extends Logging {
   val ParallelismFirstKey = "spark.sql.adaptive.coalescePartitions.parallelismFirst"
   val MinPartitionSizeKey = "spark.sql.adaptive.coalescePartitions.minPartitionSize"
   val AdvisoryPartitionSizeKey = "spark.sql.adaptive.advisoryPartitionSizeInBytes"
+  val NumConnectionsPerPeerKey = "spark.shuffle.io.numConnectionsPerPeer"
   // Spark's default for spark.sql.adaptive.advisoryPartitionSizeInBytes.
   private val DefaultAdvisoryPartitionBytes = 64 * MiB
   // Partitions smaller than this fraction of the advisory size are merged with neighbors.
@@ -53,6 +55,11 @@ object StartupTuning extends Logging {
   // allocation, which is not returned to the OS, bounded on large hosts.
   private val PinnedPoolBudgetFraction = 8
   private val MaxPinnedPoolBytes = 16 * GiB
+
+  // Connections per peer for MULTITHREADED shuffle served from the in-memory catalog. With
+  // two executors on one host, same-host shuffle reads of SSB at 3 TB stopped improving
+  // beyond 4 connections.
+  private[tuning] val SkipMergeConnectionsPerPeer = 4
 
   def scanSplitBytes(batchSizeBytes: Long): Long =
     math.min(math.max(batchSizeBytes, MinScanSplitBytes), MaxScanSplitBytes)
@@ -77,6 +84,8 @@ object StartupTuning extends Logging {
     if (conf.adaptiveTuningEnabled) {
       deriveScanSplit(sc, sparkConf, conf)
       deriveShuffleSkipMerge(sc, sparkConf, conf)
+      // after skip merge, which it depends on
+      deriveShuffleConnectionsPerPeer(sc, sparkConf)
       deriveCoalescing(sc, sparkConf)
     }
   }
@@ -116,6 +125,42 @@ object StartupTuning extends Logging {
         AdaptiveTuningListener.NoExecutionId, -1, key, "unset", "true",
         "MULTITHREADED shuffle with the external shuffle service disabled and the off-heap " +
           "limit enabled", TuningDecisionLog.RuleSource))
+    }
+  }
+
+  /**
+   * When MULTITHREADED shuffle serves its blocks from the in-memory catalog (skip merge),
+   * there are no shuffle files to read from local disk, so the blocks of other executors on
+   * the same host are fetched over the network like remote ones. Spark opens one connection
+   * per peer by default, which caps that traffic at what one channel can move: on NDS-H at
+   * 1 TB, with two executors on one host, fetch wait was about 80% of the task time of the
+   * largest shuffled joins. The conditions are those under which the catalog is used: the
+   * RAPIDS shuffle manager in MULTITHREADED mode with skip merge, no external shuffle service
+   * and the off-heap limit enabled (GpuShuffleEnv.init). Executors read the value when they
+   * create their shuffle client, from the application configuration they receive from the
+   * driver, so deriving it at startup reaches them.
+   */
+  def shouldDeriveConnectionsPerPeer(sparkConf: SparkConf,
+      rapidsShuffleConfigured: Boolean): Boolean = {
+    // read the configuration again: skip merge may just have been derived
+    val conf = new RapidsConf(sparkConf)
+    rapidsShuffleConfigured &&
+      !sparkConf.contains(NumConnectionsPerPeerKey) &&
+      conf.isMultiThreadedShuffleManagerMode &&
+      conf.isMultithreadedShuffleSkipMergeEnabled &&
+      !sparkConf.getBoolean(TrampolineUtil.shuffleServiceEnabledKey, false) &&
+      conf.offHeapLimitEnabled
+  }
+
+  private def deriveShuffleConnectionsPerPeer(sc: SparkContext, sparkConf: SparkConf): Unit = {
+    if (shouldDeriveConnectionsPerPeer(sparkConf,
+        GpuShuffleEnv.isRapidsShuffleConfigured(sparkConf))) {
+      sparkConf.set(NumConnectionsPerPeerKey, SkipMergeConnectionsPerPeer.toString)
+      TuningDecisionLog.record(sc, SparkRapidsTuningDecisionEvent(
+        AdaptiveTuningListener.NoExecutionId, -1, NumConnectionsPerPeerKey, "unset",
+        SkipMergeConnectionsPerPeer.toString,
+        "MULTITHREADED shuffle with skip merge fetches the blocks of same-host executors " +
+          "over the network", TuningDecisionLog.RuleSource))
     }
   }
 

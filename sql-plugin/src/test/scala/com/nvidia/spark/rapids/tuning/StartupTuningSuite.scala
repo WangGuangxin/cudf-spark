@@ -68,4 +68,22 @@ class StartupTuningSuite extends AnyFunSuite {
     assert(!derives(mt, offHeap, RapidsConf.MULTITHREADED_SHUFFLE_SKIP_MERGE.key -> "false"))
     assert(!derives(RapidsConf.SHUFFLE_MANAGER_MODE.key -> "UCX", offHeap))
   }
+
+  test("connections per peer are derived only when skip merge serves the blocks") {
+    def derives(settings: (String, String)*): Boolean =
+      StartupTuning.shouldDeriveConnectionsPerPeer(new SparkConf(false).setAll(settings),
+        rapidsShuffleConfigured = true)
+    val mt = RapidsConf.SHUFFLE_MANAGER_MODE.key -> "MULTITHREADED"
+    val skipMerge = RapidsConf.MULTITHREADED_SHUFFLE_SKIP_MERGE.key -> "true"
+    val offHeap = RapidsConf.OFF_HEAP_LIMIT_ENABLED.key -> "true"
+    assert(derives(mt, skipMerge, offHeap))
+    assert(!derives(mt, offHeap))
+    assert(!derives(mt, skipMerge))
+    assert(!derives(mt, skipMerge, offHeap, "spark.shuffle.service.enabled" -> "true"))
+    assert(!derives(mt, skipMerge, offHeap, StartupTuning.NumConnectionsPerPeerKey -> "1"))
+    assert(!derives(RapidsConf.SHUFFLE_MANAGER_MODE.key -> "UCX", skipMerge, offHeap))
+    // Spark's own shuffle manager never uses the catalog
+    assert(!StartupTuning.shouldDeriveConnectionsPerPeer(
+      new SparkConf(false).setAll(Seq(mt, skipMerge, offHeap)), rapidsShuffleConfigured = false))
+  }
 }
