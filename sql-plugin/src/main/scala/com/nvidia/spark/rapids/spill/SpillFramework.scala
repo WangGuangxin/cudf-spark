@@ -22,7 +22,8 @@ import java.nio.channels.{Channels, FileChannel, WritableByteChannel}
 import java.nio.file.StandardOpenOption
 import java.util
 import java.util.UUID
-import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.{ArrayBlockingQueue, ConcurrentHashMap}
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.annotation.tailrec
 import scala.collection.mutable
@@ -1741,6 +1742,23 @@ trait HandleStore[T <: StoreHandle] extends AutoCloseable with Logging {
     handles.remove(handle)
   }
 
+  /** A point-in-time copy of the tracked handles. */
+  protected def snapshotHandles(): util.ArrayList[T] = synchronized {
+    new util.ArrayList[T](handles)
+  }
+
+  /** A point-in-time copy of the tracked handles, iterated in spill-priority order. */
+  protected def handlesInPriorityOrder(): util.Iterator[T] = synchronized {
+    handles.priorityIterator()
+  }
+
+  /** Removes every tracked handle and returns the ones that were removed. */
+  protected def drainHandles(): util.ArrayList[T] = synchronized {
+    val list = new util.ArrayList[T](handles)
+    handles.clear()
+    list
+  }
+
   /**
    * Close all handles in the store.
    *
@@ -1751,11 +1769,7 @@ trait HandleStore[T <: StoreHandle] extends AutoCloseable with Logging {
    * handle lock first, then store lock via removeFromXxxStore().
    */
   override def close(): Unit = {
-    val handlesToClose = synchronized {
-      val list = new util.ArrayList[T](handles)
-      handles.clear()
-      list
-    }
+    val handlesToClose = drainHandles()
     // Close handles outside the store lock to avoid deadlock
     handlesToClose.forEach(_.close())
   }
@@ -1821,9 +1835,7 @@ trait SpillableStore[T <: SpillableHandle]
   private def makeSpillPlan(spillNeeded: Long): SpillPlan = {
     val plan = new SpillPlan()
     var amountToSpill = 0L
-    val allHandles = synchronized {
-      handles.priorityIterator()
-    }
+    val allHandles = handlesInPriorityOrder()
     // two threads could be here trying to spill and creating a list of spillables
     while (allHandles.hasNext && amountToSpill < spillNeeded) {
       val handle = allHandles.next()
@@ -1876,9 +1888,7 @@ trait SpillableStore[T <: SpillableHandle]
    * so we must not hold the store lock while calling it.
    */
   def spillableSummary(): String = {
-    val handlesCopy = synchronized {
-      new util.ArrayList[T](handles)
-    }
+    val handlesCopy = snapshotHandles()
     var spillableHandleCount = 0L
     var spillableHandleBytes = 0L
     var totalHandleBytes = 0L
@@ -1902,31 +1912,78 @@ class SpillableHostStore(val maxSize: Option[Long] = None)
   extends SpillableStore[HostSpillableHandle[_]]
     with Logging {
 
-  private[spill] var totalSize: Long = 0L
+  // The host store sees one track + one remove per shuffle block read by the multithreaded
+  // shuffle reader (hundreds of millions per stage with 10k+ partitions), so it does not use
+  // the base class's monitor-guarded HashedPriorityQueue. Handles live in a concurrent set and
+  // the size is an atomic counter; spill-priority order is only needed when spilling, so the
+  // spill path sorts a snapshot instead of keeping the set ordered on every insert.
+  private val liveHandles = ConcurrentHashMap.newKeySet[HostSpillableHandle[_]]()
+  private val totalSizeBytes = new AtomicLong(0L)
+
+  private[spill] def totalSize: Long = totalSizeBytes.get()
+
+  override def numHandles: Int = liveHandles.size()
+
+  override def isEmpty: Boolean = liveHandles.isEmpty
+
+  override protected def doTrack(handle: HostSpillableHandle[_]): Boolean =
+    liveHandles.add(handle)
+
+  override protected def doRemove(handle: HostSpillableHandle[_]): Boolean =
+    liveHandles.remove(handle)
+
+  override protected def snapshotHandles(): util.ArrayList[HostSpillableHandle[_]] =
+    new util.ArrayList[HostSpillableHandle[_]](liveHandles)
+
+  override protected def handlesInPriorityOrder(): util.Iterator[HostSpillableHandle[_]] = {
+    val list = snapshotHandles()
+    list.sort(HandleComparator)
+    list.iterator()
+  }
+
+  override protected def drainHandles(): util.ArrayList[HostSpillableHandle[_]] = {
+    val list = new util.ArrayList[HostSpillableHandle[_]]()
+    val it = liveHandles.iterator()
+    while (it.hasNext) {
+      val handle = it.next()
+      if (liveHandles.remove(handle)) {
+        list.add(handle)
+      }
+    }
+    list
+  }
 
   private def tryTrack(handle: HostSpillableHandle[_]): Boolean = {
-    if (maxSize.isEmpty || handle.approxSizeInBytes == 0) {
-      super.doTrack(handle)
+    val size = handle.approxSizeInBytes
+    if (maxSize.isEmpty || size == 0) {
       // for now, keep this totalSize part, we technically
       // do not need to track `totalSize` if we don't have a limit
-      synchronized {
-        totalSize += handle.approxSizeInBytes
+      if (doTrack(handle)) {
+        totalSizeBytes.addAndGet(size)
       }
       true
+    } else if (liveHandles.contains(handle)) {
+      true
     } else {
-      synchronized {
-        val storeMaxSize = maxSize.get
-        if (totalSize > 0 && totalSize + handle.approxSizeInBytes > storeMaxSize) {
+      // Reserve room with a CAS loop so concurrent trackers cannot overshoot the limit.
+      val storeMaxSize = maxSize.get
+      var reserved = false
+      var done = false
+      while (!done) {
+        val current = totalSizeBytes.get()
+        if (current > 0 && current + size > storeMaxSize) {
           // we want to try to make room for this buffer
-          false
-        } else {
-          // it fits
-          if (super.doTrack(handle)) {
-            totalSize += handle.approxSizeInBytes
-          }
-          true
+          done = true
+        } else if (totalSizeBytes.compareAndSet(current, current + size)) {
+          reserved = true
+          done = true
         }
       }
+      if (reserved && !doTrack(handle)) {
+        // another thread tracked the same handle concurrently; give the room back
+        totalSizeBytes.addAndGet(-size)
+      }
+      reserved
     }
   }
 
@@ -1956,9 +2013,7 @@ class SpillableHostStore(val maxSize: Option[Long] = None)
           amountSpilled += spill(maxSize.get)
         } else {
           // handleSize is within the limits
-          val freeAmount = synchronized {
-            maxSize.get - totalSize
-          }
+          val freeAmount = maxSize.get - totalSize
           val spillNeeded = handleSize - freeAmount
           if (spillNeeded > 0) {
             amountSpilled += spill(spillNeeded)
@@ -1969,9 +2024,7 @@ class SpillableHostStore(val maxSize: Option[Long] = None)
           // we tried to spill, and we still couldn't fit this buffer
           // if we have a totalSize > 0, we could try some more
           // the disk api
-          synchronized {
-            canFit = totalSize > 0
-          }
+          canFit = totalSize > 0
         }
         numRetries += 1
       }
@@ -1991,18 +2044,14 @@ class SpillableHostStore(val maxSize: Option[Long] = None)
    * methods that are used by client code.
    */
   def trackNoSpill(handle: HostSpillableHandle[_]): Unit = {
-    synchronized {
-      if (doTrack(handle)) {
-        totalSize += handle.approxSizeInBytes
-      }
+    if (doTrack(handle)) {
+      totalSizeBytes.addAndGet(handle.approxSizeInBytes)
     }
   }
 
   override def remove(handle: HostSpillableHandle[_]): Unit = {
-    synchronized {
-      if (doRemove(handle)) {
-        totalSize -= handle.approxSizeInBytes
-      }
+    if (doRemove(handle)) {
+      totalSizeBytes.addAndGet(-handle.approxSizeInBytes)
     }
   }
 
@@ -2500,7 +2549,7 @@ object SpillFramework extends Logging {
 
   // public for tests. Some tests not in the `spill` package require setting this
   // because they need fine control over allocations.
-  var storesInternal: SpillableStores = _
+  @volatile var storesInternal: SpillableStores = _
 
   def stores: SpillableStores = {
     if (storesInternal == null) {
@@ -2609,9 +2658,9 @@ object SpillFramework extends Logging {
   }
 
   private[spill] def removeFromHostStore(handle: HostSpillableHandle[_]): Unit = {
-    synchronized {
-      Option(storesInternal).map(_.hostStore)
-    }.foreach(_.remove(handle))
+    // Runs once per closed host handle (once per shuffle block in the multithreaded reader),
+    // so read the volatile field instead of taking the SpillFramework monitor.
+    Option(storesInternal).map(_.hostStore).foreach(_.remove(handle))
   }
 
   private[spill] def removeFromDiskStore(handle: DiskHandle): Unit = {
