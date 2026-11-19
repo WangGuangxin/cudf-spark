@@ -327,6 +327,27 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
     quotaToRelease: AtomicLong)
 
   /**
+   * A record waiting for a compression drainer: a slice of a GPU batch, its limiter quota and
+   * the future the merger waits on. `owner` decides whether a drainer or a cleanup path closes
+   * the slice.
+   */
+  private case class QueuedRecord(
+    key: Any,
+    value: Any,
+    cb: ColumnarBatch,
+    partitionId: Int,
+    recordSize: Long,
+    quotaToRelease: AtomicLong,
+    batch: BatchState,
+    future: CompletableFuture[CompressedRecord],
+    owner: AtomicBoolean)
+
+  // Upper bound on writer-pool tasks one map task uses to drain its compression queue. A new
+  // drainer is only submitted while fewer than this many are active, so a burst of small records
+  // costs a few pool submissions instead of one per record.
+  private val maxDrainers: Int = math.max(1, math.min(numWriterThreads, 4))
+
+  /**
    * Cooperatively writes one GPU batch without occupying a merger thread while waiting for work.
    * At most one step is scheduled for this merger. A step drains all currently ready records and
    * yields when it reaches an empty queue or an unfinished compression future.
@@ -691,6 +712,162 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
     var waitTimeOnLimiterNs: Long = 0L
     var inputFetchTimeNs: Long = 0L
 
+    // Records waiting for compression. Instead of one writer-pool task per record, up to
+    // maxDrainers tasks drain this queue and exit when it is empty. With thousands of reduce
+    // partitions a GPU batch splits into tiny per-partition slices (q06: 20000 partitions,
+    // ~0.5 KB per record); one FutureTask per slice made the shared pool queue the bottleneck.
+    // Records are never held back: each one is queued as soon as it arrives, so the merger
+    // keeps up even while the producer waits for the next GPU batch.
+    val compressionQueue = new ConcurrentLinkedQueue[QueuedRecord]()
+    val activeDrainers = new AtomicInteger(0)
+
+    def tryClaimDrainerSlot(): Boolean = {
+      var claimed = false
+      var done = false
+      while (!done) {
+        val active = activeDrainers.get()
+        if (active >= maxDrainers) {
+          done = true
+        } else if (activeDrainers.compareAndSet(active, active + 1)) {
+          claimed = true
+          done = true
+        }
+      }
+      claimed
+    }
+
+    def releaseRecordQuota(record: QueuedRecord): Unit = {
+      val toRelease = record.quotaToRelease.getAndSet(0)
+      if (toRelease > 0) {
+        limiter.release(toRelease)
+      }
+    }
+
+    /** Closes the slice, gives back the quota and cancels a record nobody will compress. */
+    def abandonRecord(record: QueuedRecord): Unit = {
+      if (record.owner.compareAndSet(false, true)) {
+        try { record.cb.close() } catch { case _: Exception => }
+        releaseRecordQuota(record)
+        record.future.cancel(false)
+        record.batch.scheduleMerger()
+      }
+    }
+
+    def abandonQueuedRecords(): Unit = {
+      var record = compressionQueue.poll()
+      while (record != null) {
+        abandonRecord(record)
+        record = compressionQueue.poll()
+      }
+    }
+
+    def compressRecord(record: QueuedRecord): CompressedRecord = {
+      withResource(record.cb) { _ =>
+        // Create a new buffer for this record.
+        // The buffer is closed by the merger thread after writing to disk.
+        val buffer = new OpenByteArrayOutputStream()
+        closeOnExcept(buffer) { _ =>
+          // Serialize + compress + encryption to memory buffer
+          val compressedOutputStream = blockManager.serializerManager.wrapStream(
+            ShuffleBlockId(shuffleId, mapId, record.partitionId), buffer)
+          val serializationStream = serializerInstance.serializeStream(compressedOutputStream)
+          withResource(serializationStream) { serializer =>
+            serializer.writeKey(record.key.asInstanceOf[Any])
+            serializer.writeValue(record.value.asInstanceOf[Any])
+          }
+          // Track total written data size (compressed size)
+          val compressedSize = buffer.getCount.toLong
+          totalCompressedSize.addAndGet(compressedSize)
+          // Release excess quota immediately after compression. Only compressedSize stays held
+          // until the merger writes the buffer. A negative remainder means the quota was already
+          // claimed by a cancel/failure path, so skip the release.
+          val excessQuota = math.max(0L, record.recordSize - compressedSize)
+          if (excessQuota > 0 && record.quotaToRelease.addAndGet(-excessQuota) >= 0) {
+            limiter.release(excessQuota)
+          }
+          CompressedRecord(buffer, compressedSize, record.quotaToRelease)
+        }
+      }
+    }
+
+    def processRecord(record: QueuedRecord): Unit = {
+      // The owner gate is shared with abandonRecord: whoever wins closes the slice.
+      if (record.owner.compareAndSet(false, true)) {
+        try {
+          if (record.future.isDone) {
+            // Cancelled while queued (task cleanup): skip the work.
+            try { record.cb.close() } catch { case _: Exception => }
+            releaseRecordQuota(record)
+          } else {
+            val compressed = compressRecord(record)
+            if (!record.future.complete(compressed)) {
+              // Cancelled while compressing: nobody will write this buffer.
+              releaseRecordQuota(record)
+              try { compressed.buffer.close() } catch { case _: Exception => }
+            } else if (record.batch.merger.completionFuture.isCompletedExceptionally) {
+              // The merger already failed and will never write or release this record.
+              releaseRecordQuota(record)
+            }
+          }
+        } catch {
+          case t: Throwable =>
+            releaseRecordQuota(record)
+            val cause = t match {
+              case ie: InterruptedException =>
+                Thread.currentThread().interrupt()
+                ie
+              case other => other
+            }
+            record.future.completeExceptionally(new IOException(
+              s"Failed compression task for shuffle $shuffleId, map $mapId, " +
+                s"partition ${record.partitionId}", cause))
+        } finally {
+          record.batch.scheduleMerger()
+        }
+      }
+    }
+
+    def drain(): Unit = {
+      var keepRunning = true
+      while (keepRunning) {
+        val record = compressionQueue.poll()
+        if (record != null) {
+          processRecord(record)
+        } else {
+          activeDrainers.decrementAndGet()
+          // A producer may have queued a record after the poll while all slots looked busy.
+          keepRunning = !compressionQueue.isEmpty && tryClaimDrainerSlot()
+        }
+      }
+    }
+
+    def ensureDrainer(): Unit = {
+      if (tryClaimDrainerSlot()) {
+        val drainer = new FutureTask[Void](new Callable[Void] {
+          override def call(): Void = {
+            drain()
+            null
+          }
+        }) {
+          override def done(): Unit = {
+            if (isCancelled) {
+              // Cancelled before it ran (pool shutdown): nothing will drain the queue.
+              activeDrainers.decrementAndGet()
+              abandonQueuedRecords()
+            }
+          }
+        }
+        try {
+          RapidsShuffleInternalManagerBase.queueWriteTask(drainer)
+        } catch {
+          case t: Throwable =>
+            activeDrainers.decrementAndGet()
+            abandonQueuedRecords()
+            throw t
+        }
+      }
+    }
+
     // Multi-batch tracking
     val batchStates = new ArrayBuffer[BatchState]()
     val partialFiles = new ArrayBuffer[PartialFile]()
@@ -768,117 +945,19 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
         }
         waitTimeOnLimiterNs += System.nanoTime() - waitOnLimiterStart
 
-        val batchForRecord = currentBatch
-        // Tracks how much quota this task still owes back to the limiter. Initialized to
-        // the full recordSize; decremented when excessQuota is released early on the success
-        // path. getAndSet(0) in the catch block atomically claims whatever remains,
-        // ensuring quota is only released after call() has freed its resources.
-        val quotaToRelease = new AtomicLong(recordSize)
-        // CAS gate shared between call() and done(). Whoever wins compareAndSet(false, true)
-        // is responsible for closing cb and releasing quota. This prevents both a cb leak
-        // (done() fires for a cancelled-before-start task and cb is never closed) and
-        // double-close (done() and call() both try to close cb in the race window).
-        val cbOwner = new AtomicBoolean(false)
-        val compressionTask = new FutureTask[CompressedRecord](new Callable[CompressedRecord] {
-          override def call(): CompressedRecord = {
-            if (!cbOwner.compareAndSet(false, true)) {
-              // done() already closed cb and released quota; bail out.
-              throw new IOException(
-                s"Failed compression task for shuffle $shuffleId, map $mapId, " +
-                  s"partition $reducePartitionId: cancelled before starting")
-            }
-            try {
-              withResource(cb) { _ =>
-                // Create a new buffer for this record.
-                // The buffer is closed by the merger thread after writing to disk.
-                val buffer = new OpenByteArrayOutputStream()
+        val queued = QueuedRecord(key, value, cb, reducePartitionId, recordSize,
+          new AtomicLong(recordSize), currentBatch, new CompletableFuture[CompressedRecord](),
+          new AtomicBoolean(false))
 
-                // Serialize + compress + encryption to memory buffer
-                val compressedOutputStream = blockManager.serializerManager.wrapStream(
-                  ShuffleBlockId(shuffleId, mapId, reducePartitionId), buffer)
-
-                val serializationStream = serializerInstance.serializeStream(
-                  compressedOutputStream)
-                withResource(serializationStream) { serializer =>
-                  serializer.writeKey(key.asInstanceOf[Any])
-                  serializer.writeValue(value.asInstanceOf[Any])
-                }
-
-                // Track total written data size (compressed size)
-                val compressedSize = buffer.getCount.toLong
-                totalCompressedSize.addAndGet(compressedSize)
-
-                // Release excess quota immediately after compression.
-                // Data is now in OpenByteArrayOutputStream (heap), only need to hold
-                // compressedSize quota until Merger writes to disk.
-                // Note: excessQuota can be 0 if compression doesn't reduce size (or expands)
-                val excessQuota = math.max(0L, recordSize - compressedSize)
-                if (excessQuota > 0) {
-                  // addAndGet returns negative if done() already claimed quota via getAndSet(0);
-                  // skip the direct release. The merger also sees negative and skips.
-                  val remaining = quotaToRelease.addAndGet(-excessQuota)
-                  if (remaining >= 0) {
-                    limiter.release(excessQuota)
-                  }
-                }
-
-                // Return CompressedRecord carrying quotaToRelease so writeRecord can use
-                // getAndSet(0) to release the remainder — or skip if done() claimed it.
-                CompressedRecord(buffer, compressedSize, quotaToRelease)
-              }
-            } catch {
-              case e: InterruptedException =>
-                Thread.currentThread().interrupt()
-                val toRelease = quotaToRelease.getAndSet(0)
-                if (toRelease > 0) {
-                  limiter.release(toRelease)
-                }
-                throw new IOException(
-                  s"Failed compression task for shuffle $shuffleId, map $mapId, " +
-                    s"partition $reducePartitionId", e)
-              case e: Exception =>
-                val toRelease = quotaToRelease.getAndSet(0)
-                if (toRelease > 0) {
-                  limiter.release(toRelease)
-                }
-                throw new IOException(
-                  s"Failed compression task for shuffle $shuffleId, map $mapId, " +
-                    s"partition $reducePartitionId", e)
-            }
-          }
-        }) {
-          override def done(): Unit = {
-            try {
-              // If call() never ran, win the CAS to close cb (prevents the ref-count leak
-              // from incRefCountAndGetSize). Quota is handled separately below.
-              if (cbOwner.compareAndSet(false, true)) {
-                cb.close()
-              }
-            } finally {
-              // Release quota when cancelled, or when the merger has already failed (so
-              // writeRecord will never be called for this future's CompressedRecord).
-              // getAndSet(0) is idempotent: fail() may have already claimed it; returns 0.
-              if (isCancelled ||
-                  batchForRecord.merger.completionFuture.isCompletedExceptionally) {
-                val toRelease = quotaToRelease.getAndSet(0)
-                if (toRelease > 0) {
-                  limiter.release(toRelease)
-                }
-              }
-              batchForRecord.scheduleMerger()
-            }
-          }
-        }
-        val future = RapidsShuffleInternalManagerBase.queueWriteTask(compressionTask)
-
+        // The future goes into its partition queue before the record can be compressed, so a
+        // drainer that completes it always finds it there when it schedules the merger.
         currentBatch.maxPartitionIdQueued.synchronized {
-          recordQueue.add(future)
+          recordQueue.add(queued.future)
           currentBatch.maxPartitionIdQueued.set(
             math.max(currentBatch.maxPartitionIdQueued.get(), reducePartitionId))
         }
-
-        // Schedule a merger step to process this record when compression is ready.
-        currentBatch.scheduleMerger()
+        compressionQueue.add(queued)
+        ensureDrainer()
 
         // Reset timer for next iteration's hasNext/next
         inputFetchStart = System.nanoTime()
@@ -957,6 +1036,9 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
           }
         }
       }
+
+      // Records that no drainer picked up still hold slices and quota.
+      abandonQueuedRecords()
 
       // Cleanup all tracked batch states
       batchStates.foreach(cleanupBatch)
