@@ -493,6 +493,11 @@ object GpuShuffleExchangeExecBase {
         partitioner.columnarEvalAny(batch)
       }
     }
+    // OP_TIME_NEW for the shuffle write is tracked around fetching and partitioning each input
+    // batch, rather than by wrapping the record iterator in a GpuOpTimeTrackingRDD: a batch can
+    // split into tens of thousands of records, and starting and stopping the timer for every
+    // record's hasNext and next cost more than the partitioning itself.
+    val opTimeShuffleWrite = opTimeNewShuffleWrite.filter(_ => enableOpTimeTrackingRdd)
     val isIndeterminate = isRoundRobin && newPartitioning.numPartitions > 1
     val roundRobinRetryGuard = if (isIndeterminate) Some(new GpuRoundRobinShuffleRetry) else None
     val rddWithPartitionIds: RDD[Product2[Int, ColumnarBatch]] = newRdd.withScope {
@@ -506,7 +511,11 @@ object GpuShuffleExchangeExecBase {
           private val mutablePair = new MutablePair[Int, ColumnarBatch]()
           private def rangeInput[T](body: => T): T =
             RangeInputBatching.withRangeInput(useRangeInputBatching)(body)
-          private def partNextBatch(): Unit = {
+          private def partNextBatch(): Unit = opTimeShuffleWrite match {
+            case Some(opTime) => opTime.ns(descendantOpTimeMetrics)(fetchAndPartNextBatch())
+            case None => fetchAndPartNextBatch()
+          }
+          private def fetchAndPartNextBatch(): Unit = {
             if (partitioned != null) {
               partitioned.map(_._1).safeClose()
               partitioned = null
@@ -611,14 +620,6 @@ object GpuShuffleExchangeExecBase {
       }
     }
 
-    // Apply OP_TIME_NEW tracking to rddWithPartitionIds if opTimeNewMetric is provided
-    val finalRddWithPartitionIds = opTimeNewShuffleWrite match {
-      case Some(opTimeMetric) if enableOpTimeTrackingRdd =>
-        new GpuOpTimeTrackingRDD[Product2[Int, ColumnarBatch]](
-          rddWithPartitionIds, opTimeMetric, descendantOpTimeMetrics)
-      case _ => rddWithPartitionIds
-    }
-
     // Now, we manually create a GpuShuffleDependency. Because pairs in rddWithPartitionIds
     // are in the form of (partitionId, row) and every partitionId is in the expected range
     // [0, part.numPartitions - 1]. The partitioner of this is a PartitionIdPassthrough.
@@ -626,7 +627,7 @@ object GpuShuffleExchangeExecBase {
     // detect it and do further processing if needed.
     val dependency =
     new GpuShuffleDependency[Int, ColumnarBatch, ColumnarBatch](
-      finalRddWithPartitionIds,
+      rddWithPartitionIds,
       new BatchPartitionIdPassthrough(newPartitioning.numPartitions),
       sparkTypes,
       serializer,
