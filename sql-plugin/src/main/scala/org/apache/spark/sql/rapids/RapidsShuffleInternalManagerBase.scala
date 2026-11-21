@@ -1270,9 +1270,16 @@ abstract class RapidsShuffleThreadedReaderBase[K, C](
       serializer: GpuColumnarBatchSerializer)
     extends Iterator[(Any, Any)] {
     private val queued = new LinkedBlockingQueue[(Any, Any)]
-    private val futures = new mutable.Queue[Future[Option[BlockState]]]()
+    // Each future deserializes a group of blocks and returns the ones that did not fit
+    // in the limiter.
+    private val futures = new mutable.Queue[Future[Seq[BlockState]]]()
     private val serializerInstance = serializer.newInstance()
     private val limiter = new BytesInFlightLimiter(maxBytesInFlight)
+    // Limits on how many fetched blocks, and how many bytes of their first batches, one
+    // reader pool task deserializes, so small blocks share a pool task while large ones
+    // still spread across the pool.
+    private val MAX_BLOCKS_PER_DESER_TASK = 64
+    private val MAX_BYTES_PER_DESER_TASK = 4L << 20
     private val fallbackIter: Iterator[(Any, Any)] with AutoCloseable =
       if (numReaderThreads == 1) {
         // this is the non-optimized case, where we add metrics to capture the blocked
@@ -1450,12 +1457,8 @@ abstract class RapidsShuffleThreadedReaderBase[K, C](
               val futureWaitThisCall = System.nanoTime() - waitTimeStart
               waitTime += futureWaitThisCall
               deserWaitTimeNs.foreach(_ += futureWaitThisCall)
-              // if the future returned a block state, we have more work to do
-              pending match {
-                case Some(leftOver@BlockState(_, _, _)) =>
-                  pendingIts.enqueue(leftOver)
-                case _ => // done
-              }
+              // if the future returned block states, we have more work to do
+              pendingIts ++= pending
             }
           }
 
@@ -1512,42 +1515,75 @@ abstract class RapidsShuffleThreadedReaderBase[K, C](
       res
     }
 
-    private def deserializeTask(blockState: BlockState, acquiredSize: Long): Unit = {
+    private def deserializeBlock(blockState: BlockState, acquiredSize: Long): Option[BlockState] = {
+      var success = false
+      // Track the size we need to release (starts with the pre-acquired size)
+      var sizeToRelease = acquiredSize
+      try {
+        var currentBatchSize = blockState.getNextBatchSize
+        var didFit = true
+        while (blockState.hasNext && didFit) {
+          val batch = blockState.next()
+          queued.offer(batch)
+          // peek at the next batch
+          currentBatchSize = blockState.getNextBatchSize
+          limiterAcquireCount.foreach(_ += 1)
+          didFit = limiter.acquire(currentBatchSize)
+          if (didFit) {
+            // Successfully acquired, add to sizeToRelease for later release
+            sizeToRelease += currentBatchSize
+          } else {
+            limiterAcquireFailCount.foreach(_ += 1)
+          }
+        }
+        success = true
+        if (!didFit) {
+          Some(blockState)
+        } else {
+          None // no further batches
+        }
+      } finally {
+        // Release limiter immediately after deserialization completes
+        limiter.release(sizeToRelease)
+        // Close blockState (Netty buffer) immediately if:
+        // - failed (success = false), or
+        // - all batches processed (success = true and returned None)
+        if (!success || !blockState.hasNext) {
+          blockState.close()
+        }
+      }
+    }
+
+    private def deserializeTask(blockState: BlockState, acquiredSize: Long): Unit =
+      deserializeTasks(Seq((blockState, acquiredSize)))
+
+    /**
+     * Deserialize a group of blocks, in order, in one reader pool task. Each block's first
+     * batch has already been acquired from the limiter. With many partitions a block is often
+     * a single small batch, and submitting one pool task per block makes the pool's queue the
+     * bottleneck.
+     */
+    private def deserializeTasks(blocks: Seq[(BlockState, Long)]): Unit = {
       futures += RapidsShuffleInternalManagerBase.queueReadTask(() => {
+        val leftOvers = new ArrayBuffer[BlockState]()
+        var done = 0
         var success = false
-        // Track the size we need to release (starts with the pre-acquired size)
-        var sizeToRelease = acquiredSize
         try {
-          var currentBatchSize = blockState.getNextBatchSize
-          var didFit = true
-          while (blockState.hasNext && didFit) {
-            val batch = blockState.next()
-            queued.offer(batch)
-            // peek at the next batch
-            currentBatchSize = blockState.getNextBatchSize
-            limiterAcquireCount.foreach(_ += 1)
-            didFit = limiter.acquire(currentBatchSize)
-            if (didFit) {
-              // Successfully acquired, add to sizeToRelease for later release
-              sizeToRelease += currentBatchSize
-            } else {
-              limiterAcquireFailCount.foreach(_ += 1)
-            }
+          blocks.foreach { case (blockState, acquiredSize) =>
+            done += 1
+            deserializeBlock(blockState, acquiredSize).foreach(leftOvers += _)
           }
           success = true
-          if (!didFit) {
-            Some(blockState)
-          } else {
-            None // no further batches
-          }
+          leftOvers.toSeq
         } finally {
-          // Release limiter immediately after deserialization completes
-          limiter.release(sizeToRelease)
-          // Close blockState (Netty buffer) immediately if:
-          // - failed (success = false), or
-          // - all batches processed (success = true and returned None)
-          if (!success || !blockState.hasNext) {
-            blockState.close()
+          if (!success) {
+            // The failed block cleaned up after itself. Blocks after it never ran and
+            // blocks before it that did not fit are not returned, so clean them up here.
+            blocks.drop(done).foreach { case (blockState, acquiredSize) =>
+              limiter.release(acquiredSize)
+              blockState.close()
+            }
+            leftOvers.foreach(_.close())
           }
         }
       })
@@ -1589,34 +1625,51 @@ abstract class RapidsShuffleThreadedReaderBase[K, C](
             // are all dequeued (the ones that were completed up until now).
             var readBlockedTime = 0L
             var didFit = true
-            while (amountToDrain > 0 && fetcherIterator.hasNext && didFit) {
-              amountToDrain -= 1
-              // fetch block time accounts for time spent waiting for streams.next()
-              val readBlockedStart = System.nanoTime()
-              val (blockId: BlockId, inputStream) = fetcherIterator.next()
-              val ioWaitThisBlock = System.nanoTime() - readBlockedStart
-              readBlockedTime += ioWaitThisBlock
-              ioWaitTimeNs.foreach(_ += ioWaitThisBlock)
+            // blocks that fit, to deserialize together in one pool task
+            val group = new ArrayBuffer[(BlockState, Long)]()
+            var groupBytes = 0L
+            def submitGroup(): Unit = if (group.nonEmpty) {
+              deserializeTasks(group.toList)
+              group.clear()
+              groupBytes = 0L
+            }
+            try {
+              while (amountToDrain > 0 && fetcherIterator.hasNext && didFit) {
+                amountToDrain -= 1
+                // fetch block time accounts for time spent waiting for streams.next()
+                val readBlockedStart = System.nanoTime()
+                val (blockId: BlockId, inputStream) = fetcherIterator.next()
+                val ioWaitThisBlock = System.nanoTime() - readBlockedStart
+                readBlockedTime += ioWaitThisBlock
+                ioWaitTimeNs.foreach(_ += ioWaitThisBlock)
 
-              val deserStream = serializerInstance.deserializeStream(inputStream)
-              val batchIter = deserStream.asKeyValueIterator
-                .asInstanceOf[BaseSerializedTableIterator]
-              val blockState = BlockState(blockId, batchIter, inputStream)
-              // get the next known batch size (there could be multiple batches)
-              val nextBatchSize = blockState.getNextBatchSize
-              limiterAcquireCount.foreach(_ += 1)
-              if (limiter.acquire(nextBatchSize)) {
-                // we can fit at least the first batch in this block
-                // kick off a deserialization task
-                deserializeTask(blockState, nextBatchSize)
-              } else {
-                // first batch didn't fit, put iterator aside and stop asking for results
-                // from the fetcher
-                limiterAcquireFailCount.foreach(_ += 1)
-                limiterPendingBlockCount.foreach(_ += 1)
-                pendingIts.enqueue(blockState)
-                didFit = false
+                val deserStream = serializerInstance.deserializeStream(inputStream)
+                val batchIter = deserStream.asKeyValueIterator
+                  .asInstanceOf[BaseSerializedTableIterator]
+                val blockState = BlockState(blockId, batchIter, inputStream)
+                // get the next known batch size (there could be multiple batches)
+                val nextBatchSize = blockState.getNextBatchSize
+                limiterAcquireCount.foreach(_ += 1)
+                if (limiter.acquire(nextBatchSize)) {
+                  // we can fit at least the first batch in this block
+                  // add it to the group for a deserialization task
+                  group += ((blockState, nextBatchSize))
+                  groupBytes += nextBatchSize
+                  if (group.length >= MAX_BLOCKS_PER_DESER_TASK ||
+                      groupBytes >= MAX_BYTES_PER_DESER_TASK) {
+                    submitGroup()
+                  }
+                } else {
+                  // first batch didn't fit, put iterator aside and stop asking for results
+                  // from the fetcher
+                  limiterAcquireFailCount.foreach(_ += 1)
+                  limiterPendingBlockCount.foreach(_ += 1)
+                  pendingIts.enqueue(blockState)
+                  didFit = false
+                }
               }
+            } finally {
+              submitGroup()
             }
             // keep track of the overall metric which includes blocked time
             val fetchTime = System.nanoTime() - fetchTimeStart
