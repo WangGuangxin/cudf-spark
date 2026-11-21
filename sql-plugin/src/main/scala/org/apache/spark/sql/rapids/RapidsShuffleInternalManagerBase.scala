@@ -342,6 +342,25 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
     future: CompletableFuture[CompressedRecord],
     owner: AtomicBoolean)
 
+  /**
+   * A queued record's compression future. Cancelling it (task cleanup) gives back the record's
+   * remaining quota right away, as the done() hook of a per-record compression task did, so the
+   * quota is free when the writer returns even if a drainer is still working on the record.
+   */
+  private class RecordFuture(quotaToRelease: AtomicLong)
+    extends CompletableFuture[CompressedRecord] {
+    override def cancel(mayInterruptIfRunning: Boolean): Boolean = {
+      val cancelled = super.cancel(mayInterruptIfRunning)
+      if (cancelled) {
+        val toRelease = quotaToRelease.getAndSet(0)
+        if (toRelease > 0) {
+          limiter.release(toRelease)
+        }
+      }
+      cancelled
+    }
+  }
+
   // Upper bound on writer-pool tasks one map task uses to drain its compression queue. A new
   // drainer is only submitted while fewer than this many are active, so a burst of small records
   // costs a few pool submissions instead of one per record.
@@ -945,9 +964,9 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
         }
         waitTimeOnLimiterNs += System.nanoTime() - waitOnLimiterStart
 
+        val quota = new AtomicLong(recordSize)
         val queued = QueuedRecord(key, value, cb, reducePartitionId, recordSize,
-          new AtomicLong(recordSize), currentBatch, new CompletableFuture[CompressedRecord](),
-          new AtomicBoolean(false))
+          quota, currentBatch, new RecordFuture(quota), new AtomicBoolean(false))
 
         // The future goes into its partition queue before the record can be compressed, so a
         // drainer that completes it always finds it there when it schedules the merger.
