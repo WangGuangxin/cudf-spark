@@ -40,7 +40,7 @@ import org.apache.spark.network.shuffle.checksum.{Cause, ShuffleChecksumHelper}
 import org.apache.spark.network.util.{NettyUtils, TransportConf}
 import org.apache.spark.serializer.SerializerManager
 import org.apache.spark.shuffle.{FetchFailedException, ShuffleReadMetricsReporter}
-import org.apache.spark.sql.rapids.GpuShuffleEnv
+import org.apache.spark.sql.rapids.{GpuShuffleEnv, RapidsShuffleLz4}
 import org.apache.spark.util.{CompletionIterator, TaskCompletionListener, Utils}
 
 /**
@@ -1623,7 +1623,7 @@ object RapidsShuffleBlockFetcherIterator {
       blockManager,
       sparkEnv.mapOutputTracker,
       blocksByAddress,
-      serializerManager.wrapStream,
+      RapidsShuffleLz4.inputWrapper(serializerManager),
       // Note: we use getSizeAsMb when no suffix is provided for backwards compatibility
       sparkEnv.conf.get(config.REDUCER_MAX_SIZE_IN_FLIGHT) * 1024 * 1024, // 48mb default per task
       sparkEnv.conf.get(config.REDUCER_MAX_REQS_IN_FLIGHT), //Int.MaxValue by default
