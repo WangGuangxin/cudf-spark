@@ -28,7 +28,7 @@ import org.apache.spark.TaskContext
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.GpuShuffleEnv
-import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
 trait GpuPartitioning extends Partitioning {
   private[this] val (
@@ -62,6 +62,23 @@ trait GpuPartitioning extends Partitioning {
     val count = end - start
     if (count > 0) {
       ret = new ColumnarBatch(vectors.map(vec => new SlicedGpuColumnVector(vec, start, end)))
+      ret.setNumRows(count)
+    }
+    ret
+  }
+
+  def sliceBatch(shared: SlicedGpuColumnVector.SharedHostColumns, start: Int,
+      end: Int): ColumnarBatch = {
+    var ret: ColumnarBatch = null
+    val count = end - start
+    if (count > 0) {
+      val cols = new Array[ColumnVector](shared.numColumns())
+      closeOnExcept(cols) { _ =>
+        cols.indices.foreach { i =>
+          cols(i) = new SlicedGpuColumnVector(shared, i, start, end)
+        }
+      }
+      ret = new ColumnarBatch(cols)
       ret.setNumRows(count)
     }
     ret
@@ -152,13 +169,17 @@ trait GpuPartitioning extends Partitioning {
       GpuSemaphore.releaseIfNecessary(TaskContext.get())
 
       val origParts = new Array[ColumnarBatch](numPartitions)
-      var start = 0
-      for (i <- 1 until Math.min(numPartitions, partitionIndexes.length)) {
-        val idx = partitionIndexes(i)
-        origParts(i - 1) = sliceBatch(hostPartColumns, start, idx)
-        start = idx
+      withResource(new SlicedGpuColumnVector.SharedHostColumns(hostPartColumns)) { shared =>
+        closeOnExcept(origParts) { _ =>
+          var start = 0
+          for (i <- 1 until Math.min(numPartitions, partitionIndexes.length)) {
+            val idx = partitionIndexes(i)
+            origParts(i - 1) = sliceBatch(shared, start, idx)
+            start = idx
+          }
+          origParts(numPartitions - 1) = sliceBatch(shared, start, numRows)
+        }
       }
-      origParts(numPartitions - 1) = sliceBatch(hostPartColumns, start, numRows)
       val tmp = origParts.zipWithIndex.filter(_._1 != null)
       // Spark CPU shuffle in some cases has limits on the size of the data a single
       //  row can have. It is a little complicated because the limit is on the compressed

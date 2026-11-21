@@ -1338,46 +1338,66 @@ object RapidsShuffleLz4 {
 }
 
 class BytesInFlightLimiter(maxBytesInFlight: Long) {
-  private var inFlight: Long = 0L
-  private var failureCause: Throwable = null
+  // Acquire and release are lock-free; the lock is only taken to block and to wake blocked
+  // threads. Writer threads release quota once per record, so a monitor here is contended.
+  private val inFlight = new AtomicLong(0L)
+  private val lock = new Object
+  // Number of threads in acquireOrBlock's slow path. Only changed while holding `lock`.
+  @volatile private var waiters: Int = 0
+  @volatile private var failureCause: Throwable = null
 
   def acquire(sz: Long): Boolean = {
     if (sz == 0) {
       true
     } else {
-      synchronized {
-        if (inFlight == 0 || sz + inFlight <= maxBytesInFlight) {
-          inFlight += sz
-          true
-        } else {
-          false
+      var cur = inFlight.get()
+      var acquired = false
+      while (!acquired && (cur == 0 || sz + cur <= maxBytesInFlight)) {
+        acquired = inFlight.compareAndSet(cur, cur + sz)
+        if (!acquired) {
+          cur = inFlight.get()
+        }
+      }
+      acquired
+    }
+  }
+
+  def acquireOrBlock(sz: Long): Unit = {
+    if (failureCause != null || !acquire(sz)) {
+      lock.synchronized {
+        waiters += 1
+        try {
+          // A release that does not see this waiter decremented inFlight before reading
+          // `waiters`, so the acquire below sees its quota.
+          while (failureCause == null && !acquire(sz)) {
+            lock.wait()
+          }
+        } finally {
+          waiters -= 1
+        }
+        if (failureCause != null) {
+          throw new IOException("Compression batch failed; quota acquisition aborted",
+            failureCause)
         }
       }
     }
   }
 
-  def acquireOrBlock(sz: Long): Unit = synchronized {
-    while (failureCause == null && !acquire(sz)) {
-      wait()
-    }
-    if (failureCause != null) {
-      throw new IOException("Compression batch failed; quota acquisition aborted", failureCause)
-    }
-  }
-
-  def signalFailure(t: Throwable): Unit = synchronized {
+  def signalFailure(t: Throwable): Unit = lock.synchronized {
     failureCause = t
-    notifyAll()
+    lock.notifyAll()
   }
 
-  def release(sz: Long): Unit = synchronized {
-    inFlight -= sz
-    notifyAll()
+  def release(sz: Long): Unit = {
+    inFlight.addAndGet(-sz)
+    if (waiters > 0) {
+      lock.synchronized {
+        lock.notifyAll()
+      }
+    }
   }
 
-  def getBytesInFlight: Long = synchronized {
-    inFlight
-  }
+  def getBytesInFlight: Long = inFlight.get()
 }
 
 abstract class RapidsShuffleThreadedReaderBase[K, C](
