@@ -17,7 +17,7 @@
 package com.nvidia.spark.rapids
 
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.LongAdder
+import java.util.concurrent.atomic.{AtomicLong, LongAdder}
 
 import scala.collection.mutable
 
@@ -35,19 +35,21 @@ case class HostAllocResult(buffer: HostMemoryBuffer, isPinned: Boolean)
 
 private abstract class HostAlloc(nonPinnedLimit: Long, protected val pageableLimit: Long)
     extends HostMemoryAllocator with Logging {
-  private var currentNonPinnedAllocated: Long = 0L
-  private var currentPageableAllocated: Long = 0L
+  // Accounting is lock-free (AtomicLong + CAS) and the raw malloc + cleaner registration happen
+  // outside any monitor. Every shuffle block in the multithreaded reader allocates and frees a
+  // host buffer, so a process-wide monitor here serializes all reader/task threads.
+  private val currentNonPinnedAllocated = new AtomicLong(0L)
+  private val currentPageableAllocated = new AtomicLong(0L)
   private val pinnedLimit: Long = PinnedMemoryPool.getTotalPoolSizeBytes
   // For now we are going to assume that we are the only ones calling into the pinned pool
   // That is not really true, but should be okay.
-  private var currentPinnedAllocated: Long = 0L
+  private val currentPinnedAllocated = new AtomicLong(0L)
   private val isUnlimited = nonPinnedLimit < 0
   private val isPinnedOnly = nonPinnedLimit == 0
 
   // Expose for usage ratio calculation
-  def getCurrentAllocated: Long = synchronized {
-    currentNonPinnedAllocated + currentPageableAllocated + currentPinnedAllocated
-  }
+  def getCurrentAllocated: Long =
+    currentNonPinnedAllocated.get() + currentPageableAllocated.get() + currentPinnedAllocated.get()
 
   def getTotalLimit: Long = {
     if (isUnlimited) Long.MaxValue
@@ -93,9 +95,7 @@ private abstract class HostAlloc(nonPinnedLimit: Long, protected val pageableLim
   }
 
   private def releasePinned(ptr: Long, amount: Long): Unit = {
-    synchronized {
-      currentPinnedAllocated -= amount
-    }
+    currentPinnedAllocated.addAndGet(-amount)
     val metrics = GpuTaskMetrics.get
     metrics.decHostBytesAllocated(amount, isPinned = true)
     logTrace(getHostAllocMetricsLogStr(metrics))
@@ -110,31 +110,25 @@ private abstract class HostAlloc(nonPinnedLimit: Long, protected val pageableLim
   }
 
   private def releaseRawAllocation(ptr: Long, amount: Long): Unit = {
-    synchronized {
-      currentNonPinnedAllocated -= amount
-    }
+    currentNonPinnedAllocated.addAndGet(-amount)
     releaseNonPinned(ptr, amount)
   }
 
   private def tryAllocPinned(amount: Long): Option[HostMemoryBuffer] = {
     val ret = Option(PinnedMemoryPool.tryAllocate(amount))
     ret.foreach { b =>
-      synchronized {
-        currentPinnedAllocated += amount
-      }
+      currentPinnedAllocated.addAndGet(amount)
       HostAlloc.addEventHandler(b, new OnPinnedCloseCallback(b.getAddress, amount))
     }
     ret
   }
 
-  protected final def trackPageableAllocation(amount: Long): Unit = synchronized {
-    currentPageableAllocated += amount
+  protected final def trackPageableAllocation(amount: Long): Unit = {
+    currentPageableAllocated.addAndGet(amount)
   }
 
   protected final def releasePageableAllocation(ptr: Long, amount: Long): Unit = {
-    synchronized {
-      currentPageableAllocated -= amount
-    }
+    currentPageableAllocated.addAndGet(-amount)
     releaseNonPinned(ptr, amount)
   }
 
@@ -143,20 +137,33 @@ private abstract class HostAlloc(nonPinnedLimit: Long, protected val pageableLim
   }
 
   protected def tryAllocNonPinned(amount: Long): Option[HostMemoryBuffer] = {
-    val ret = if (isUnlimited) {
-      synchronized {
-        currentNonPinnedAllocated += amount
-      }
-      Some(HostMemoryBuffer.allocateRaw(amount))
+    val reserved = if (isUnlimited) {
+      currentNonPinnedAllocated.addAndGet(amount)
+      true
     } else {
-      synchronized {
-        if ((currentNonPinnedAllocated + amount) <= nonPinnedLimit) {
-          currentNonPinnedAllocated += amount
-          Some(HostMemoryBuffer.allocateRaw(amount))
-        } else {
-          None
+      var done = false
+      var ok = false
+      while (!done) {
+        val cur = currentNonPinnedAllocated.get()
+        if (cur + amount > nonPinnedLimit) {
+          done = true
+        } else if (currentNonPinnedAllocated.compareAndSet(cur, cur + amount)) {
+          ok = true
+          done = true
         }
       }
+      ok
+    }
+    val ret = if (reserved) {
+      try {
+        Some(HostMemoryBuffer.allocateRaw(amount))
+      } catch {
+        case t: Throwable =>
+          currentNonPinnedAllocated.addAndGet(-amount)
+          throw t
+      }
+    } else {
+      None
     }
     ret.foreach { b =>
       HostAlloc.addEventHandler(b, new OnRawCloseCallback(b.getAddress, amount))
@@ -164,14 +171,14 @@ private abstract class HostAlloc(nonPinnedLimit: Long, protected val pageableLim
     ret
   }
 
-  private def canNeverSucceed(amount: Long, preferPinned: Boolean): Boolean = synchronized {
+  private def canNeverSucceed(amount: Long, preferPinned: Boolean): Boolean = {
     val pinnedFailed = (isPinnedOnly || preferPinned) && (amount > pinnedLimit)
     val nonPinnedFailed = isPinnedOnly || (amount > nonPinnedLimit)
     val pageableFailed = amount > pageableLimit
     !isUnlimited && pinnedFailed && nonPinnedFailed && pageableFailed
   }
 
-  private def checkSize(amount: Long, preferPinned: Boolean): Unit = synchronized {
+  private def checkSize(amount: Long, preferPinned: Boolean): Unit = {
     if (canNeverSucceed(amount, preferPinned)) {
       throw new IllegalArgumentException(s"The amount requested $amount is larger than the " +
           s"maximum pool size ${math.max(math.max(pinnedLimit, pageableLimit), nonPinnedLimit)}")
@@ -187,9 +194,8 @@ private abstract class HostAlloc(nonPinnedLimit: Long, protected val pageableLim
       s"spillAndCheckRetry invoked with invalid retryCount $retryCount")
 
     val store = SpillFramework.stores.hostStore
-    val totalSize: Long = synchronized {
-      currentPinnedAllocated + currentPageableAllocated + currentNonPinnedAllocated
-    }
+    val totalSize: Long = currentPinnedAllocated.get() + currentPageableAllocated.get() +
+      currentNonPinnedAllocated.get()
 
     val attemptMsg = if (retryCount > 0) {
       s"Attempt $retryCount"
@@ -338,11 +344,9 @@ private class PooledHostAlloc(nonPinnedLimit: Long, poolLimit: Long)
  * A new API for host memory allocation. This can be used to limit the amount of host memory.
  */
 object HostAlloc extends Logging {
-  private var singleton: HostAlloc = new RawHostAlloc(-1)
+  @volatile private var singleton: HostAlloc = new RawHostAlloc(-1)
 
-  private def getSingleton: HostAlloc = synchronized {
-    singleton
-  }
+  private def getSingleton: HostAlloc = singleton
 
   def initialize(nonPinnedLimit: Long): Unit = synchronized {
     val pageableLimit = PageableMemoryPool.getTotalPoolSizeBytes
