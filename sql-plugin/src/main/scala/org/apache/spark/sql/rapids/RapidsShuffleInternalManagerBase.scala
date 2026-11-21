@@ -16,7 +16,7 @@
 
 package org.apache.spark.sql.rapids
 
-import java.io.{IOException, OutputStream}
+import java.io.{ByteArrayOutputStream, InputStream, IOException, OutputStream}
 import java.util.concurrent.{Callable, CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue,
   ExecutionException, Executors, ExecutorService, Future, FutureTask, LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, At
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+import scala.util.control.NonFatal
 
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
@@ -34,6 +35,9 @@ import com.nvidia.spark.rapids.ScalableTaskCompletion.onTaskCompletion
 import com.nvidia.spark.rapids.jni.kudo.OpenByteArrayOutputStream
 import com.nvidia.spark.rapids.shuffle.{CatalogShuffleRequestHandler, RapidsShuffleServer, RapidsShuffleTransport}
 import com.nvidia.spark.rapids.spill.SpillablePartialFileHandle
+
+import net.jpountz.lz4.{LZ4BlockInputStream, LZ4BlockOutputStream, LZ4Factory}
+import net.jpountz.xxhash.XXHashFactory
 
 import org.apache.spark.{InterruptibleIterator, MapOutputTracker, ShuffleDependency, SparkConf, SparkEnv, TaskContext}
 import org.apache.spark.executor.ShuffleWriteMetrics
@@ -296,6 +300,8 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
   private val numPartitions = partitioner.numPartitions
   private val serializer = dep.serializer.newInstance()
   private val fileBufferSize = sparkConf.get(config.SHUFFLE_FILE_BUFFER_SIZE).toInt * 1024
+  private lazy val shuffleOutputWrapper =
+    RapidsShuffleLz4.outputWrapper(blockManager.serializerManager, sparkConf)
   private val limiter = new BytesInFlightLimiter(maxBytesInFlight)
   private val limiterWaitTimeMetric =
     handle.metrics.get(METRIC_THREADED_WRITER_LIMITER_WAIT_TIME)
@@ -794,8 +800,8 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
                 val buffer = new OpenByteArrayOutputStream()
 
                 // Serialize + compress + encryption to memory buffer
-                val compressedOutputStream = blockManager.serializerManager.wrapStream(
-                  ShuffleBlockId(shuffleId, mapId, reducePartitionId), buffer)
+                val compressedOutputStream = shuffleOutputWrapper(
+                  ShuffleBlockId(shuffleId, mapId, reducePartitionId), buffer, recordSize)
 
                 val serializationStream = serializerInstance.serializeStream(
                   compressedOutputStream)
@@ -1140,6 +1146,94 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
   }
 
   def getBytesInFlight: Long = limiter.getBytesInFlight
+}
+
+/**
+ * LZ4 streams for the multithreaded shuffle that checksum with the pure Java XXHash32.
+ *
+ * Spark's LZ4 codec checksums every stream with the JNI StreamingXXHash32 when the native
+ * library is loaded. That class has a finalizer, so each one is registered under the JVM-wide
+ * finalizer lock when it is created, and the multithreaded shuffle creates one per record on
+ * the write side and one per block on the read side: with tens of thousands of partitions,
+ * writer and task threads queue on that lock. The streams built here use the same seed, block
+ * size and format as Spark's LZ4CompressionCodec, so they read what Spark wrote and vice versa.
+ * They are only used when the SerializerManager would wrap shuffle streams in plain LZ4
+ * (compressed, not encrypted); anything else goes through the SerializerManager.
+ */
+object RapidsShuffleLz4 {
+  // LZ4BlockOutputStream.DEFAULT_SEED, which Spark's LZ4CompressionCodec also uses
+  private val DEFAULT_SEED = 0x9747b28c
+  private lazy val lz4Factory = LZ4Factory.fastestInstance()
+  private lazy val xxHashFactory = XXHashFactory.fastestJavaInstance()
+
+  /**
+   * Whether `serializerManager` wraps shuffle streams in LZ4 without encryption. Asks it to wrap
+   * a probe stream rather than reading the configuration, so it agrees with the manager in use.
+   */
+  private def isPlainLz4(serializerManager: SerializerManager): Boolean = {
+    try {
+      !serializerManager.encryptionEnabled && {
+        val probe = serializerManager.wrapStream(ShuffleBlockId(0, 0L, 0),
+          new ByteArrayOutputStream())
+        try {
+          probe.isInstanceOf[LZ4BlockOutputStream]
+        } finally {
+          probe.close()
+        }
+      }
+    } catch {
+      case NonFatal(_) => false
+    }
+  }
+
+  /** The equivalent of `serializerManager.wrapStream` for shuffle block input streams. */
+  def inputWrapper(serializerManager: SerializerManager): (BlockId, InputStream) => InputStream = {
+    if (isPlainLz4(serializerManager)) {
+      (_, in) => new LZ4BlockInputStream(in, lz4Factory.fastDecompressor(),
+        xxHashFactory.newStreamingHash32(DEFAULT_SEED).asChecksum,
+        false) // same as Spark: do not stop at an empty block, streams can be concatenated
+    } else {
+      serializerManager.wrapStream
+    }
+  }
+
+  // Smallest LZ4 block size used for a small record, see blockSizeFor
+  private val MIN_RECORD_BLOCK_SIZE = 1024
+
+  /**
+   * The LZ4 block size for a stream that will hold about `sizeHint` bytes. LZ4BlockOutputStream
+   * allocates two buffers of about the block size per stream, and the multithreaded writer opens
+   * one stream per record: with thousands of partitions records are a few hundred bytes, and
+   * Spark's 32 KiB default made the writer allocate and zero about 65 KiB per record. A record
+   * smaller than the configured block size gets the next power of two above its size plus some
+   * headroom for serialization overhead, so it still compresses as a single block. Readers
+   * take the block size from each block's header, so streams stay readable by Spark's codec.
+   */
+  private def blockSizeFor(sizeHint: Long, maxBlockSize: Int): Int = {
+    val wanted = sizeHint + MIN_RECORD_BLOCK_SIZE
+    if (sizeHint <= 0 || wanted >= maxBlockSize) {
+      maxBlockSize
+    } else {
+      math.max(MIN_RECORD_BLOCK_SIZE, Integer.highestOneBit(wanted.toInt - 1) << 1)
+    }
+  }
+
+  /**
+   * The equivalent of `serializerManager.wrapStream` for shuffle block output streams. The
+   * returned function also takes the expected uncompressed size of what will be written.
+   */
+  def outputWrapper(
+      serializerManager: SerializerManager,
+      conf: SparkConf): (BlockId, OutputStream, Long) => OutputStream = {
+    if (isPlainLz4(serializerManager)) {
+      val maxBlockSize = conf.get(config.IO_COMPRESSION_LZ4_BLOCKSIZE).toInt
+      (_, out, sizeHint) => new LZ4BlockOutputStream(out, blockSizeFor(sizeHint, maxBlockSize),
+        lz4Factory.fastCompressor(), xxHashFactory.newStreamingHash32(DEFAULT_SEED).asChecksum,
+        false) // same as Spark: no sync flush
+    } else {
+      (blockId, out, _) => serializerManager.wrapStream(blockId, out)
+    }
+  }
 }
 
 class BytesInFlightLimiter(maxBytesInFlight: Long) {
