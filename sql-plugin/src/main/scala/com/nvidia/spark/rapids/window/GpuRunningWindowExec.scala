@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +19,12 @@ package com.nvidia.spark.rapids.window
 import scala.collection.mutable.ArrayBuffer
 
 import ai.rapids.cudf
-import ai.rapids.cudf.Scalar
+import ai.rapids.cudf.{DType, Scalar}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource, withResourceIfAllowed}
+import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.{splitSpillableInHalfByRows, withRestoreOnRetry, withRetry}
+import com.nvidia.spark.rapids.jni.GpuSplitAndRetryOOM
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions.{Expression, NamedExpression, RangeFrame, SortOrder}
@@ -113,9 +115,91 @@ class GpuRunningWindowIterator(
     }
   }
 
+  /**
+   * Find where to cut `cb` close to its middle without splitting a group of rows that have
+   * the same partition and order-by keys (peers). Returns None if all rows are peers.
+   */
+  private def findPeerGroupCut(cb: ColumnarBatch): Option[Int] = {
+    val numRows = cb.numRows()
+    val mid = numRows / 2
+    withResource(GpuProjectExec.project(cb, boundPartitionSpec ++ boundOrderColumns)) { keys =>
+      val keyColumns = GpuColumnVector.extractBases(keys)
+      val sameKeyAsMid = withResource(getScalarRow(mid, keyColumns)) { midKey =>
+        arePartsEqual(midKey, keyColumns)
+      }
+      withResourceIfAllowed(sameKeyAsMid) {
+        case Right(_) =>
+          // No keys at all, so every row is a peer of every other row
+          None
+        case Left(mask) =>
+          // The input is sorted by the keys, so the peers of the middle row are a single
+          // contiguous run of rows [start, end) that contains `mid`.
+          val peerRange = withResource(Scalar.fromInt(0)) { zero =>
+            withResource(cudf.ColumnVector.sequence(zero, numRows)) { rowIds =>
+              withResource(Scalar.fromNull(DType.INT32)) { nullId =>
+                withResource(mask.ifElse(rowIds, nullId)) { peerIds =>
+                  withResource(peerIds.min()) { first =>
+                    withResource(peerIds.max()) { last =>
+                      // The mask can miss the middle row itself if its key holds a NaN that
+                      // the equality check does not match. Then no boundary is known.
+                      if (first.isValid && last.isValid) {
+                        Some((first.getInt, last.getInt + 1))
+                      } else {
+                        None
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          peerRange.flatMap { case (start, end) =>
+            Seq(start, end).filter(cut => cut > 0 && cut < numRows)
+              .sortBy(cut => math.abs(cut - mid)).headOption
+          }
+      }
+    }
+  }
+
+  /**
+   * Split policy used when a RANGE frame is present. The fixers can only carry state across
+   * partition boundaries, not across a split peer group, so the cut is moved to the closest
+   * peer group boundary instead of the exact middle.
+   */
+  private def splitSpillableKeepingPeers(
+      sb: SpillableColumnarBatch): Seq[SpillableColumnarBatch] = {
+    withResource(sb) { _ =>
+      withResource(sb.getColumnarBatch()) { cb =>
+        val cut = findPeerGroupCut(cb).getOrElse {
+          throw new GpuSplitAndRetryOOM(s"GPU OutOfMemory: a batch of ${cb.numRows()} rows " +
+              "cannot be split because all of the rows are peers in a RANGE window frame!")
+        }
+        val cts = withResource(GpuColumnVector.from(cb)) { tbl =>
+          tbl.contiguousSplit(cut)
+        }
+        withResource(cts) { _ =>
+          withResource(cts.safeMap(ct => GpuColumnVector.from(ct.getTable, sb.dataTypes))) {
+            batches =>
+              batches.safeMap { b =>
+                SpillableColumnarBatch(GpuColumnVector.incRefCounts(b),
+                  SpillPriorities.ACTIVE_BATCHING_PRIORITY)
+              }.toSeq
+          }
+        }
+      }
+    }
+  }
+
+  private lazy val splitPolicy: SpillableColumnarBatch => Seq[SpillableColumnarBatch] =
+    if (GpuRunningWindowIterator.hasRangeFrame(boundWindowOps)) {
+      splitSpillableKeepingPeers
+    } else {
+      splitSpillableInHalfByRows
+    }
+
   def computeRunningAndClose(sb: SpillableColumnarBatch): Iterator[ColumnarBatch] = {
     val fixers = fixerIndexMap
-    withRetry(sb, splitSpillableInHalfByRows) { maybeSplitSb =>
+    withRetry(sb, splitPolicy) { maybeSplitSb =>
       val numRows = maybeSplitSb.numRows()
       withResource(maybeSplitSb.getColumnarBatch()) { cb =>
         withResource(computeBasicWindow(cb)) { basic =>
@@ -211,6 +295,20 @@ class GpuRunningWindowIterator(
   }
 }
 
+object GpuRunningWindowIterator {
+  /**
+   * True if any of the window operations uses a RANGE frame. Peers (rows with the same
+   * partition and order-by keys) must then stay in the same batch.
+   */
+  def hasRangeFrame(windowOps: Seq[Expression]): Boolean = windowOps.exists {
+    case GpuAlias(
+    GpuWindowExpression(
+    _, GpuWindowSpecDefinition(_, _, GpuSpecifiedWindowFrame(RangeFrame, _, _))),
+    _) => true
+    case _ => false
+  }
+}
+
 /**
  * This allows for batches of data to be processed without needing them to correspond to
  * the partition by boundaries, but only for window operations that are unbounded preceding
@@ -230,14 +328,7 @@ case class GpuRunningWindowExec(
   override def childrenCoalesceGoal: Seq[CoalesceGoal] = Seq(outputBatching)
 
   override def outputBatching: CoalesceGoal = {
-    val isRangeFrame = windowOps.exists {
-      case GpuAlias(
-      GpuWindowExpression(
-      _, GpuWindowSpecDefinition(_, _, GpuSpecifiedWindowFrame(RangeFrame, _, _))),
-      _) => true
-      case _ => false
-    }
-    if (!isRangeFrame) {
+    if (!GpuRunningWindowIterator.hasRangeFrame(windowOps)) {
       return null // NO batching restrictions on ROW frames.
     }
     if (gpuPartitionSpec.isEmpty) {

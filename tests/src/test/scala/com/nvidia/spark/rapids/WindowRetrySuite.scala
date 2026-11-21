@@ -221,6 +221,68 @@ class WindowRetrySuite
     }
   }
 
+  /**
+   * Run a RANGE UNBOUNDED PRECEDING to CURRENT ROW count(1) over a single batch, partitioned
+   * by a constant and ordered by `orderValues`, with one GpuSplitAndRetryOOM injected.
+   * Returns the counts of each output batch.
+   */
+  private def runRangeRunningCountWithSplit(orderValues: Seq[Int]): List[Seq[Long]] = {
+    val rangeRunningFrame = GpuSpecifiedWindowFrame(RangeFrame,
+      GpuSpecialFrameBoundary(UnboundedPreceding), GpuSpecialFrameBoundary(CurrentRow))
+    val boundOrderSpec = SortOrder(
+      GpuBoundReference(0, IntegerType, nullable = true)(ExprId(0), "int"), Ascending) :: Nil
+    val boundPartSpec = Seq(
+      GpuBoundReference(1, LongType, nullable = true)(ExprId(1), "long"))
+    val spec = GpuWindowSpecDefinition(boundPartSpec, boundOrderSpec, rangeRunningFrame)
+    val count = GpuWindowExpression(GpuCount(Seq(GpuLiteral.create(1, IntegerType))), spec)
+    val cb = withResource(new Table.TestBuilder()
+        .column(orderValues.map(Int.box): _*)
+        .column(Seq.fill(orderValues.length)(Long.box(7L)): _*)
+        .build()) { tbl =>
+      GpuColumnVector.from(tbl, Seq(IntegerType, LongType).toArray[DataType])
+    }
+
+    val runningIter = new GpuRunningWindowIterator(
+      Seq(cb).iterator, Seq(GpuAlias(count, "count")()), boundPartSpec, boundOrderSpec,
+      Array(LongType), NoopMetric, NoopMetric, NoopMetric)
+    withResource(runningIter) { _ =>
+      RmmSpark.forceSplitAndRetryOOM(RmmSpark.getCurrentThreadId, 1,
+        RmmSpark.OomInjectionType.GPU.ordinal, 0)
+      runningIter.map { batch =>
+        withResource(batch) { _ =>
+          withResource(batch.column(0).asInstanceOf[GpuColumnVector].copyToHost()) { hc =>
+            (0 until hc.getRowCount.toInt).map(hc.getLong)
+          }
+        }
+      }.toList
+    }
+  }
+
+  test("range-based running window keeps peers together on GpuSplitAndRetryOOM") {
+    // Rows with equal order-by values (peers) must all see the whole peer group. A split in
+    // half by rows lands inside the peer group of 2, so the cut has to move before it.
+    val batchCounts = runRangeRunningCountWithSplit(Seq(1, 2, 2, 3))
+    // Make sure the split path was really taken.
+    assertResult(2)(batchCounts.length)
+    // Same answer as without any split: peers 2, 2 both count rows [1, 2, 2].
+    assertResult(Seq(1L, 3L, 3L, 4L))(batchCounts.flatten)
+  }
+
+  test("range-based running window moves the split after a leading peer group") {
+    // The middle row is in the peer group of 1, which starts at row 0, so the only
+    // boundary to cut at is after the group.
+    val batchCounts = runRangeRunningCountWithSplit(Seq(1, 1, 1, 2))
+    assertResult(Seq(3, 1))(batchCounts.map(_.length))
+    assertResult(Seq(3L, 3L, 3L, 4L))(batchCounts.flatten)
+  }
+
+  test("range-based running window does not split a batch of peers") {
+    // Every row is a peer of every other row, so no split can give a correct answer.
+    assertThrows[GpuSplitAndRetryOOM] {
+      runRangeRunningCountWithSplit(Seq(2, 2, 2, 2))
+    }
+  }
+
   private def buildLargeBatchForBoundedWindow() = {
     // Build a batch with 8 rows to have enough data for bounded window with preceding/following
     val windowTable = new Table.TestBuilder()
