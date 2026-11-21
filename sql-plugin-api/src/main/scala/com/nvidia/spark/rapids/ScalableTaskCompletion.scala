@@ -17,6 +17,7 @@
 package com.nvidia.spark.rapids
 
 import java.util
+import java.util.concurrent.ConcurrentHashMap
 
 import org.apache.spark.TaskContext
 
@@ -46,7 +47,9 @@ object ScalableTaskCompletion {
   //
   // ScalableTaskCompletion -> TopLevelTaskCompletion -> UserTaskCompletion
   //
-  // this is to avoid any potential deadlocks
+  // this is to avoid any potential deadlocks. Adding a callback does not take the
+  // ScalableTaskCompletion lock: callers can register one per shuffle block, and with many
+  // tasks per executor a process-wide lock on that path becomes a point of contention.
 
   /**
    * Wrapper around a user callback function.
@@ -170,31 +173,32 @@ object ScalableTaskCompletion {
   /**
    * Callbacks indexed by the task attempt id.
    */
-  private val pendingCallbacks = new util.HashMap[Long, TopLevelTaskCompletion]
+  private val pendingCallbacks = new ConcurrentHashMap[Long, TopLevelTaskCompletion]
 
-  private def getTopLevel(id: Long): TopLevelTaskCompletion = synchronized {
-    pendingCallbacks.get(id)
-  }
+  private def getTopLevel(id: Long): TopLevelTaskCompletion = pendingCallbacks.get(id)
 
-  private def removeTopLevel(id: Long): TopLevelTaskCompletion = synchronized {
-    pendingCallbacks.remove(id)
-  }
+  private def removeTopLevel(id: Long): TopLevelTaskCompletion = pendingCallbacks.remove(id)
 
   private def add(ucb: UserTaskCompletion): TaskCompletionCallbackHandle = {
     val tc = ucb.tc
     val id = tc.taskAttemptId()
-    synchronized {
-      val tl = if (!pendingCallbacks.containsKey(id)) {
-        val topLevel = new TopLevelTaskCompletion
-        tc.addTaskCompletionListener[Unit](topLevel)
-        pendingCallbacks.put(id, topLevel)
-        topLevel
+    val existing = pendingCallbacks.get(id)
+    val tl = if (existing != null) {
+      existing
+    } else {
+      val topLevel = new TopLevelTaskCompletion
+      val raced = pendingCallbacks.putIfAbsent(id, topLevel)
+      if (raced != null) {
+        raced
       } else {
-        pendingCallbacks.get(id)
+        // Registered outside of the map update: Spark runs the listener right away if the task
+        // already completed, and the listener removes the entry again.
+        tc.addTaskCompletionListener[Unit](topLevel)
+        topLevel
       }
-      tl.add(ucb)
     }
-
+    // If the task already completed, the callback runs right away.
+    tl.add(ucb)
     ucb
   }
 
