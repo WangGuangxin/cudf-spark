@@ -801,7 +801,7 @@ abstract class RapidsShuffleThreadedWriterBase[K, V](
 
                 // Serialize + compress + encryption to memory buffer
                 val compressedOutputStream = shuffleOutputWrapper(
-                  ShuffleBlockId(shuffleId, mapId, reducePartitionId), buffer)
+                  ShuffleBlockId(shuffleId, mapId, reducePartitionId), buffer, recordSize)
 
                 val serializationStream = serializerInstance.serializeStream(
                   compressedOutputStream)
@@ -1197,17 +1197,41 @@ object RapidsShuffleLz4 {
     }
   }
 
-  /** The equivalent of `serializerManager.wrapStream` for shuffle block output streams. */
+  // Smallest LZ4 block size used for a small record, see blockSizeFor
+  private val MIN_RECORD_BLOCK_SIZE = 1024
+
+  /**
+   * The LZ4 block size for a stream that will hold about `sizeHint` bytes. LZ4BlockOutputStream
+   * allocates two buffers of about the block size per stream, and the multithreaded writer opens
+   * one stream per record: with thousands of partitions records are a few hundred bytes, and
+   * Spark's 32 KiB default made the writer allocate and zero about 65 KiB per record. A record
+   * smaller than the configured block size gets the next power of two above its size plus some
+   * headroom for serialization overhead, so it still compresses as a single block. Readers
+   * take the block size from each block's header, so streams stay readable by Spark's codec.
+   */
+  private def blockSizeFor(sizeHint: Long, maxBlockSize: Int): Int = {
+    val wanted = sizeHint + MIN_RECORD_BLOCK_SIZE
+    if (sizeHint <= 0 || wanted >= maxBlockSize) {
+      maxBlockSize
+    } else {
+      math.max(MIN_RECORD_BLOCK_SIZE, Integer.highestOneBit(wanted.toInt - 1) << 1)
+    }
+  }
+
+  /**
+   * The equivalent of `serializerManager.wrapStream` for shuffle block output streams. The
+   * returned function also takes the expected uncompressed size of what will be written.
+   */
   def outputWrapper(
       serializerManager: SerializerManager,
-      conf: SparkConf): (BlockId, OutputStream) => OutputStream = {
+      conf: SparkConf): (BlockId, OutputStream, Long) => OutputStream = {
     if (isPlainLz4(serializerManager)) {
-      val blockSize = conf.get(config.IO_COMPRESSION_LZ4_BLOCKSIZE).toInt
-      (_, out) => new LZ4BlockOutputStream(out, blockSize, lz4Factory.fastCompressor(),
-        xxHashFactory.newStreamingHash32(DEFAULT_SEED).asChecksum,
+      val maxBlockSize = conf.get(config.IO_COMPRESSION_LZ4_BLOCKSIZE).toInt
+      (_, out, sizeHint) => new LZ4BlockOutputStream(out, blockSizeFor(sizeHint, maxBlockSize),
+        lz4Factory.fastCompressor(), xxHashFactory.newStreamingHash32(DEFAULT_SEED).asChecksum,
         false) // same as Spark: no sync flush
     } else {
-      serializerManager.wrapStream
+      (blockId, out, _) => serializerManager.wrapStream(blockId, out)
     }
   }
 }
