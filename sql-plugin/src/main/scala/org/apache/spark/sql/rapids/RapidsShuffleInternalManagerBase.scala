@@ -1192,6 +1192,8 @@ object RapidsShuffleLz4 {
       (_, in) => new LZ4BlockInputStream(in, lz4Factory.fastDecompressor(),
         xxHashFactory.newStreamingHash32(DEFAULT_SEED).asChecksum,
         false) // same as Spark: do not stop at an empty block, streams can be concatenated
+    } else if (RapidsShuffleZstd.isPlainZstd(serializerManager)) {
+      RapidsShuffleZstd.inputWrapper(serializerManager)
     } else {
       serializerManager.wrapStream
     }
@@ -1230,6 +1232,8 @@ object RapidsShuffleLz4 {
       (_, out, sizeHint) => new LZ4BlockOutputStream(out, blockSizeFor(sizeHint, maxBlockSize),
         lz4Factory.fastCompressor(), xxHashFactory.newStreamingHash32(DEFAULT_SEED).asChecksum,
         false) // same as Spark: no sync flush
+    } else if (RapidsShuffleZstd.isPlainZstd(serializerManager)) {
+      RapidsShuffleZstd.outputWrapper(serializerManager, conf)
     } else {
       (blockId, out, _) => serializerManager.wrapStream(blockId, out)
     }
