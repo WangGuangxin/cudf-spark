@@ -91,8 +91,8 @@ abstract class GpuShuffleBlockResolverBase(
           throw new IllegalStateException(s"The block $blockId is being managed by the catalog")
         }
 
-        // Fall back to disk-based resolver
-        wrapped.getBlockData(blockId, dirs)
+        // Fall back to the files written to disk
+        RapidsShuffleFileCache.getBlockData(wrapped, sbid, dirs)
 
       case sbbid: ShuffleBlockBatchId =>
         // ShuffleBlockBatchId contains multiple reduce partitions for batch fetch
@@ -2243,6 +2243,7 @@ class RapidsShuffleInternalManagerBase(conf: SparkConf, val isDriver: Boolean)
     // Kept out of the catalog path that a reclaim shares, which in local mode runs in this JVM:
     // a reclaimed shuffle stays a candidate until Spark itself removes it.
     GpuShuffleRegistry.remove(shuffleId)
+    RapidsShuffleFileCache.removeShuffle(shuffleId)
     var unregistered = false
     Utils.tryWithSafeFinally {
       unregisterGpuShuffle(shuffleId)
