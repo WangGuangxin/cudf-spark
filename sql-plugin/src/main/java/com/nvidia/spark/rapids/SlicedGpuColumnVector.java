@@ -25,14 +25,81 @@ import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.apache.spark.sql.vectorized.ColumnarMap;
 import org.apache.spark.unsafe.types.UTF8String;
 
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
  * Wraps a GpuColumnVector but only points to a slice of it.  This is intended to only be used
  * during shuffle after the data is partitioned and before it is serialized.
  */
 public class SlicedGpuColumnVector extends ColumnVector {
   private final RapidsHostColumnVector wrap;
+  private final SharedHostColumns shared;
   private final int start;
   private final int end;
+
+  /**
+   * Host columns shared by all slices of one partitioned batch. It holds one reference on each
+   * column and counts the slices' references with a single atomic counter, so creating, passing
+   * and closing thousands of slices does not lock the shared columns once per slice and column.
+   */
+  public static final class SharedHostColumns implements AutoCloseable {
+    private final RapidsHostColumnVector[] columns;
+    // Starts at 1 for the creator, who must close this after creating the slices.
+    private final AtomicLong refs = new AtomicLong(1);
+
+    public SharedHostColumns(RapidsHostColumnVector[] columns) {
+      int i = 0;
+      try {
+        for (; i < columns.length; i++) {
+          columns[i].incRefCount();
+        }
+      } catch (Throwable t) {
+        for (int j = 0; j < i; j++) {
+          columns[j].close();
+        }
+        throw t;
+      }
+      this.columns = columns.clone();
+    }
+
+    void incRef() {
+      if (refs.getAndIncrement() <= 0) {
+        throw new IllegalStateException("Shared host columns are already closed");
+      }
+    }
+
+    @Override
+    public void close() {
+      long r = refs.decrementAndGet();
+      if (r == 0) {
+        Throwable err = null;
+        for (RapidsHostColumnVector c : columns) {
+          try {
+            c.close();
+          } catch (Throwable t) {
+            if (err == null) {
+              err = t;
+            } else {
+              err.addSuppressed(t);
+            }
+          }
+        }
+        if (err instanceof RuntimeException) {
+          throw (RuntimeException) err;
+        } else if (err instanceof Error) {
+          throw (Error) err;
+        } else if (err != null) {
+          throw new RuntimeException(err);
+        }
+      } else if (r < 0) {
+        throw new IllegalStateException("Shared host columns closed too many times");
+      }
+    }
+
+    public int numColumns() {
+      return columns.length;
+    }
+  }
 
   /**
    * Sets up the data type of this column vector.
@@ -45,18 +112,41 @@ public class SlicedGpuColumnVector extends ColumnVector {
     assert start >= 0;
     assert end > start; // we don't support empty slices, it should be a null
     assert end <= w.getBase().getRowCount();
+    this.shared = null;
     w.incRefCount();
+  }
+
+  /** A slice of column {@code index} of {@code shared}; it takes one reference on it. */
+  protected SlicedGpuColumnVector(SharedHostColumns shared, int index, int start, int end) {
+    super(shared.columns[index].dataType());
+    this.wrap = shared.columns[index];
+    this.start = start;
+    this.end = end;
+    assert start >= 0;
+    assert end > start; // we don't support empty slices, it should be a null
+    assert end <= wrap.getBase().getRowCount();
+    shared.incRef();
+    this.shared = shared;
   }
 
   @Override
   public void close() {
-    wrap.close();
+    if (shared != null) {
+      shared.close();
+    } else {
+      wrap.close();
+    }
   }
 
   public static ColumnarBatch incRefCount(ColumnarBatch batch) {
     for (int i = 0; i < batch.numCols(); i++) {
       if (batch.column(i) instanceof SlicedGpuColumnVector) {
-        ((SlicedGpuColumnVector)batch.column(i)).getBase().incRefCount();
+        SlicedGpuColumnVector scv = (SlicedGpuColumnVector) batch.column(i);
+        if (scv.shared != null) {
+          scv.shared.incRef();
+        } else {
+          scv.getBase().incRefCount();
+        }
       }
     }
     return batch;
