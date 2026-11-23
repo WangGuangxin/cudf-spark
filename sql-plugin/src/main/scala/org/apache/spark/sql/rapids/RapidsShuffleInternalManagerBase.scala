@@ -18,7 +18,8 @@ package org.apache.spark.sql.rapids
 
 import java.io.{ByteArrayOutputStream, InputStream, IOException, OutputStream}
 import java.util.concurrent.{Callable, CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue,
-  ExecutionException, Executors, ExecutorService, Future, FutureTask, LinkedBlockingQueue, TimeUnit}
+  ExecutionException, ExecutorService, Future, FutureTask, LinkedBlockingQueue, LinkedTransferQueue,
+  ThreadPoolExecutor, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 
 import scala.collection.JavaConverters._
@@ -212,26 +213,26 @@ object RapidsShuffleInternalManagerBase extends Logging {
     }
   }
 
+  /**
+   * Like Executors.newFixedThreadPool, but queues tasks in a LinkedTransferQueue. Shuffle threads
+   * submit a task per record or block, and a LinkedBlockingQueue makes them contend on its lock.
+   */
+  private def newFixedThreadPool(numThreads: Int, nameFormat: String): ExecutorService =
+    new ThreadPoolExecutor(numThreads, numThreads, 0L, TimeUnit.MILLISECONDS,
+      new LinkedTransferQueue[Runnable](),
+      new ThreadFactoryBuilder().setNameFormat(nameFormat).setDaemon(true).build())
+
   def startThreadPoolIfNeeded(
       numWriterThreads: Int,
       numReaderThreads: Int): Unit = synchronized {
     if (!mtShuffleInitialized) {
       mtShuffleInitialized = true
       if (numWriterThreads > 0) {
-        writerPool = Executors.newFixedThreadPool(numWriterThreads, new ThreadFactoryBuilder()
-          .setNameFormat("rapids-shuffle-writer-%d")
-          .setDaemon(true)
-          .build())
-        mergerPool = Executors.newFixedThreadPool(numWriterThreads, new ThreadFactoryBuilder()
-          .setNameFormat("rapids-shuffle-merger-%d")
-          .setDaemon(true)
-          .build())
+        writerPool = newFixedThreadPool(numWriterThreads, "rapids-shuffle-writer-%d")
+        mergerPool = newFixedThreadPool(numWriterThreads, "rapids-shuffle-merger-%d")
       }
       if (numReaderThreads > 0) {
-        readerPool = Executors.newFixedThreadPool(numReaderThreads, new ThreadFactoryBuilder()
-          .setNameFormat("rapids-shuffle-reader-%d")
-          .setDaemon(true)
-          .build())
+        readerPool = newFixedThreadPool(numReaderThreads, "rapids-shuffle-reader-%d")
       }
     }
   }
