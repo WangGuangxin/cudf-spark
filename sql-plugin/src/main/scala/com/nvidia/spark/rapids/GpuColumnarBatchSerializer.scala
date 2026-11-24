@@ -561,6 +561,9 @@ private class KudoGpuSerializerInstance(
         if (batch.numCols() > 0) {
           val firstCol = batch.column(0)
           firstCol match {
+            case vector: SlicedSerializedColumnVector if GpuShuffleFrame.enabled =>
+              dataSize += GpuShuffleFrame.writeFrame(vector.getWrap, out)
+              flush()
             case vector: SlicedSerializedColumnVector =>
               val data = vector.getWrap
               val dataLen = data.getLength
@@ -579,7 +582,15 @@ private class KudoGpuSerializerInstance(
             case _ =>
           }
         } else {
-          dataSize += KudoSerializer.writeRowCountToStream(out, batch.numRows())
+          dataSize += (if (GpuShuffleFrame.enabled) {
+            // keep the stream all frames so that the reader can decode it
+            val bos = new ByteArrayOutputStream()
+            val n = KudoSerializer.writeRowCountToStream(bos, batch.numRows())
+            out.write(GpuShuffleFrame.rawHeaderOnlyFrame(bos.toByteArray, bos.size()))
+            n
+          } else {
+            KudoSerializer.writeRowCountToStream(out, batch.numRows())
+          })
         }
         this
       }
@@ -618,7 +629,11 @@ private class KudoGpuSerializerInstance(
         new DataInputStream(new BufferedInputStream(wrappedIn))
 
       override def asKeyValueIterator: Iterator[(Int, ColumnarBatch)] = {
-        new KudoSerializedBatchIterator(dIn, deserTime)
+        if (GpuShuffleFrame.enabled) {
+          new FramedKudoBatchIterator(dIn, deserTime)
+        } else {
+          new KudoSerializedBatchIterator(dIn, deserTime)
+        }
       }
 
       override def asIterator: Iterator[Any] = {

@@ -25,17 +25,29 @@ class SpillableKudoTable(val header: KudoTableHeader,
     shb: SpillableHostBuffer)
   extends AutoCloseable {
 
+  /**
+   * A table whose stored data is shorter than the header's data length holds an LZ4-compressed
+   * body written with GpuShuffleFrame.
+   */
+  def isCompressed: Boolean = shb != null && length < header.getTotalDataLen
+
+  /** The table with its raw data; a compressed body is decompressed on the CPU. */
   def makeKudoTable: KudoTable = {
     if (shb == null) {
       new KudoTable(header, null)
+    } else if (isCompressed) {
+      val raw = Arm.withResource(shb.getHostBuffer()) { comp =>
+        GpuShuffleFrame.cpuDecompressHost(comp, header.getTotalDataLen)
+      }
+      new KudoTable(header, raw)
     } else {
       new KudoTable(header, shb.getHostBuffer())
     }
   }
 
   /**
-   * Copy this table's data bytes into `dst` at `dstOffset`. A table with no
-   * buffer contributes nothing.
+   * Copy this table's stored data bytes (`length` of them, compressed if `isCompressed`) into
+   * `dst` at `dstOffset`. A table with no buffer contributes nothing.
    */
   def materializeInto(dst: HostMemoryBuffer, dstOffset: Long): Unit = {
     if (shb != null) {
